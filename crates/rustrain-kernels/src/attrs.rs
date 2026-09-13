@@ -92,4 +92,28 @@ pub fn require_str_of<'a>(
     }
 }
 
+/// An optional string attribute with a documented default: absent yields
+/// `default`; present-but-unknown is a hard error naming the accepted values
+/// (an attribute the description wrote must mean what it says — a typo is
+/// never silently read as the default).
+pub fn str_or<'a>(
+    attrs: &'a RsAttrs,
+    key: &str,
+    default: &'static str,
+    accepted: &[&str],
+    op: &'static str,
+) -> OpResultAttr<'a> {
+    match attr_str(attrs, key) {
+        None => Ok(default),
+        Some(v) if accepted.contains(&v) => Ok(v),
+        Some(v) => Err(crate::error::err(
+            op,
+            format!(
+                "unknown {key} '{v}'; accepted values: {}",
+                accepted.join(", ")
+            ),
+        )),
+    }
+}
+
 pub type OpResultAttr<'a> = crate::error::OpResult<&'a str>;

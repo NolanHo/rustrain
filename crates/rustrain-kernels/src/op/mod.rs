@@ -5,3 +5,4 @@ pub mod compute;
 pub mod meta;
 pub mod movement;
 pub mod quant;
+pub mod recurrent;

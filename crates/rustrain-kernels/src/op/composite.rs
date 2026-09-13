@@ -55,169 +55,374 @@ macro_rules! exec_entry {
 
 // ── sdpa ────────────────────────────────────────────────────────────────────
 
-fn sdpa_infer_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
-    c.expect_arity((3, 3))?;
-    c.expect_out_count(1)?;
-    let q = c.in_t(0);
-    let k = c.in_t(1);
-    let v = c.in_t(2);
+/// One validated sdpa call's plan: the head decomposition, the scale and the
+/// mask/causal switches. Shared by infer and execute so direct execute calls
+/// get the same validation. `headed` distinguishes the two declared forms:
+/// with `num_heads` declared the inputs are per-head `[.., S, H, D]` (the
+/// plan's sequence-first layout, S at -3, H at -2, D at -1); without it the
+/// legacy flat form `[.., S, D]` (S at -2, one head).
+struct SdpaPlan {
+    rank: usize,
+    s: usize,
+    t: usize,
+    num_heads: usize,
+    num_kv: usize,
+    d: usize,
+    dv: usize,
+    scale: f32,
+    causal: bool,
+    /// num_heads was declared: inputs are per-head [.., S, H, D].
+    headed: bool,
+}
+
+fn sdpa_plan(
+    q: &RsTensor,
+    k: &RsTensor,
+    v: &RsTensor,
+    a: &RsAttrs,
+    op: &'static str,
+) -> OpResult<SdpaPlan> {
     for (i, t) in [(0usize, q), (1, k), (2, v)] {
         if t.dtype != RsDtype::F32 {
-            return Err(err(c.op, format!("input {i} has dtype {}, expected f32", t.dtype)));
+            return Err(err(
+                op,
+                format!("input {i} has dtype {}, expected f32", t.dtype),
+            ));
         }
     }
     let rank = q.rank as usize;
-    if rank < 3 || k.rank as usize != rank || v.rank as usize != rank {
+    if rank < 2 || k.rank as usize != rank || v.rank as usize != rank {
         return Err(fail!(
-            c.op,
-            "sdpa expects q, k, v of equal rank >= 3, got ranks {}, {}, {}",
+            op,
+            "sdpa expects q, k, v of equal rank >= 2, got ranks {}, {}, {}",
             q.rank,
             k.rank,
             v.rank
         ));
     }
-    for d in 0..rank - 2 {
-        if q.shape[d] != k.shape[d] || q.shape[d] != v.shape[d] {
+    let headed = attr_i64(a, "num_heads").is_some();
+    // GQA is declared, never inferred. The headed form carries the heads on
+    // the second-to-last axis (validated against the declaration); the
+    // legacy flat form is the same math with a single head.
+    let (batch_axes, s, hq, d) = if headed {
+        if rank < 3 {
             return Err(fail!(
-                c.op,
-                "sdpa batch dim {d} mismatch: q={}, k={}, v={} (batch dims must be identical)",
-                q.shape[d],
-                k.shape[d],
-                v.shape[d]
+                op,
+                "sdpa with 'num_heads' expects per-head inputs [.., S, H, D] of rank >= 3,                  got rank {rank}"
+            ));
+        }
+        (
+            rank - 3,
+            q.shape[rank - 3] as usize,
+            q.shape[rank - 2] as usize,
+            q.shape[rank - 1] as usize,
+        )
+    } else {
+        (
+            rank - 2,
+            q.shape[rank - 2] as usize,
+            1,
+            q.shape[rank - 1] as usize,
+        )
+    };
+    let num_heads = attr_i64(a, "num_heads").unwrap_or(1);
+    if num_heads < 1 {
+        return Err(fail!(op, "sdpa 'num_heads' ({num_heads}) must be >= 1"));
+    }
+    if headed && hq != num_heads as usize {
+        return Err(fail!(
+            op,
+            "sdpa q head axis is {hq} but 'num_heads' declares {num_heads} — the heads are              declared, never inferred"
+        ));
+    }
+    let num_kv = attr_i64(a, "num_kv_heads").unwrap_or(num_heads);
+    if num_kv < 1 || num_heads % num_kv != 0 {
+        return Err(fail!(
+            op,
+            "sdpa 'num_kv_heads' ({num_kv}) must divide 'num_heads' ({num_heads})"
+        ));
+    }
+    for dd in 0..batch_axes {
+        if q.shape[dd] != k.shape[dd] || q.shape[dd] != v.shape[dd] {
+            return Err(fail!(
+                op,
+                "sdpa batch dim {dd} mismatch: q={}, k={}, v={} (batch dims must be identical)",
+                q.shape[dd],
+                k.shape[dd],
+                v.shape[dd]
             ));
         }
     }
-    let (s, dv) = (q.shape[rank - 2], q.shape[rank - 1]);
-    let (t, dk) = (k.shape[rank - 2], k.shape[rank - 1]);
-    if dk != dv || k.shape[rank - 2] != v.shape[rank - 2] {
+    let (t, kd) = (
+        k.shape[rank - 2 - headed as usize] as usize,
+        k.shape[rank - 1] as usize,
+    );
+    if v.shape[rank - 2 - headed as usize] as usize != t {
         return Err(fail!(
-            c.op,
-            "sdpa dim mismatch: q {:?}, k {:?}, v {:?}",
+            op,
+            "sdpa dim mismatch: q {:?}, k {:?}, v {:?} (k and v share the sequence length T)",
             q.dims(),
             k.dims(),
             v.dims()
         ));
     }
-    let _ = attr_f64(a, "scale");
+    if headed && (k.shape[rank - 2] as usize) != num_kv as usize {
+        return Err(fail!(
+            op,
+            "sdpa k head axis is {} but 'num_kv_heads' declares {num_kv}",
+            k.shape[rank - 2]
+        ));
+    }
+    if kd != d {
+        return Err(fail!(op, "sdpa k head dim ({kd}) must equal q's ({d})"));
+    }
+    let (v_heads, vd) = if headed {
+        (v.shape[rank - 2] as usize, v.shape[rank - 1] as usize)
+    } else {
+        (1, v.shape[rank - 1] as usize)
+    };
+    if v_heads != num_kv as usize {
+        return Err(fail!(
+            op,
+            "sdpa v head axis is {v_heads} but 'num_kv_heads' declares {num_kv}"
+        ));
+    }
+    // The declared scale convention: explicit `scale` wins; absent, the
+    // headed form (num_heads declared) defaults to 1/sqrt(head_dim) and the
+    // legacy flat form keeps its pre-D5 default of 1.0 — additive with the
+    // old behaviour as the default, and the declared expansion's softmax
+    // node still matches the legacy path.
+    let scale = match attr_f64(a, "scale") {
+        Some(s) => s as f32,
+        None if headed => 1.0 / (d as f32).sqrt(),
+        None => 1.0,
+    };
+    let causal = crate::attrs::attr_bool(a, "causal").unwrap_or(false);
+    Ok(SdpaPlan {
+        rank,
+        s,
+        t,
+        num_heads: num_heads as usize,
+        num_kv: num_kv as usize,
+        d,
+        dv: vd,
+        scale,
+        causal,
+        headed,
+    })
+}
+
+/// The sdpa output shape: the input shape with the head dim replaced by Dv —
+/// each of the num_heads output heads carries the value head width Dv (which
+/// equals D in Qwen3.6, where the output is q-shaped).
+fn sdpa_out_shape(q: &RsTensor, headed: bool, dv: usize) -> SmallShape {
+    let rank = q.rank as usize;
     let mut shape = SmallShape {
         len: rank,
         dims: [0; MAX_RANK],
     };
     shape.dims[..rank].copy_from_slice(q.dims());
-    shape.dims[rank - 1] = v.shape[rank - 1];
+    shape.dims[rank - 1] = dv as i64;
+    let _ = headed;
+    shape
+}
+
+fn sdpa_infer_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
+    c.expect_arity((3, 4))?;
+    c.expect_out_count(1)?;
+    let plan = sdpa_plan(c.in_t(0), c.in_t(1), c.in_t(2), a, c.op)?;
+    if c.n_in() == 4 {
+        // The additive padding/causal mask must broadcast (right-aligned) to
+        // [.., S, T]; 0.0 attends, -inf masks (the HF attention_mask form).
+        let m = c.in_t(3);
+        if m.dtype != RsDtype::F32 {
+            return Err(err(
+                c.op,
+                format!("sdpa mask has dtype {}, expected f32", m.dtype),
+            ));
+        }
+        let batch_axes = plan.rank - if plan.headed { 3 } else { 2 };
+        let mut want = SmallShape {
+            len: plan.rank,
+            dims: [0; MAX_RANK],
+        };
+        want.dims[..batch_axes].copy_from_slice(&c.in_t(0).dims()[..batch_axes]);
+        want.dims[batch_axes] = plan.s as i64;
+        want.dims[batch_axes + 1] = plan.t as i64;
+        want.len = batch_axes + 2;
+        crate::tensor::broadcast_shape_small(m.dims(), want.as_slice(), c.op).map_err(|e| {
+            err(
+                c.op,
+                format!("sdpa mask must broadcast to {:?}: {e}", want.as_slice()),
+            )
+        })?;
+    }
+    let shape = sdpa_out_shape(c.in_t(0), plan.headed, plan.dv);
     let o = c.out_t(0);
     set_output_desc(o, RsDtype::F32, shape.as_slice());
-    let _ = (s, t);
     Ok(())
 }
 
 fn sdpa_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
-    c.expect_arity((3, 3))?;
+    c.expect_arity((3, 4))?;
     c.expect_out_count(1)?;
     let q = c.in_t(0);
-    let k = c.in_t(1);
-    let v = c.in_t(2);
-    for (i, t) in [(0usize, q), (1, k), (2, v)] {
-        if t.dtype != RsDtype::F32 {
-            return Err(err(c.op, format!("input {i} has dtype {}, expected f32", t.dtype)));
-        }
-    }
-    let rank = q.rank as usize;
-    if rank < 3 || k.rank as usize != rank || v.rank as usize != rank {
-        return Err(fail!(
-            c.op,
-            "sdpa expects q, k, v of equal rank >= 3, got ranks {}, {}, {}",
-            q.rank,
-            k.rank,
-            v.rank
-        ));
-    }
-    for d in 0..rank - 2 {
-        if q.shape[d] != k.shape[d] || q.shape[d] != v.shape[d] {
-            return Err(fail!(
-                c.op,
-                "sdpa batch dim {d} mismatch: q={}, k={}, v={}",
-                q.shape[d],
-                k.shape[d],
-                v.shape[d]
-            ));
-        }
-    }
-    let (s, d) = (q.dims()[rank - 2] as usize, q.dims()[rank - 1] as usize);
-    let t = k.dims()[rank - 2] as usize;
-    let dv = v.dims()[rank - 1] as usize;
-    if k.dims()[rank - 1] as usize != d || v.dims()[rank - 2] as usize != t {
-        return Err(fail!(
-            c.op,
-            "sdpa dim mismatch: q {:?}, k {:?}, v {:?}",
-            q.dims(),
-            k.dims(),
-            v.dims()
-        ));
-    }
-    let batches: usize = q.dims()[..rank - 2].iter().map(|&x| x as usize).product();
-    // Convention (documented): when `scale` is absent the fused body uses
-    // scale = 1.0, exactly like the declared expansion's softmax node; the
-    // caller passes 1/sqrt(D) explicitly if it wants scaled attention. This
-    // keeps fused and expansion bitwise comparable, which is the point of a
-    // reference backend.
-    let scale = attr_f64(a, "scale").unwrap_or(1.0) as f32;
-    let mut shape = SmallShape {
-        len: rank,
-        dims: [0; MAX_RANK],
-    };
-    shape.dims[..rank].copy_from_slice(q.dims());
-    shape.dims[rank - 1] = v.dims()[rank - 1];
-    expect_out(c.out_t(0), c.op, RsDtype::F32, shape.as_slice())?;
+    let plan = sdpa_plan(q, c.in_t(1), c.in_t(2), a, c.op)?;
+    let SdpaPlan {
+        rank,
+        s,
+        t,
+        num_heads,
+        num_kv,
+        d,
+        dv,
+        scale,
+        causal,
+        headed,
+    } = plan;
+    let out_shape = sdpa_out_shape(q, headed, dv);
+    expect_out(c.out_t(0), c.op, RsDtype::F32, out_shape.as_slice())?;
     // SAFETY: descriptor liveness is the ABI caller's contract.
     let qv = unsafe { crate::tensor::f32_in(c.op, "q", q) }?;
-    let kv = unsafe { crate::tensor::f32_in(c.op, "k", k) }?;
-    let vv = unsafe { crate::tensor::f32_in(c.op, "v", v) }?;
+    let kv = unsafe { crate::tensor::f32_in(c.op, "k", c.in_t(1)) }?;
+    let vv = unsafe { crate::tensor::f32_in(c.op, "v", c.in_t(2)) }?;
     let mut ov = unsafe { crate::tensor::f32_out(c.op, c.out_t(0)) }?;
-    // Fused body = the declared expansion, with stable softmax: per batch,
-    // scores = q @ k^T (d ascending), row-softmax over t, then @ v (t
-    // ascending). All reductions in fixed index order — deterministic.
+    let qs = qv.as_slice().expect("contiguous");
+    let ks = kv.as_slice().expect("contiguous");
+    let vs = vv.as_slice().expect("contiguous");
+    let os = ov.as_slice_mut().expect("contiguous");
+    let batch_axes = rank - if headed { 3 } else { 2 };
+    let batch_dims: Vec<usize> = q.dims()[..batch_axes].iter().map(|&x| x as usize).collect();
+    let batches: usize = batch_dims.iter().product();
+
+    // The additive mask, right-aligned broadcast to [.., S, T]. Read with
+    // plain index math (size-1 dims stretch, missing leading dims stretch)
+    // straight from the caller's buffer — no copy, no extra scratch, and the
+    // memory reporter stays exact.
+    let mask_raw: Option<(*const f32, usize, Vec<usize>)> = if c.n_in() == 4 {
+        let m = c.in_t(3);
+        // Validates dtype/contiguity; the descriptor and its buffer are
+        // owned by the caller and outlive this call.
+        let mv = unsafe { crate::tensor::f32_in(c.op, "mask", m) }?;
+        let dims: Vec<usize> = m.dims().iter().map(|&x| x.max(1) as usize).collect();
+        Some((mv.as_ptr(), mv.len(), dims))
+    } else {
+        None
+    };
+
+    // Two scratch buffers (scores + probs), reused per (batch, head) — the
+    // memory reporter accounts for exactly these S*T elements each.
     let mut scores = vec![0.0f32; s * t];
     let mut probs = vec![0.0f32; s * t];
+    // SAFETY: the mask buffer is the caller's, live for the whole call, and
+    // `f32_in` above validated dtype and contiguity.
+    let mask_slice = mask_raw
+        .as_ref()
+        .map(|(p, n, _)| unsafe { std::slice::from_raw_parts(*p, *n) });
+    let mut prefix = vec![0usize; batch_axes];
+    // Strides of the last (S/H, head, D) axes for the per-batch head reads.
+    let r = num_heads / num_kv;
     for b in 0..batches {
-        let qb = &qv.as_slice().expect("contiguous")[b * s * d..(b + 1) * s * d];
-        let kb = &kv.as_slice().expect("contiguous")[b * t * d..(b + 1) * t * d];
-        let vb = &vv.as_slice().expect("contiguous")[b * t * dv..(b + 1) * t * dv];
-        for i in 0..s {
-            for j in 0..t {
-                let mut acc = 0.0f32;
-                for dd in 0..d {
-                    acc += qb[i * d + dd] * kb[j * d + dd];
-                }
-                scores[i * t + j] = acc;
-            }
+        let mut rem = b;
+        for dd in (0..batch_axes).rev() {
+            prefix[dd] = rem % batch_dims[dd];
+            rem /= batch_dims[dd];
         }
-        for i in 0..s {
-            let row = &scores[i * t..(i + 1) * t];
-            let m = row.iter().fold(f32::NEG_INFINITY, |acc, &x| acc.max(x));
-            let sum = row.iter().fold(0.0f32, |acc, &x| acc + ((x - m) * scale).exp());
-            for j in 0..t {
-                probs[i * t + j] = ((row[j] - m) * scale).exp() / sum;
-            }
-        }
-        let ob = &mut ov.as_slice_mut().expect("contiguous")[b * s * dv..(b + 1) * s * dv];
-        for i in 0..s {
-            for jj in 0..dv {
-                let mut acc = 0.0f32;
+        for h in 0..num_heads {
+            let kv_h = h / r;
+            // Per-head offsets: headed [.., S, H, D] with strides S: H*D,
+            // heads: D; legacy [.., S, D] with strides S: D. Explicit math.
+            let (q_base, q_step, k_base, k_step, v_base, v_step, o_base, o_step) = if headed {
+                (
+                    b * s * num_heads * d + h * d,
+                    num_heads * d,
+                    b * t * num_kv * d + kv_h * d,
+                    num_kv * d,
+                    b * t * num_kv * dv + kv_h * dv,
+                    num_kv * dv,
+                    b * s * num_heads * dv + h * dv,
+                    num_heads * dv,
+                )
+            } else {
+                (b * s * d, d, b * t * d, d, b * t * dv, dv, b * s * dv, dv)
+            };
+            // scores = q @ k^T * scale, then the declared mask and the causal
+            // triangle. All reductions in ascending order — deterministic.
+            for i in 0..s {
                 for j in 0..t {
-                    acc += probs[i * t + j] * vb[j * dv + jj];
+                    let mut acc = 0.0f32;
+                    for dd in 0..d {
+                        acc += qs[q_base + i * q_step + dd] * ks[k_base + j * k_step + dd];
+                    }
+                    acc *= scale;
+                    if let (Some(mask), Some((_, _, mdims))) = (&mask_slice, &mask_raw) {
+                        acc += mask_value(mask, mdims, &prefix, i, j);
+                    }
+                    if causal && j > i {
+                        acc = f32::NEG_INFINITY;
+                    }
+                    scores[i * t + j] = acc;
                 }
-                ob[i * dv + jj] = acc;
+            }
+            // Stable row softmax over T; -inf entries (masked positions)
+            // exponentiate to 0 exactly.
+            for i in 0..s {
+                let row = &scores[i * t..(i + 1) * t];
+                let m = row.iter().fold(f32::NEG_INFINITY, |acc, &x| acc.max(x));
+                let sum = row.iter().fold(0.0f32, |acc, &x| acc + (x - m).exp());
+                for j in 0..t {
+                    probs[i * t + j] = (row[j] - m).exp() / sum;
+                }
+            }
+            for i in 0..s {
+                for jj in 0..dv {
+                    let mut acc = 0.0f32;
+                    for j in 0..t {
+                        acc += probs[i * t + j] * vs[v_base + j * v_step + jj];
+                    }
+                    os[o_base + i * o_step + jj] = acc;
+                }
             }
         }
     }
     Ok(())
+}
+
+fn mask_value(mask: &[f32], mdims: &[usize], prefix: &[usize], i: usize, j: usize) -> f32 {
+    let rank = prefix.len() + 2;
+    let mut offset = 0usize;
+    let mut stride = 1usize;
+    for d in (0..rank).rev() {
+        let coord = if d < prefix.len() {
+            prefix[d]
+        } else if d == prefix.len() {
+            i
+        } else {
+            j
+        };
+        let md = d as i64 + mdims.len() as i64 - rank as i64;
+        let dim = if md >= 0 && (md as usize) < mdims.len() {
+            mdims[md as usize]
+        } else {
+            1
+        };
+        let local = if dim == 1 { 0 } else { coord % dim };
+        offset += local * stride;
+        stride *= dim.max(1);
+    }
+    mask[offset]
 }
 
 /// Declared expansion of `sdpa`: `bmm(q, k, transpose_b=true)` -> `softmax`
 /// -> `bmm(p, v)`. The transposed-B form is chosen because this provider's
 /// matmul family requires contiguous inputs (documented policy), and a
 /// `transpose` view would be strided and therefore unusable downstream.
+///
+/// The expansion describes the **legacy flat form** (num_heads =
+/// num_kv_heads = 1, scale 1.0, no causal/mask) — the only form the
+/// primitive vocabulary can express, which is precisely why the fused body
+/// exists. GQA/causal cases cannot be replayed and the conformance gate
+/// reports that as a skip, never as a mismatch.
 ///
 /// Node attribute table (the current `ExpansionSpec` API cannot attach
 /// per-node attrs — see the module doc):
@@ -296,7 +501,10 @@ fn cross_entropy_infer_body(c: &mut Call, _a: &RsAttrs) -> OpResult<()> {
     if logits.rank != 2 {
         return Err(err(
             c.op,
-            format!("cross_entropy expects logits [N, C], got rank {}", logits.rank),
+            format!(
+                "cross_entropy expects logits [N, C], got rank {}",
+                logits.rank
+            ),
         ));
     }
     if targets.rank != 1 || targets.shape[0] != logits.shape[0] {
@@ -438,7 +646,10 @@ fn adamw_infer_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     for (i, who) in [(1usize, "grad"), (2, "exp_avg"), (3, "exp_avg_sq")] {
         let t = c.in_t(i);
         if t.dtype != RsDtype::F32 {
-            return Err(err(c.op, format!("input '{who}' has dtype {}, expected f32", t.dtype)));
+            return Err(err(
+                c.op,
+                format!("input '{who}' has dtype {}, expected f32", t.dtype),
+            ));
         }
         if t.dims() != p.dims() {
             return Err(err(
@@ -465,7 +676,10 @@ fn adamw_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     for (i, who) in [(1usize, "grad"), (2, "exp_avg"), (3, "exp_avg_sq")] {
         let t = c.in_t(i);
         if t.dtype != RsDtype::F32 {
-            return Err(err(c.op, format!("input '{who}' has dtype {}, expected f32", t.dtype)));
+            return Err(err(
+                c.op,
+                format!("input '{who}' has dtype {}, expected f32", t.dtype),
+            ));
         }
         if t.dims() != p.dims() {
             return Err(err(
@@ -573,7 +787,10 @@ fn topk_infer_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     if logits.rank != 2 {
         return Err(err(
             c.op,
-            format!("topk_router expects logits [N, E], got rank {}", logits.rank),
+            format!(
+                "topk_router expects logits [N, E], got rank {}",
+                logits.rank
+            ),
         ));
     }
     let e = logits.shape[1];
@@ -605,7 +822,10 @@ fn topk_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     if logits.rank != 2 {
         return Err(err(
             c.op,
-            format!("topk_router expects logits [N, E], got rank {}", logits.rank),
+            format!(
+                "topk_router expects logits [N, E], got rank {}",
+                logits.rank
+            ),
         ));
     }
     let n = logits.shape[0] as usize;

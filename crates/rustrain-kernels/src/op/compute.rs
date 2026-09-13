@@ -7,14 +7,14 @@
 //! `HashMap` iteration — so the same inputs twice produce bitwise-identical
 //! outputs. This is the reference provider's whole reason to exist.
 
-use ndarray::{ArrayView1, ArrayViewD, Axis, Dimension, IxDyn, Zip};
+use ndarray::{ArrayView1, Axis, IxDyn, Zip};
 use rustrain_abi::ffi::{RsAttrs, RsTensor};
 
-use crate::attrs::{attr_bool, attr_f64, attr_i64, require_str_of};
+use crate::attrs::{attr_bool, attr_f64, attr_i64, require_str_of, str_or};
 use crate::dispatch::{Call, run};
 use crate::error::{OpResult, err, fail};
 use crate::tensor::{
-    SmallShape, broadcast_shape_small, expect_out, expect_dtype, resolve_axis, set_output_desc,
+    SmallShape, broadcast_shape_small, expect_dtype, expect_out, resolve_axis, set_output_desc,
 };
 
 macro_rules! infer_entry {
@@ -58,7 +58,12 @@ fn check_f32_desc(t: &RsTensor, op: &'static str, who: &str) -> OpResult<()> {
 
 /// Shared matmul shape plan (used by infer and execute, so direct execute
 /// calls get the same validation): returns (m, k, n, transpose_b).
-fn matmul_plan(a: &RsTensor, b: &RsTensor, attrs: &RsAttrs, op: &'static str) -> OpResult<(i64, i64, i64, bool)> {
+fn matmul_plan(
+    a: &RsTensor,
+    b: &RsTensor,
+    attrs: &RsAttrs,
+    op: &'static str,
+) -> OpResult<(i64, i64, i64, bool)> {
     check_f32_desc(a, op, "a")?;
     check_f32_desc(b, op, "b")?;
     if a.rank != 2 || b.rank != 2 {
@@ -229,7 +234,12 @@ fn linear_exec_body(c: &mut Call, _a: &RsAttrs) -> OpResult<()> {
     };
     shape.dims[..shape.len].copy_from_slice(x.dims());
     shape.dims[shape.len - 1] = w.shape[1];
-    expect_out(c.out_t(0), c.op, rustrain_abi::ffi::RsDtype::F32, shape.as_slice())?;
+    expect_out(
+        c.out_t(0),
+        c.op,
+        rustrain_abi::ffi::RsDtype::F32,
+        shape.as_slice(),
+    )?;
     // SAFETY: descriptor liveness is the ABI caller's contract.
     let xv = unsafe { crate::tensor::f32_in(c.op, "x", x) }?;
     let wv = unsafe { crate::tensor::f32_in(c.op, "w", w) }?;
@@ -332,14 +342,22 @@ fn bmm_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     c.expect_out_count(1)?;
     let (r, m, k, n, b_t) = bmm_plan(c.in_t(0), c.in_t(1), a, c.op)?;
     let (m, k, n) = (m as usize, k as usize, n as usize);
-    let batches: usize = c.in_t(0).dims()[..r - 2].iter().map(|&d| d as usize).product();
+    let batches: usize = c.in_t(0).dims()[..r - 2]
+        .iter()
+        .map(|&d| d as usize)
+        .product();
     let mut shape = SmallShape {
         len: r,
         dims: [0; rustrain_abi::ffi::MAX_RANK],
     };
     shape.dims[..r].copy_from_slice(c.in_t(0).dims());
     shape.dims[r - 1] = n as i64;
-    expect_out(c.out_t(0), c.op, rustrain_abi::ffi::RsDtype::F32, shape.as_slice())?;
+    expect_out(
+        c.out_t(0),
+        c.op,
+        rustrain_abi::ffi::RsDtype::F32,
+        shape.as_slice(),
+    )?;
     // SAFETY: descriptor liveness is the ABI caller's contract.
     let av = unsafe { crate::tensor::f32_in(c.op, "a", c.in_t(0)) }?;
     let bv = unsafe { crate::tensor::f32_in(c.op, "b", c.in_t(1)) }?;
@@ -384,6 +402,8 @@ pub(crate) const UNARY_KINDS: &[&str] = &[
     "neg",
     "sqrt",
     "rsqrt",
+    "softplus",
+    "negative_exp",
     "silu_grad",
     "gelu_grad",
     "sigmoid_grad",
@@ -415,6 +435,17 @@ fn unary_fn(op: &'static str, kind: &str) -> OpResult<fn(f32) -> f32> {
         // separately-rounded rsqrt intrinsic, so the doc's "1/sqrt(x)" is
         // exactly what runs.
         "rsqrt" => |x: f32| 1.0 / x.sqrt(),
+        // torch F.softplus with the default beta=1, threshold=20: the exact
+        // identity for x > 20 (ln(1+e^x) would overflow its argument's
+        // exponent), ln(1+e^x) otherwise. Qwen3.6's dt gate:
+        // softplus(a + dt_bias).
+        "softplus" => |x: f32| {
+            if x > 20.0 { x } else { x.exp().ln_1p() }
+        },
+        // -exp(x), spelled the way the Qwen3.6 description declares it
+        // (`elementwise_unary(kind: negative_exp)` on A_log); the composition
+        // neg(exp(x)) would need two nodes for the same math.
+        "negative_exp" => |x: f32| -x.exp(),
         // silu(x) = x*σ(x) ⇒ silu' = σ(x)*(1 + x*(1 - σ(x))). σ comes from
         // the same 1/(1+e^-x) as the forward silu, so a central finite
         // difference of the forward op matches to rounding error.
@@ -448,11 +479,7 @@ fn unary_fn(op: &'static str, kind: &str) -> OpResult<fn(f32) -> f32> {
         // there): 0. The strict '>' follows IEEE — NaN compares false, so
         // relu_grad(NaN) = 0, matching relu(NaN) = 0 via f32::max.
         "relu_grad" => |x: f32| {
-            if x > 0.0 {
-                1.0
-            } else {
-                0.0
-            }
+            if x > 0.0 { 1.0 } else { 0.0 }
         },
         other => {
             return Err(err(
@@ -566,7 +593,12 @@ fn binary_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     } else {
         SmallShape::of(x)
     };
-    expect_out(c.out_t(0), c.op, rustrain_abi::ffi::RsDtype::F32, out_shape.as_slice())?;
+    expect_out(
+        c.out_t(0),
+        c.op,
+        rustrain_abi::ffi::RsDtype::F32,
+        out_shape.as_slice(),
+    )?;
     // SAFETY: descriptor liveness is the ABI caller's contract.
     let xv = unsafe { crate::tensor::f32_in(c.op, "a", x) }?;
     let mut yv = unsafe { crate::tensor::f32_out(c.op, c.out_t(0)) }?;
@@ -578,11 +610,7 @@ fn binary_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     } else {
         // SAFETY: descriptor liveness is the ABI caller's contract.
         let bv = unsafe { crate::tensor::f32_in(c.op, "b", c.in_t(1)) }?;
-        let dims: Vec<usize> = out_shape
-            .as_slice()
-            .iter()
-            .map(|&d| d as usize)
-            .collect();
+        let dims: Vec<usize> = out_shape.as_slice().iter().map(|&d| d as usize).collect();
         let ab = xv
             .broadcast(IxDyn(&dims))
             .ok_or_else(|| err(c.op, "broadcast of 'a' failed unexpectedly"))?;
@@ -590,7 +618,10 @@ fn binary_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
             .broadcast(IxDyn(&dims))
             .ok_or_else(|| err(c.op, "broadcast of 'b' failed unexpectedly"))?;
         // Zip iterates in the fixed logical order — deterministic.
-        Zip::from(&ab).and(&bb).and(&mut yv).for_each(|&a, &b, y| *y = f(a, b));
+        Zip::from(&ab)
+            .and(&bb)
+            .and(&mut yv)
+            .for_each(|&a, &b, y| *y = f(a, b));
     }
     Ok(())
 }
@@ -765,7 +796,12 @@ fn reduce_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     let x = c.in_t(0);
     let kind = require_str_of(a, "kind", REDUCE_KINDS, c.op)?;
     let out_shape = reduce_out_shape(x, a, c.op)?;
-    expect_out(c.out_t(0), c.op, rustrain_abi::ffi::RsDtype::F32, out_shape.as_slice())?;
+    expect_out(
+        c.out_t(0),
+        c.op,
+        rustrain_abi::ffi::RsDtype::F32,
+        out_shape.as_slice(),
+    )?;
     // SAFETY: descriptor liveness is the ABI caller's contract.
     let xv = unsafe { crate::tensor::f32_in(c.op, "x", x) }?;
     let mut yv = unsafe { crate::tensor::f32_out(c.op, c.out_t(0)) }?;
@@ -774,9 +810,9 @@ fn reduce_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
             // Reduce-all: iterate the whole buffer in order. Works for both
             // the rank-0 scalar shape and the all-ones keepdim shape (both
             // hold exactly one element).
-            let flat = xv.as_slice().ok_or_else(|| {
-                err(c.op, "input is not contiguous in memory (unexpected)")
-            })?;
+            let flat = xv
+                .as_slice()
+                .ok_or_else(|| err(c.op, "input is not contiguous in memory (unexpected)"))?;
             let lane = ArrayView1::from(flat);
             let v = reduce_lane(c.op, kind, lane)?;
             if let Some(first) = yv.iter_mut().next() {
@@ -834,7 +870,9 @@ fn softmax_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     // large-magnitude lane (e.g. [1000, 1000, 0]) cannot overflow to inf/NaN.
     for (lane, mut out) in xv.lanes(ax).into_iter().zip(yv.lanes_mut(ax)) {
         let m = lane.iter().fold(f32::NEG_INFINITY, |acc, &v| acc.max(v));
-        let s = lane.iter().fold(0.0f32, |acc, &v| acc + ((v - m) * scale).exp());
+        let s = lane
+            .iter()
+            .fold(0.0f32, |acc, &v| acc + ((v - m) * scale).exp());
         for (o, &v) in out.iter_mut().zip(lane.iter()) {
             *o = ((v - m) * scale).exp() / s;
         }
@@ -884,6 +922,11 @@ fn rmsnorm_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
     }
     let rank = x.rank as usize;
     let eps = norm_eps(a) as f32;
+    // Weight convention (declared, D5): y = n * (w + weight_offset). The
+    // trunk uses offset 1.0 (1 + weight); GDN's gated normalisation uses the
+    // raw weight (offset 0.0, the default — the pre-D5 behaviour). Without a
+    // weight input the offset has nothing to add to and is ignored.
+    let offset = attr_f64(a, "weight_offset").unwrap_or(0.0) as f32;
     expect_out(c.out_t(0), c.op, rustrain_abi::ffi::RsDtype::F32, x.dims())?;
     // SAFETY: descriptor liveness is the ABI caller's contract.
     let xv = unsafe { crate::tensor::f32_in(c.op, "x", x) }?;
@@ -894,8 +937,8 @@ fn rmsnorm_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
         None
     };
     let mut yv = unsafe { crate::tensor::f32_out(c.op, c.out_t(0)) }?;
-    // Convention (documented): y = x / sqrt(mean(x^2) + eps) * w, eps inside
-    // the sqrt. mean(x^2) is accumulated in ascending order.
+    // Convention (documented): y = x / sqrt(mean(x^2) + eps) * (w + offset),
+    // eps inside the sqrt. mean(x^2) is accumulated in ascending order.
     let ax = Axis(rank - 1);
     for (lane, mut out) in xv.lanes(ax).into_iter().zip(yv.lanes_mut(ax)) {
         let ss = lane.iter().fold(0.0f32, |acc, &v| acc + v * v) / lane.len() as f32;
@@ -903,9 +946,271 @@ fn rmsnorm_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
         for (i, (o, &v)) in out.iter_mut().zip(lane.iter()).enumerate() {
             let n = v / r;
             *o = match &wv {
-                Some(w) => n * w[i],
+                Some(w) => n * (w[i] + offset),
                 None => n,
             };
+        }
+    }
+    Ok(())
+}
+
+// ── l2norm ──────────────────────────────────────────────────────────────────
+
+/// `y = x * rsqrt(sum(x^2, dim) + eps)`: the L2 normalisation GDN applies to
+/// q and k (HF `l2norm` in `modeling_qwen3_5_moe.py`, aligned with FLA: the
+/// SUM of squares — not the mean — with eps added *inside* the rsqrt).
+/// No learnable parameter; the delta rule's 1/sqrt(D) query scaling is a
+/// separate, always-applied convention of `gated_delta_rule` itself.
+fn l2norm_infer_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
+    c.expect_arity((1, 1))?;
+    c.expect_out_count(1)?;
+    let x = c.in_t(0);
+    check_f32_desc(x, c.op, "x")?;
+    let rank = x.rank as usize;
+    if rank < 1 {
+        return Err(err(c.op, "l2norm expects rank >= 1"));
+    }
+    resolve_axis(attr_i64(a, "dim").unwrap_or(-1), rank, c.op)?;
+    let _ = attr_f64(a, "eps").unwrap_or(1e-6);
+    let o = c.out_t(0);
+    set_output_desc(o, rustrain_abi::ffi::RsDtype::F32, x.dims());
+    Ok(())
+}
+
+fn l2norm_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
+    c.expect_arity((1, 1))?;
+    c.expect_out_count(1)?;
+    let x = c.in_t(0);
+    check_f32_desc(x, c.op, "x")?;
+    let rank = x.rank as usize;
+    if rank < 1 {
+        return Err(err(c.op, "l2norm expects rank >= 1"));
+    }
+    let eps = attr_f64(a, "eps").unwrap_or(1e-6) as f32;
+    expect_out(c.out_t(0), c.op, rustrain_abi::ffi::RsDtype::F32, x.dims())?;
+    // SAFETY: descriptor liveness is the ABI caller's contract.
+    let xv = unsafe { crate::tensor::f32_in(c.op, "x", x) }?;
+    let mut yv = unsafe { crate::tensor::f32_out(c.op, c.out_t(0)) }?;
+    // Convention (documented): y = x / sqrt(sum(x^2) + eps), the sum (not the
+    // mean) accumulated in ascending order, eps inside the sqrt.
+    let ax = Axis(resolve_axis(attr_i64(a, "dim").unwrap_or(-1), rank, c.op)?);
+    for (lane, mut out) in xv.lanes(ax).into_iter().zip(yv.lanes_mut(ax)) {
+        let ss = lane.iter().fold(0.0f32, |acc, &v| acc + v * v);
+        let r = (ss + eps).sqrt();
+        for (o, &v) in out.iter_mut().zip(lane.iter()) {
+            *o = v / r;
+        }
+    }
+    Ok(())
+}
+
+// ── rmsnorm_gated ───────────────────────────────────────────────────────────
+
+/// GDN's output normalisation (HF `Qwen3_5MoeRMSNormGated`): the reduce and
+/// the gating run in ONE pass over the data. `x` is treated as `[rows, D]`
+/// rows (D = w.len(), any leading layout whose numel is a multiple of D —
+/// HF reshapes the v-heads flat before the norm), and
+/// `y = (x / sqrt(mean(x^2) + eps)) * (w + weight_offset) * silu(gate)`.
+/// Weight convention: RAW weight (offset 0.0), unlike the trunk's 1 + weight.
+fn rmsnorm_gated_infer_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
+    c.expect_arity((3, 3))?;
+    c.expect_out_count(1)?;
+    let x = c.in_t(0);
+    check_f32_desc(x, c.op, "x")?;
+    let rank = x.rank as usize;
+    if rank < 1 {
+        return Err(err(c.op, "rmsnorm_gated expects rank >= 1"));
+    }
+    let d = x.dims()[rank - 1];
+    if d <= 0 {
+        return Err(err(c.op, "rmsnorm_gated expects a positive last dim"));
+    }
+    let w = c.in_t(1);
+    check_f32_desc(w, c.op, "w")?;
+    if w.rank != 1 || w.shape[0] != d {
+        return Err(fail!(
+            c.op,
+            "rmsnorm_gated weight must be [D={d}], got {:?}",
+            w.dims()
+        ));
+    }
+    let gate = c.in_t(2);
+    check_f32_desc(gate, c.op, "gate")?;
+    if gate.numel() != x.numel() {
+        return Err(fail!(
+            c.op,
+            "rmsnorm_gated gate must have the same element count as x ({}), got {} \
+             — the gate is applied elementwise after the row normalisation",
+            x.numel(),
+            gate.numel()
+        ));
+    }
+    str_or(a, "gate_act", "silu", &["silu"], c.op)?;
+    let _ = attr_f64(a, "eps").unwrap_or(1e-6);
+    let _ = attr_f64(a, "weight_offset").unwrap_or(0.0);
+    let o = c.out_t(0);
+    set_output_desc(o, rustrain_abi::ffi::RsDtype::F32, x.dims());
+    Ok(())
+}
+
+fn rmsnorm_gated_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
+    c.expect_arity((3, 3))?;
+    c.expect_out_count(1)?;
+    let x = c.in_t(0);
+    check_f32_desc(x, c.op, "x")?;
+    let rank = x.rank as usize;
+    if rank < 1 {
+        return Err(err(c.op, "rmsnorm_gated expects rank >= 1"));
+    }
+    let d = x.dims()[rank - 1] as usize;
+    let eps = attr_f64(a, "eps").unwrap_or(1e-6) as f32;
+    let offset = attr_f64(a, "weight_offset").unwrap_or(0.0) as f32;
+    str_or(a, "gate_act", "silu", &["silu"], c.op)?;
+    expect_out(c.out_t(0), c.op, rustrain_abi::ffi::RsDtype::F32, x.dims())?;
+    // SAFETY: descriptor liveness is the ABI caller's contract.
+    let xv = unsafe { crate::tensor::f32_in(c.op, "x", x) }?;
+    let wv = unsafe { crate::tensor::f32_in(c.op, "w", c.in_t(1)) }?;
+    let gv = unsafe { crate::tensor::f32_in(c.op, "gate", c.in_t(2)) }?;
+    let mut yv = unsafe { crate::tensor::f32_out(c.op, c.out_t(0)) }?;
+    let xs = xv.as_slice().expect("contiguous");
+    let gs = gv.as_slice().expect("contiguous");
+    let ys = yv.as_slice_mut().expect("contiguous");
+    // One reduce pass (documented): rows of D, mean(x^2) ascending, then
+    // weight (raw + offset) and the silu gate in the same element sweep.
+    // silu(t) = t / (1 + e^-t): the x/(1+e^-x) form is exact for both tails.
+    let rows = xs.len() / d;
+    for r in 0..rows {
+        let row = &xs[r * d..(r + 1) * d];
+        let ss = row.iter().fold(0.0f32, |acc, &v| acc + v * v) / d as f32;
+        let inv = 1.0 / (ss + eps).sqrt();
+        for i in 0..d {
+            let n = row[i] * inv;
+            let g = gs[r * d + i];
+            ys[r * d + i] = n * (wv[i] + offset) * (g / (1.0 + (-g).exp()));
+        }
+    }
+    Ok(())
+}
+
+// ── causal_conv1d ───────────────────────────────────────────────────────────
+
+/// Qwen3.6's depthwise causal sequence convolution (HF `causal_conv1d_fn`):
+/// out[t, c] = sum_k w[c, 0, k] * x[t + k - pad, c], with x[j < 0] = 0 and
+/// an optional fused silu. `pad` defaults to kernel - 1, which makes the
+/// window strictly causal (taps t-kernel+1..t only). Input layout is
+/// [..., L, C] (sequence first, channels last); the weight is [C, 1, K].
+fn causal_conv1d_infer_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
+    c.expect_arity((2, 2))?;
+    c.expect_out_count(1)?;
+    let x = c.in_t(0);
+    check_f32_desc(x, c.op, "x")?;
+    let rank = x.rank as usize;
+    if rank < 2 {
+        return Err(err(c.op, "causal_conv1d expects rank >= 2 ([..., L, C])"));
+    }
+    let channels = x.dims()[rank - 1];
+    let w = c.in_t(1);
+    check_f32_desc(w, c.op, "w")?;
+    if w.rank != 3 || w.shape[1] != 1 || w.shape[0] != channels {
+        return Err(fail!(
+            c.op,
+            "causal_conv1d weight must be [C={channels}, 1, K] (depthwise), got {:?}",
+            w.dims()
+        ));
+    }
+    let k = w.shape[2];
+    let kernel = attr_i64(a, "kernel").unwrap_or(k);
+    if kernel != k {
+        return Err(fail!(
+            c.op,
+            "attribute 'kernel' ({kernel}) must equal the weight's tap count K={k} — \
+             the declared kernel size is the checkpoint's own, never a silent truncation"
+        ));
+    }
+    str_or(a, "groups", "channels", &["channels"], c.op)?;
+    let act = str_or(a, "activation", "", &["", "silu"], c.op)?;
+    let pad = attr_i64(a, "pad").unwrap_or(k - 1);
+    if pad < 0 || pad >= k {
+        return Err(fail!(
+            c.op,
+            "attribute 'pad' ({pad}) must be in [0, K={k}); the default K-1 makes the \
+             window strictly causal"
+        ));
+    }
+    let _ = act;
+    let o = c.out_t(0);
+    set_output_desc(o, rustrain_abi::ffi::RsDtype::F32, x.dims());
+    Ok(())
+}
+
+fn causal_conv1d_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
+    c.expect_arity((2, 2))?;
+    c.expect_out_count(1)?;
+    let x = c.in_t(0);
+    check_f32_desc(x, c.op, "x")?;
+    let rank = x.rank as usize;
+    if rank < 2 {
+        return Err(err(c.op, "causal_conv1d expects rank >= 2 ([..., L, C])"));
+    }
+    let (l, channels) = (x.dims()[rank - 2] as usize, x.dims()[rank - 1] as usize);
+    let w = c.in_t(1);
+    if w.rank != 3 || w.shape[1] != 1 || w.shape[0] != channels as i64 {
+        return Err(fail!(
+            c.op,
+            "causal_conv1d weight must be [C={channels}, 1, K] (depthwise), got {:?}",
+            w.dims()
+        ));
+    }
+    let k = w.shape[2] as usize;
+    let kernel = attr_i64(a, "kernel").unwrap_or(k as i64);
+    if kernel != k as i64 {
+        return Err(fail!(
+            c.op,
+            "attribute 'kernel' ({kernel}) must equal the weight's tap count K={k}"
+        ));
+    }
+    str_or(a, "groups", "channels", &["channels"], c.op)?;
+    let act = str_or(a, "activation", "", &["", "silu"], c.op)?;
+    let pad = attr_i64(a, "pad").unwrap_or(k as i64 - 1);
+    if pad < 0 || pad >= k as i64 {
+        return Err(fail!(
+            c.op,
+            "attribute 'pad' ({pad}) must be in [0, K={k}); the default K-1 makes the \
+             window strictly causal"
+        ));
+    }
+    expect_out(c.out_t(0), c.op, rustrain_abi::ffi::RsDtype::F32, x.dims())?;
+    // SAFETY: descriptor liveness is the ABI caller's contract.
+    let xv = unsafe { crate::tensor::f32_in(c.op, "x", x) }?;
+    let wv = unsafe { crate::tensor::f32_in(c.op, "w", w) }?;
+    let mut yv = unsafe { crate::tensor::f32_out(c.op, c.out_t(0)) }?;
+    let xs = xv.as_slice().expect("contiguous");
+    let ws = wv.as_slice().expect("contiguous");
+    let ys = yv.as_slice_mut().expect("contiguous");
+    let batches = xs.len() / (l * channels);
+    // Fixed ascending order (documented): batch, channel, time, tap k.
+    // out[t] = sum_k w[c, 0, k] * x[t + k - pad], x[j < 0] = 0 — the
+    // cross-correlation of F.conv1d with `pad` zeros on the left, cropped to
+    // the original length (HF causal_conv1d_fn, bias-less).
+    for b in 0..batches {
+        let xb = &xs[b * l * channels..(b + 1) * l * channels];
+        let yb = &mut ys[b * l * channels..(b + 1) * l * channels];
+        for c in 0..channels {
+            let taps = &ws[c * k..(c + 1) * k];
+            for t in 0..l {
+                let mut acc = 0.0f32;
+                for (kk, &wk) in taps.iter().enumerate() {
+                    let src = t as i64 + kk as i64 - pad;
+                    if (0..l as i64).contains(&src) {
+                        acc += wk * xb[src as usize * channels + c];
+                    }
+                }
+                yb[t * channels + c] = if act == "silu" {
+                    acc / (1.0 + (-acc).exp())
+                } else {
+                    acc
+                };
+            }
         }
     }
     Ok(())
@@ -1001,107 +1306,194 @@ fn layernorm_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
 
 // ── rope ────────────────────────────────────────────────────────────────────
 
-fn rope_infer_body(c: &mut Call, _a: &RsAttrs) -> OpResult<()> {
-    c.expect_arity((3, 3))?;
-    c.expect_out_count(1)?;
-    let x = c.in_t(0);
-    check_f32_desc(x, c.op, "x")?;
+/// Shared rope shape plan for infer and execute. Returns
+/// (rank, s, d, rotary_dim) and validates both operands and the optional
+/// position tensor.
+fn rope_plan(
+    x: &RsTensor,
+    y: &RsTensor,
+    pos: Option<&RsTensor>,
+    attrs: &RsAttrs,
+    op: &'static str,
+) -> OpResult<(usize, i64, i64, i64)> {
+    check_f32_desc(x, op, "x")?;
+    check_f32_desc(y, op, "y")?;
     let rank = x.rank as usize;
-    if rank < 1 {
-        return Err(err(c.op, "rope expects rank >= 1"));
-    }
-    let d = x.dims()[rank - 1];
-    if d % 2 != 0 {
+    if rank < 2 {
         return Err(err(
-            c.op,
-            format!("rope requires an even last dim (D={d}); the half-rotation pairs (2i, 2i+1)"),
+            op,
+            "rope expects rank >= 2 inputs; positions vary along the FIRST axis (the \
+             plan's sequence-first layout: [seq, ...])",
         ));
     }
-    let half = d / 2;
-    let mut want = SmallShape {
-        len: rank,
-        dims: [0; rustrain_abi::ffi::MAX_RANK],
-    };
-    want.dims[..rank].copy_from_slice(x.dims());
-    want.dims[rank - 1] = half;
-    for (i, who) in [(1usize, "cos"), (2, "sin")] {
-        let t = c.in_t(i);
-        check_f32_desc(t, c.op, who)?;
-        broadcast_shape_small(t.dims(), want.as_slice(), c.op).map_err(|e| {
-            err(
-                c.op,
-                format!("input '{who}' must broadcast to {:?}: {e}", want.as_slice()),
-            )
-        })?;
+    if y.rank as usize != rank || x.dims() != y.dims() {
+        return Err(fail!(
+            op,
+            "rope expects x and y with identical shape, got {:?} and {:?}",
+            x.dims(),
+            y.dims()
+        ));
     }
-    let o = c.out_t(0);
-    set_output_desc(o, rustrain_abi::ffi::RsDtype::F32, x.dims());
+    // Sequence-first convention (the plan's squeezed-batch layout): S is the
+    // first axis; the rotary block is the prefix of the last axis (per head).
+    let (s, d) = (x.dims()[0], x.dims()[rank - 1]);
+    if let Some(p) = pos {
+        if p.numel() != s {
+            return Err(fail!(
+                op,
+                "rope position tensor must hold one entry per position (S={s}), got {}",
+                p.numel()
+            ));
+        }
+        match p.dtype {
+            rustrain_abi::ffi::RsDtype::F32
+            | rustrain_abi::ffi::RsDtype::I32
+            | rustrain_abi::ffi::RsDtype::I64 => {}
+            other => {
+                return Err(err(
+                    op,
+                    format!("rope position tensor has dtype {other}, expected f32, i32 or i64"),
+                ));
+            }
+        }
+    }
+    let rotary = attr_i64(attrs, "rotary_dim").unwrap_or(d);
+    if rotary <= 0 || rotary > d || rotary % 2 != 0 {
+        return Err(fail!(
+            op,
+            "attribute 'rotary_dim' ({rotary}) must be a positive even number <= D={d}"
+        ));
+    }
+    let partial = attr_bool(attrs, "partial_rotary").unwrap_or(false);
+    if !partial && rotary != d {
+        return Err(fail!(
+            op,
+            "attribute 'rotary_dim' ({rotary}) is smaller than D={d} but 'partial_rotary' \
+             is not set — declare partial_rotary=true to rotate only the first rotary_dim \
+             dims and pass the rest through"
+        ));
+    }
+    let _ = attr_f64(attrs, "theta").unwrap_or(1e7);
+    Ok((rank, s, d, rotary))
+}
+
+fn rope_infer_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
+    c.expect_arity((2, 3))?;
+    c.expect_out_count(2)?;
+    let pos = (c.n_in() == 3).then(|| c.in_t(2));
+    let (rank, _s, _d, _rotary) = rope_plan(c.in_t(0), c.in_t(1), pos, a, c.op)?;
+    let shape = SmallShape::of(c.in_t(0));
+    for i in 0..2 {
+        let o = c.out_t(i);
+        set_output_desc(o, rustrain_abi::ffi::RsDtype::F32, shape.as_slice());
+        let _ = rank;
+    }
     Ok(())
 }
 
-fn rope_exec_body(c: &mut Call, _a: &RsAttrs) -> OpResult<()> {
-    c.expect_arity((3, 3))?;
-    c.expect_out_count(1)?;
-    let x = c.in_t(0);
-    if x.rank < 1 {
-        return Err(err(c.op, "rope expects rank >= 1"));
-    }
-    let rank = x.rank as usize;
-    let d = x.dims()[rank - 1] as usize;
-    if d % 2 != 0 {
-        return Err(err(
-            c.op,
-            format!("rope requires an even last dim (D={d})"),
+/// Reads the optional position tensor as f64 positions, validating length S.
+/// Absent → arange(S) (causal positions from 0 — the documented default).
+fn rope_positions(p: Option<&RsTensor>, s: usize, op: &'static str) -> OpResult<Vec<f64>> {
+    let Some(t) = p else {
+        return Ok((0..s).map(|i| i as f64).collect());
+    };
+    crate::tensor::expect_contiguous(t, op, "pos")?;
+    if t.numel() as usize != s {
+        return Err(fail!(
+            op,
+            "rope position tensor must hold one entry per position (S={s}), got {}",
+            t.numel()
         ));
     }
-    let half = d / 2;
-    expect_out(c.out_t(0), c.op, rustrain_abi::ffi::RsDtype::F32, x.dims())?;
-    // SAFETY: descriptor liveness is the ABI caller's contract.
-    let xv = unsafe { crate::tensor::f32_in(c.op, "x", x) }?;
-    let cos = unsafe { crate::tensor::f32_in(c.op, "cos", c.in_t(1)) }?;
-    let sin = unsafe { crate::tensor::f32_in(c.op, "sin", c.in_t(2)) }?;
-    let mut yv = unsafe { crate::tensor::f32_out(c.op, c.out_t(0)) }?;
-    // Target shape for cos/sin: x.shape with the last dim halved.
-    let mut want: Vec<usize> = xv.shape().to_vec();
-    want[rank - 1] = half;
-    let cb = cos
-        .broadcast(IxDyn(&want))
-        .ok_or_else(|| err(c.op, "cos does not broadcast to the halved shape"))?;
-    let sb = sin
-        .broadcast(IxDyn(&want))
-        .ok_or_else(|| err(c.op, "sin does not broadcast to the halved shape"))?;
-    let cd: ArrayViewD<f32> = cb;
-    let sd: ArrayViewD<f32> = sb;
-    // NeoX/GPT-J half rotation (documented): for each pair (2i, 2i+1),
-    //   y[2i]   = x[2i] * cos[i] - x[2i+1] * sin[i]
-    //   y[2i+1] = x[2i+1] * cos[i] + x[2i] * sin[i]
-    // cos/sin are caller-computed tables; the op only rotates, which keeps it
-    // convention-free about theta bases and position encodings.
-    // Fixed-size index buffers: the hot loop must not allocate (the memory
-    // reporter would have to account for it, and per-element allocs are
-    // exactly the kind of hidden workspace the planning rule forbids).
-    for ((idx, o), &v) in yv.indexed_iter_mut().zip(xv.iter()) {
-        let idx = idx.slice();
-        let rank = idx.len();
-        let mut cidx = [0usize; rustrain_abi::ffi::MAX_RANK];
-        cidx[..rank].copy_from_slice(idx);
-        let last = cidx[rank - 1];
-        let i = last / 2;
-        cidx[rank - 1] = i;
-        let c = cd[IxDyn(&cidx[..rank])];
-        let s = sd[IxDyn(&cidx[..rank])];
-        let (other, sign_even) = if last % 2 == 0 {
-            // even element: paired with the odd element to its right
-            let mut oidx = cidx;
-            oidx[rank - 1] = last + 1;
-            (xv[IxDyn(&oidx[..rank])], true)
-        } else {
-            let mut oidx = cidx;
-            oidx[rank - 1] = last - 1;
-            (xv[IxDyn(&oidx[..rank])], false)
-        };
-        *o = if sign_even { v * c - other * s } else { v * c + other * s };
+    match t.dtype {
+        rustrain_abi::ffi::RsDtype::F32 => {
+            // SAFETY: descriptor liveness is the ABI caller's contract.
+            let v = unsafe { crate::tensor::f32_in(op, "pos", t) }?;
+            Ok(v.as_slice()
+                .expect("contiguous")
+                .iter()
+                .map(|&f| f as f64)
+                .collect())
+        }
+        rustrain_abi::ffi::RsDtype::I32 | rustrain_abi::ffi::RsDtype::I64 => {
+            // SAFETY: descriptor liveness is the ABI caller's contract.
+            let v = unsafe { crate::tensor::indices_i64(op, "pos", t) }?;
+            Ok(v.iter().map(|&i| i as f64).collect())
+        }
+        other => Err(err(
+            op,
+            format!("rope position tensor has dtype {other}, expected f32, i32 or i64"),
+        )),
     }
+}
+
+fn rope_exec_body(c: &mut Call, a: &RsAttrs) -> OpResult<()> {
+    c.expect_arity((2, 3))?;
+    c.expect_out_count(2)?;
+    let pos = (c.n_in() == 3).then(|| c.in_t(2));
+    let (rank, s, d, rotary) = rope_plan(c.in_t(0), c.in_t(1), pos, a, c.op)?;
+    let theta = attr_f64(a, "theta").unwrap_or(1e7);
+    let shape = SmallShape::of(c.in_t(0));
+    for i in 0..2 {
+        expect_out(
+            c.out_t(i),
+            c.op,
+            rustrain_abi::ffi::RsDtype::F32,
+            shape.as_slice(),
+        )?;
+    }
+    // SAFETY: descriptor liveness is the ABI caller's contract.
+    let xv = unsafe { crate::tensor::f32_in(c.op, "x", c.in_t(0)) }?;
+    let yv = unsafe { crate::tensor::f32_in(c.op, "y", c.in_t(1)) }?;
+    let mut out0 = unsafe { crate::tensor::f32_out(c.op, c.out_t(0)) }?;
+    let mut out1 = unsafe { crate::tensor::f32_out(c.op, c.out_t(1)) }?;
+    let positions = rope_positions(pos, s as usize, c.op)?;
+    let (s, d, rotary) = (s as usize, d as usize, rotary as usize);
+    let h = rotary / 2;
+    // inv_freq[j] = theta^(-2j / rotary_dim), the Qwen3.6 text convention
+    // (compute_default_rope_parameters, float32 like the HF source).
+    let mut inv_freq = vec![0.0f32; h];
+    for (j, f) in inv_freq.iter_mut().enumerate() {
+        *f = (theta as f32).powf(-((2 * j) as f32) / rotary as f32);
+    }
+    // cos/sin per (position t, pair j), computed once and reused for both
+    // operands (the two tensors share the position table).
+    let mut cos = vec![0.0f32; s * h];
+    let mut sin = vec![0.0f32; s * h];
+    for (t, &p) in positions.iter().enumerate() {
+        for (j, &f) in inv_freq.iter().enumerate() {
+            cos[t * h + j] = (p * f as f64).cos() as f32;
+            sin[t * h + j] = (p * f as f64).sin() as f32;
+        }
+    }
+    let xs = xv.as_slice().expect("contiguous");
+    let ys = yv.as_slice().expect("contiguous");
+    let o0 = out0.as_slice_mut().expect("contiguous");
+    let o1 = out1.as_slice_mut().expect("contiguous");
+    let batches: usize = xs.len() / (s * d);
+    // Half-split rotation over the first `rotary` dims of the last axis
+    // (HF rotate_half: pairs (i, i+h) with h = rotary/2), pass-through for
+    // the remaining dims. Deterministic ascending loops.
+    for b in 0..batches {
+        for t in 0..s {
+            for j in 0..h {
+                let c = cos[t * h + j];
+                let sn = sin[t * h + j];
+                let i = j; // the first half of the rotary block
+                let base = (b * s + t) * d;
+                let (x_a, x_b) = (xs[base + i], xs[base + i + h]);
+                o0[base + i] = x_a * c - x_b * sn;
+                o0[base + i + h] = x_b * c + x_a * sn;
+                let (y_a, y_b) = (ys[base + i], ys[base + i + h]);
+                o1[base + i] = y_a * c - y_b * sn;
+                o1[base + i + h] = y_b * c + y_a * sn;
+            }
+            let base = (b * s + t) * d;
+            o0[base + rotary..base + d].copy_from_slice(&xs[base + rotary..base + d]);
+            o1[base + rotary..base + d].copy_from_slice(&ys[base + rotary..base + d]);
+        }
+    }
+    let _ = rank;
     Ok(())
 }
 
@@ -1123,6 +1515,20 @@ infer_entry!(softmax_infer, "softmax", softmax_infer_body);
 exec_entry!(softmax_exec, "softmax", softmax_exec_body);
 infer_entry!(rmsnorm_infer, "rmsnorm", rmsnorm_infer_body);
 exec_entry!(rmsnorm_exec, "rmsnorm", rmsnorm_exec_body);
+infer_entry!(l2norm_infer, "l2norm", l2norm_infer_body);
+exec_entry!(l2norm_exec, "l2norm", l2norm_exec_body);
+infer_entry!(
+    rmsnorm_gated_infer,
+    "rmsnorm_gated",
+    rmsnorm_gated_infer_body
+);
+exec_entry!(rmsnorm_gated_exec, "rmsnorm_gated", rmsnorm_gated_exec_body);
+infer_entry!(
+    causal_conv1d_infer,
+    "causal_conv1d",
+    causal_conv1d_infer_body
+);
+exec_entry!(causal_conv1d_exec, "causal_conv1d", causal_conv1d_exec_body);
 infer_entry!(layernorm_infer, "layernorm", layernorm_infer_body);
 exec_entry!(layernorm_exec, "layernorm", layernorm_exec_body);
 infer_entry!(rope_infer, "rope", rope_infer_body);

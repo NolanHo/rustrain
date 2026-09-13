@@ -246,67 +246,71 @@ fn op(name: &str) -> &'static RsOpDesc {
     let p = plugin();
     let ops = unsafe { slice::from_raw_parts(p.ops, p.n_ops as usize) };
     ops.iter()
-        .find(|d| unsafe { CStr::from_ptr((&*(**d)).id.name) }.to_str().unwrap() == name)
+        .find(|d| {
+            unsafe { CStr::from_ptr((&*(**d)).id.name) }
+                .to_str()
+                .unwrap()
+                == name
+        })
         .map(|d| unsafe { &**d })
         .unwrap_or_else(|| panic!("op '{name}' not registered"))
 }
 
-unsafe fn last_err(o: &'static RsOpDesc) -> String { unsafe {
-    let f = o.last_error.unwrap();
-    let p = f(ptr::null_mut());
-    if p.is_null() {
-        "(no message)".to_string()
-    } else {
-        CStr::from_ptr(p).to_string_lossy().into_owned()
+unsafe fn last_err(o: &'static RsOpDesc) -> String {
+    unsafe {
+        let f = o.last_error.unwrap();
+        let p = f(ptr::null_mut());
+        if p.is_null() {
+            "(no message)".to_string()
+        } else {
+            CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
     }
-}}
+}
 
 unsafe fn call_infer(
     o: &'static RsOpDesc,
     ins: &[&RsTensor],
     outs: &mut [RsTensor],
     attrs: &[RsAttr],
-) -> Result<(), String> { unsafe {
-    let a = attrs_view(attrs);
-    let inptrs: Vec<*const RsTensor> = ins.iter().map(|t| *t as *const RsTensor).collect();
-    let mut outptrs: Vec<*mut RsTensor> = outs.iter_mut().map(|t| t as *mut RsTensor).collect();
-    let st = (o.infer.unwrap())(
-        inptrs.as_ptr(),
-        ins.len() as u32,
-        outptrs.as_mut_ptr(),
-        outs.len() as u32,
-        &a,
-    );
-    if st == 0 {
-        Ok(())
-    } else {
-        Err(last_err(o))
+) -> Result<(), String> {
+    unsafe {
+        let a = attrs_view(attrs);
+        let inptrs: Vec<*const RsTensor> = ins.iter().map(|t| *t as *const RsTensor).collect();
+        let mut outptrs: Vec<*mut RsTensor> = outs.iter_mut().map(|t| t as *mut RsTensor).collect();
+        let st = (o.infer.unwrap())(
+            inptrs.as_ptr(),
+            ins.len() as u32,
+            outptrs.as_mut_ptr(),
+            outs.len() as u32,
+            &a,
+        );
+        if st == 0 { Ok(()) } else { Err(last_err(o)) }
     }
-}}
+}
 
 unsafe fn call_exec(
     o: &'static RsOpDesc,
     ins: &[&RsTensor],
     outs: &mut [&mut RsTensor],
     attrs: &[RsAttr],
-) -> Result<(), String> { unsafe {
-    let a = attrs_view(attrs);
-    let inptrs: Vec<*const RsTensor> = ins.iter().map(|t| *t as *const RsTensor).collect();
-    let mut outptrs: Vec<*mut RsTensor> = outs.iter_mut().map(|t| *t as *mut RsTensor).collect();
-    let st = (o.execute.unwrap())(
-        ptr::null_mut(),
-        inptrs.as_ptr(),
-        ins.len() as u32,
-        outptrs.as_mut_ptr(),
-        outs.len() as u32,
-        &a,
-    );
-    if st == 0 {
-        Ok(())
-    } else {
-        Err(last_err(o))
+) -> Result<(), String> {
+    unsafe {
+        let a = attrs_view(attrs);
+        let inptrs: Vec<*const RsTensor> = ins.iter().map(|t| *t as *const RsTensor).collect();
+        let mut outptrs: Vec<*mut RsTensor> =
+            outs.iter_mut().map(|t| *t as *mut RsTensor).collect();
+        let st = (o.execute.unwrap())(
+            ptr::null_mut(),
+            inptrs.as_ptr(),
+            ins.len() as u32,
+            outptrs.as_mut_ptr(),
+            outs.len() as u32,
+            &a,
+        );
+        if st == 0 { Ok(()) } else { Err(last_err(o)) }
     }
-}}
+}
 
 /// infer -> allocate -> execute, returning the filled outputs.
 unsafe fn run_op(
@@ -330,14 +334,20 @@ fn assert_close(a: f32, b: f32, tol: f32, what: &str) {
     );
 }
 
-
 /// Reads a (possibly strided) view descriptor against the base buffer it
 /// aliases, walking indices by the declared strides.
 fn collect_view(t: &RsTensor, base: &[f32]) -> Vec<f32> {
     let dims: Vec<usize> = t.dims().iter().map(|&d| d as usize).collect();
     let strides: Vec<usize> = t.strides().iter().map(|&x| x as usize).collect();
     let mut out = Vec::new();
-    fn walk(d: usize, acc: usize, dims: &[usize], strides: &[usize], base: &[f32], out: &mut Vec<f32>) {
+    fn walk(
+        d: usize,
+        acc: usize,
+        dims: &[usize],
+        strides: &[usize],
+        base: &[f32],
+        out: &mut Vec<f32>,
+    ) {
         if d == dims.len() {
             out.push(base[acc]);
             return;
@@ -372,15 +382,18 @@ fn plugin_loads_through_the_abi_loader() {
         .unwrap_or_else(|e| panic!("loader rejected {so:?}: {e}"));
     assert_eq!(plugin.name(), "reference");
     let ops = plugin.ops();
-    assert_eq!(ops.len(), 27);
+    assert_eq!(ops.len(), 31);
     assert_eq!(ops[0].spec_name(), "view@reference.f32");
     assert_eq!(ops[11].spec_name(), "compare@reference.f32");
     assert_eq!(ops[26].spec_name(), "topk_router@reference.f32");
+    assert_eq!(ops[27].spec_name(), "l2norm@reference.f32");
+    assert_eq!(ops[28].spec_name(), "rmsnorm_gated@reference.f32");
+    assert_eq!(ops[29].spec_name(), "causal_conv1d@reference.f32");
+    assert_eq!(ops[30].spec_name(), "gated_delta_rule@reference.f32");
     for o in &ops {
         assert!(o.variant() == "reference.f32", "{}: variant", o.name());
     }
 }
-
 
 #[test]
 fn plugin_publishes_the_expected_ops() {
@@ -391,11 +404,13 @@ fn plugin_publishes_the_expected_ops() {
         "reference"
     );
     assert_eq!(
-        unsafe { CStr::from_ptr(p.plugin_version) }.to_str().unwrap(),
+        unsafe { CStr::from_ptr(p.plugin_version) }
+            .to_str()
+            .unwrap(),
         env!("CARGO_PKG_VERSION")
     );
     let ops = unsafe { slice::from_raw_parts(p.ops, p.n_ops as usize) };
-    assert_eq!(p.n_ops, 27, "one variant per vocabulary op");
+    assert_eq!(p.n_ops, 31, "one variant per vocabulary op");
     let names: Vec<&str> = ops
         .iter()
         .map(|d| unsafe { CStr::from_ptr((**d).id.name) }.to_str().unwrap())
@@ -403,10 +418,37 @@ fn plugin_publishes_the_expected_ops() {
     assert_eq!(
         names,
         vec![
-            "view", "reshape", "transpose", "narrow", "cat", "broadcast", "matmul", "linear",
-            "bmm", "elementwise_unary", "elementwise_binary", "compare", "reduce", "softmax",
-            "rmsnorm", "layernorm", "rope", "quantize", "dequantize", "amax_update", "embedding",
-            "gather", "scatter", "sdpa", "cross_entropy", "adamw", "topk_router",
+            "view",
+            "reshape",
+            "transpose",
+            "narrow",
+            "cat",
+            "broadcast",
+            "matmul",
+            "linear",
+            "bmm",
+            "elementwise_unary",
+            "elementwise_binary",
+            "compare",
+            "reduce",
+            "softmax",
+            "rmsnorm",
+            "layernorm",
+            "rope",
+            "quantize",
+            "dequantize",
+            "amax_update",
+            "embedding",
+            "gather",
+            "scatter",
+            "sdpa",
+            "cross_entropy",
+            "adamw",
+            "topk_router",
+            "l2norm",
+            "rmsnorm_gated",
+            "causal_conv1d",
+            "gated_delta_rule",
         ]
     );
     for d in ops {
@@ -445,6 +487,25 @@ fn sdpa_memory_reports_its_scratch() {
     assert_eq!(st, 0);
     // Two f32 scratch buffers of S*T = 3*5 elements each.
     assert_eq!(req.workspace_bytes, 8 * 3 * 5);
+    assert_eq!(req.save_for_backward_bytes, 0);
+}
+
+#[test]
+fn gated_delta_rule_memory_reports_its_scratch() {
+    // vh=1, d=dv=2, S=4, chunk_size=2 -> s2=4, nc=2. The reported f32 count
+    // is vh*(s2*(3d+3dv+3) + nc*c*(3c+d+dv) + d*dv) + c*dv + d*dv
+    // = 1*(4*15 + 2*2*10 + 4) + 4 + 4 = 112 f32 = 448 bytes — the exact
+    // single buffer the chunked body carves.
+    let o = op("gated_delta_rule");
+    let q = Owned::f32(&[1, 4, 2], vec![0.0; 8]);
+    let v = Owned::f32(&[1, 4, 2], vec![0.0; 8]);
+    let g = Owned::f32(&[1, 4, 1], vec![0.0; 4]);
+    let mut req = RsMemReq::default();
+    let io: Vec<*const RsTensor> = vec![&q.t, &q.t, &v.t, &g.t, &g.t];
+    let attrs = attrs_view(&[ai64("chunk_size", 2)]);
+    let st = unsafe { (o.memory.unwrap())(io.as_ptr(), io.len() as u32, &attrs, &mut req) };
+    assert_eq!(st, 0);
+    assert_eq!(req.workspace_bytes, 448);
     assert_eq!(req.save_for_backward_bytes, 0);
 }
 
@@ -529,7 +590,14 @@ fn expansions_are_structurally_sound() {
                     .collect();
                 assert_eq!(
                     ops_of,
-                    ["softmax", "elementwise_unary", "reshape", "gather", "elementwise_unary", "reduce"]
+                    [
+                        "softmax",
+                        "elementwise_unary",
+                        "reshape",
+                        "gather",
+                        "elementwise_unary",
+                        "reduce"
+                    ]
                 );
                 assert_eq!(unsafe { nodes[5].output_ids() }, &[2]); // parent output 0
             }
@@ -567,12 +635,21 @@ fn sdpa_fused_matches_its_declared_expansion() {
     let v = Owned::f32(&[1, 2, 2], vec![1.0, 2.0, 3.0, 4.0]);
     let fused = unsafe { run_op(op("sdpa"), &[&q.t, &k.t, &v.t], &[], 1) }.unwrap();
     // bmm(q, k, transpose_b=true) -> softmax -> bmm(p, v)
-    let s0 = unsafe { run_op(op("bmm"), &[&q.t, &k.t], &[abool("transpose_b", true)], 1) }
-        .unwrap();
+    let s0 = unsafe { run_op(op("bmm"), &[&q.t, &k.t], &[abool("transpose_b", true)], 1) }.unwrap();
     let p = unsafe { run_op(op("softmax"), &[&s0[0].t], &[], 1) }.unwrap();
     let o = unsafe { run_op(op("bmm"), &[&p[0].t, &v.t], &[], 1) }.unwrap();
-    assert_close(o[0].fdata()[0], fused[0].fdata()[0], 1e-6, "sdpa fused vs expansion [0]");
-    assert_close(o[0].fdata()[3], fused[0].fdata()[3], 1e-6, "sdpa fused vs expansion [3]");
+    assert_close(
+        o[0].fdata()[0],
+        fused[0].fdata()[0],
+        1e-6,
+        "sdpa fused vs expansion [0]",
+    );
+    assert_close(
+        o[0].fdata()[3],
+        fused[0].fdata()[3],
+        1e-6,
+        "sdpa fused vs expansion [3]",
+    );
 }
 
 #[test]
@@ -583,15 +660,28 @@ fn cross_entropy_fused_matches_its_declared_expansion() {
     // softmax -> log -> reshape(targets, [-1,1]) -> gather(axis=-1) -> neg ->
     // reduce(mean, all axes)
     let p = unsafe { run_op(op("softmax"), &[&logits.t], &[ai64("axis", -1)], 1) }.unwrap();
-    let lp =
-        unsafe { run_op(op("elementwise_unary"), &[&p[0].t], &[astr("kind", "log")], 1) }.unwrap();
-    let t2 = unsafe { run_op(op("reshape"), &[&targets.t], &[ai64s("shape", &[-1, 1])], 1) }
-        .unwrap();
-    let per = unsafe { run_op(op("gather"), &[&lp[0].t, &t2[0].t], &[ai64("axis", -1)], 1) }
-        .unwrap();
-    let neg =
-        unsafe { run_op(op("elementwise_unary"), &[&per[0].t], &[astr("kind", "neg")], 1) }
-            .unwrap();
+    let lp = unsafe {
+        run_op(
+            op("elementwise_unary"),
+            &[&p[0].t],
+            &[astr("kind", "log")],
+            1,
+        )
+    }
+    .unwrap();
+    let t2 =
+        unsafe { run_op(op("reshape"), &[&targets.t], &[ai64s("shape", &[-1, 1])], 1) }.unwrap();
+    let per =
+        unsafe { run_op(op("gather"), &[&lp[0].t, &t2[0].t], &[ai64("axis", -1)], 1) }.unwrap();
+    let neg = unsafe {
+        run_op(
+            op("elementwise_unary"),
+            &[&per[0].t],
+            &[astr("kind", "neg")],
+            1,
+        )
+    }
+    .unwrap();
     let loss = unsafe { run_op(op("reduce"), &[&neg[0].t], &[astr("kind", "mean")], 1) }.unwrap();
     assert_close(
         loss[0].fdata()[0],
@@ -608,8 +698,7 @@ fn adamw_fused_matches_its_declared_expansion() {
     let g0 = Owned::f32(&[4], vec![0.5, -0.5, 0.25, -0.25]);
     let m0 = Owned::f32(&[4], vec![0.0; 4]);
     let v0 = Owned::f32(&[4], vec![0.0; 4]);
-    let fused =
-        unsafe { run_op(op("adamw"), &[&p0.t, &g0.t, &m0.t, &v0.t], &[], 3) }.unwrap();
+    let fused = unsafe { run_op(op("adamw"), &[&p0.t, &g0.t, &m0.t, &v0.t], &[], 3) }.unwrap();
     // The 16 documented expansion steps.
     let eb = |ins: &[&RsTensor], attrs: &[RsAttr]| -> Owned {
         let o = unsafe { run_op(op("elementwise_binary"), ins, attrs, 1) }.unwrap();
@@ -652,7 +741,10 @@ fn view_aliases_without_copy() {
     assert_eq!(o.t.dims(), &[2, 3]);
     assert_eq!(o.t.strides(), &[3, 1]);
     assert_eq!(o.t.data, x.t.data, "view must alias the input buffer");
-    assert_eq!(collect_view(&o.t, x.fdata()), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    assert_eq!(
+        collect_view(&o.t, x.fdata()),
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    );
 }
 
 #[test]
@@ -663,7 +755,10 @@ fn reshape_reinterprets_and_aliases() {
     assert_eq!(o.t.dims(), &[3, 2]);
     assert_eq!(o.t.strides(), &[2, 1]);
     assert_eq!(o.t.data, x.t.data);
-    assert_eq!(collect_view(&o.t, x.fdata()), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    assert_eq!(
+        collect_view(&o.t, x.fdata()),
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    );
 
     // One -1 is inferred from numel.
     let outs = unsafe { run_op(op("reshape"), &[&x.t], &[ai64s("shape", &[6, -1])], 1) }.unwrap();
@@ -673,8 +768,15 @@ fn reshape_reinterprets_and_aliases() {
 #[test]
 fn transpose_swaps_shape_and_strides() {
     let x = Owned::f32(&[2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-    let outs = unsafe { run_op(op("transpose"), &[&x.t], &[ai64("dim0", 0), ai64("dim1", 1)], 1) }
-        .unwrap();
+    let outs = unsafe {
+        run_op(
+            op("transpose"),
+            &[&x.t],
+            &[ai64("dim0", 0), ai64("dim1", 1)],
+            1,
+        )
+    }
+    .unwrap();
     let o = &outs[0];
     assert_eq!(o.t.dims(), &[3, 2]);
     assert_eq!(o.t.strides(), &[1, 3]);
@@ -702,7 +804,10 @@ fn narrow_offsets_the_data_pointer() {
     assert_eq!(o.t.dims(), &[3, 2]);
     assert_eq!(o.t.strides(), &[4, 1]);
     assert_eq!(o.t.data, unsafe { x.t.data.add(4) });
-    assert_eq!(collect_view(&o.t, &x.fdata()[1..]), vec![2.0, 3.0, 6.0, 7.0, 10.0, 11.0]);
+    assert_eq!(
+        collect_view(&o.t, &x.fdata()[1..]),
+        vec![2.0, 3.0, 6.0, 7.0, 10.0, 11.0]
+    );
 }
 
 #[test]
@@ -765,7 +870,12 @@ fn matmul_and_bmm_transpose_b_hand_values() {
     let a = Owned::f32(&[2, 2], vec![1.0, 2.0, 3.0, 4.0]);
     let b = Owned::f32(&[2, 2], vec![5.0, 6.0, 7.0, 8.0]);
     let outs = unsafe {
-        run_op(op("matmul"), &[&a.t, &b.t], &[abool("transpose_b", true)], 1)
+        run_op(
+            op("matmul"),
+            &[&a.t, &b.t],
+            &[abool("transpose_b", true)],
+            1,
+        )
     }
     .unwrap();
     assert_eq!(outs[0].fdata(), &[17.0, 23.0, 39.0, 53.0]);
@@ -773,10 +883,8 @@ fn matmul_and_bmm_transpose_b_hand_values() {
     // Batched form: batch 0 as above; batch 1 = 2a @ b^T = [[34,46],[78,106]].
     let a = Owned::f32(&[2, 2, 2], vec![1.0, 2.0, 3.0, 4.0, 2.0, 4.0, 6.0, 8.0]);
     let b = Owned::f32(&[2, 2, 2], vec![5.0, 6.0, 7.0, 8.0, 5.0, 6.0, 7.0, 8.0]);
-    let outs = unsafe {
-        run_op(op("bmm"), &[&a.t, &b.t], &[abool("transpose_b", true)], 1)
-    }
-    .unwrap();
+    let outs =
+        unsafe { run_op(op("bmm"), &[&a.t, &b.t], &[abool("transpose_b", true)], 1) }.unwrap();
     assert_eq!(
         outs[0].fdata(),
         &[17.0, 23.0, 39.0, 53.0, 34.0, 46.0, 78.0, 106.0]
@@ -796,14 +904,17 @@ fn bmm_hand_values() {
 fn elementwise_unary_hand_values() {
     let x = Owned::f32(&[4], vec![-2.0, -1.0, 0.0, 1.0]);
     let run = |kind: &str| {
-        let outs = unsafe { run_op(op("elementwise_unary"), &[&x.t], &[astr("kind", kind)], 1) }
-            .unwrap();
+        let outs =
+            unsafe { run_op(op("elementwise_unary"), &[&x.t], &[astr("kind", kind)], 1) }.unwrap();
         outs[0].fdata().to_vec()
     };
     assert_eq!(run("relu"), vec![0.0, 0.0, 0.0, 1.0]);
     assert_eq!(run("neg"), vec![2.0, 1.0, 0.0, -1.0]);
     let sqrt = run("sqrt");
-    assert!(sqrt[0].is_nan() && sqrt[1].is_nan(), "sqrt of negatives is NaN");
+    assert!(
+        sqrt[0].is_nan() && sqrt[1].is_nan(),
+        "sqrt of negatives is NaN"
+    );
     assert_eq!(&sqrt[2..], &[0.0, 1.0]);
     let sig = run("sigmoid");
     assert_close(sig[2], 0.5, 1e-7, "sigmoid(0)");
@@ -822,12 +933,22 @@ fn elementwise_unary_hand_values() {
 
     // rsqrt = 1/sqrt(x): IEEE at the edges.
     let rsqrt = run("rsqrt");
-    assert!(rsqrt[0].is_nan() && rsqrt[1].is_nan(), "rsqrt of negatives is NaN");
+    assert!(
+        rsqrt[0].is_nan() && rsqrt[1].is_nan(),
+        "rsqrt of negatives is NaN"
+    );
     assert_eq!(rsqrt[2], f32::INFINITY, "rsqrt(0) = +inf");
     assert_eq!(rsqrt[3], 1.0, "rsqrt(1)");
     let x4 = Owned::f32(&[1], vec![4.0]);
-    let outs = unsafe { run_op(op("elementwise_unary"), &[&x4.t], &[astr("kind", "rsqrt")], 1) }
-        .unwrap();
+    let outs = unsafe {
+        run_op(
+            op("elementwise_unary"),
+            &[&x4.t],
+            &[astr("kind", "rsqrt")],
+            1,
+        )
+    }
+    .unwrap();
     assert_eq!(outs[0].fdata(), &[0.5], "rsqrt(4) = 1/2");
 
     // Hand-computed *_grad values at the sample points (the central finite
@@ -837,14 +958,28 @@ fn elementwise_unary_hand_values() {
     assert_close(sig_g[3], 0.196_611_94, 1e-6, "sigmoid_grad(1)");
     let tanh_g = run("tanh_grad");
     assert_close(tanh_g[2], 1.0, 1e-7, "tanh_grad(0)");
-    assert_close(tanh_g[3], 0.419_974_34, 1e-6, "tanh_grad(1) = 1 - tanh(1)^2");
+    assert_close(
+        tanh_g[3],
+        0.419_974_34,
+        1e-6,
+        "tanh_grad(1) = 1 - tanh(1)^2",
+    );
     let relu_g = run("relu_grad");
-    assert_eq!(relu_g, vec![0.0, 0.0, 0.0, 1.0], "relu_grad: 0 at 0 by convention");
+    assert_eq!(
+        relu_g,
+        vec![0.0, 0.0, 0.0, 1.0],
+        "relu_grad: 0 at 0 by convention"
+    );
     let silu_g = run("silu_grad");
     assert_close(silu_g[2], 0.5, 1e-7, "silu_grad(0)");
     assert_close(silu_g[3], 0.927_670_5, 1e-6, "silu_grad(1)");
     let gelu_g = run("gelu_grad");
-    assert_close(gelu_g[2], 0.5, 1e-7, "gelu_grad(0) of the tanh approximation");
+    assert_close(
+        gelu_g[2],
+        0.5,
+        1e-7,
+        "gelu_grad(0) of the tanh approximation",
+    );
 }
 
 /// The `*_grad` kinds exist so VJPs are writable; their entire contract is
@@ -870,16 +1005,13 @@ fn unary_grad_kinds_match_central_finite_difference() {
             }
             let xp = Owned::f32(&[1], vec![x + h]);
             let xm = Owned::f32(&[1], vec![x - h]);
-            let fp =
-                unsafe { run_op(op("elementwise_unary"), &[&xp.t], &[astr("kind", fwd)], 1) }
-                    .unwrap();
-            let fm =
-                unsafe { run_op(op("elementwise_unary"), &[&xm.t], &[astr("kind", fwd)], 1) }
-                    .unwrap();
+            let fp = unsafe { run_op(op("elementwise_unary"), &[&xp.t], &[astr("kind", fwd)], 1) }
+                .unwrap();
+            let fm = unsafe { run_op(op("elementwise_unary"), &[&xm.t], &[astr("kind", fwd)], 1) }
+                .unwrap();
             let x0 = Owned::f32(&[1], vec![x]);
-            let g =
-                unsafe { run_op(op("elementwise_unary"), &[&x0.t], &[astr("kind", grad)], 1) }
-                    .unwrap();
+            let g = unsafe { run_op(op("elementwise_unary"), &[&x0.t], &[astr("kind", grad)], 1) }
+                .unwrap();
             // Central difference in f64 so the FD itself is not the limiting
             // error; the tolerance covers f32 rounding of the two forward
             // calls (two ~1e-7 absolute roundings over a 2h = 2e-3 step).
@@ -900,7 +1032,12 @@ fn elementwise_binary_hand_values() {
     let b = Owned::f32(&[2, 2], vec![10.0, 20.0, 30.0, 40.0]);
     let run = |kind: &str| {
         let outs = unsafe {
-            run_op(op("elementwise_binary"), &[&a.t, &b.t], &[astr("kind", kind)], 1)
+            run_op(
+                op("elementwise_binary"),
+                &[&a.t, &b.t],
+                &[astr("kind", kind)],
+                1,
+            )
         }
         .unwrap();
         outs[0].fdata().to_vec()
@@ -915,7 +1052,12 @@ fn elementwise_binary_hand_values() {
     let base = Owned::f32(&[4], vec![2.0, 3.0, 4.0, 0.0]);
     let exp = Owned::f32(&[4], vec![3.0, 2.0, 0.5, 0.0]);
     let outs = unsafe {
-        run_op(op("elementwise_binary"), &[&base.t, &exp.t], &[astr("kind", "pow")], 1)
+        run_op(
+            op("elementwise_binary"),
+            &[&base.t, &exp.t],
+            &[astr("kind", "pow")],
+            1,
+        )
     }
     .unwrap();
     let got = outs[0].fdata();
@@ -926,8 +1068,15 @@ fn elementwise_binary_hand_values() {
     // Broadcasting: [2,1] + [1,3].
     let a = Owned::f32(&[2, 1], vec![1.0, 2.0]);
     let b = Owned::f32(&[1, 3], vec![10.0, 20.0, 30.0]);
-    let outs = unsafe { run_op(op("elementwise_binary"), &[&a.t, &b.t], &[astr("kind", "add")], 1) }
-        .unwrap();
+    let outs = unsafe {
+        run_op(
+            op("elementwise_binary"),
+            &[&a.t, &b.t],
+            &[astr("kind", "add")],
+            1,
+        )
+    }
+    .unwrap();
     assert_eq!(outs[0].t.dims(), &[2, 3]);
     assert_eq!(outs[0].fdata(), &[11.0, 21.0, 31.0, 12.0, 22.0, 32.0]);
 
@@ -951,8 +1100,8 @@ fn compare_all_kinds_and_nan_policy() {
     let a = Owned::f32(&[4], vec![1.0, 2.0, 2.0, 0.0]);
     let b = Owned::f32(&[4], vec![1.0, 2.0, 3.0, -1.0]);
     let run = |kind: &str| {
-        let outs = unsafe { run_op(op("compare"), &[&a.t, &b.t], &[astr("kind", kind)], 1) }
-            .unwrap();
+        let outs =
+            unsafe { run_op(op("compare"), &[&a.t, &b.t], &[astr("kind", kind)], 1) }.unwrap();
         assert_eq!(outs[0].t.dims(), &[4]);
         assert_eq!(outs[0].t.dtype, RsDtype::F32);
         outs[0].fdata().to_vec()
@@ -969,11 +1118,11 @@ fn compare_all_kinds_and_nan_policy() {
     let nan = Owned::f32(&[1], vec![f32::NAN]);
     let one = Owned::f32(&[1], vec![1.0]);
     for kind in ["eq", "ne", "lt", "le", "gt", "ge"] {
-        let outs = unsafe { run_op(op("compare"), &[&nan.t, &one.t], &[astr("kind", kind)], 1) }
-            .unwrap();
+        let outs =
+            unsafe { run_op(op("compare"), &[&nan.t, &one.t], &[astr("kind", kind)], 1) }.unwrap();
         assert_eq!(outs[0].fdata(), &[0.0], "NaN on the left, kind {kind}");
-        let outs = unsafe { run_op(op("compare"), &[&one.t, &nan.t], &[astr("kind", kind)], 1) }
-            .unwrap();
+        let outs =
+            unsafe { run_op(op("compare"), &[&one.t, &nan.t], &[astr("kind", kind)], 1) }.unwrap();
         assert_eq!(outs[0].fdata(), &[0.0], "NaN on the right, kind {kind}");
     }
 }
@@ -997,9 +1146,17 @@ fn compare_shape_mismatch_is_a_hard_error_naming_both_shapes() {
         );
         // infer must reject the same pair.
         let mut outs = [RsTensor::default()];
-        let err = call_infer(op("compare"), &[&a.t, &b.t], &mut outs, &[astr("kind", "eq")])
-            .unwrap_err();
-        assert!(err.contains("[4]") && err.contains("[2, 2]"), "infer message: {err}");
+        let err = call_infer(
+            op("compare"),
+            &[&a.t, &b.t],
+            &mut outs,
+            &[astr("kind", "eq")],
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("[4]") && err.contains("[2, 2]"),
+            "infer message: {err}"
+        );
     }
 }
 
@@ -1040,7 +1197,11 @@ fn reduce_hand_values() {
             run_op(
                 op("reduce"),
                 &[&x.t],
-                &[astr("kind", kind), ai64("axis", axis), abool("keepdim", true)],
+                &[
+                    astr("kind", kind),
+                    ai64("axis", axis),
+                    abool("keepdim", true),
+                ],
                 1,
             )
         }
@@ -1053,8 +1214,16 @@ fn reduce_hand_values() {
     let kd1 = run_kd("sum", 1);
     assert_eq!(kd1.t.dims(), &[2, 1]);
     assert_eq!(kd1.fdata(), &[6.0, 15.0]);
-    assert_eq!(run("sum", Some(0)).fdata(), kd0.fdata(), "squeezed values agree");
-    assert_eq!(run("sum", Some(1)).fdata(), kd1.fdata(), "squeezed values agree");
+    assert_eq!(
+        run("sum", Some(0)).fdata(),
+        kd0.fdata(),
+        "squeezed values agree"
+    );
+    assert_eq!(
+        run("sum", Some(1)).fdata(),
+        kd1.fdata(),
+        "squeezed values agree"
+    );
     // Negative axis with keepdim.
     let kdm1 = run_kd("mean", -1);
     assert_eq!(kdm1.t.dims(), &[2, 1]);
@@ -1062,7 +1231,12 @@ fn reduce_hand_values() {
     // No axis + keepdim: every dim becomes 1 (torch convention), value the
     // same as the rank-0 scalar.
     let all_kd = unsafe {
-        run_op(op("reduce"), &[&x.t], &[astr("kind", "sum"), abool("keepdim", true)], 1)
+        run_op(
+            op("reduce"),
+            &[&x.t],
+            &[astr("kind", "sum"), abool("keepdim", true)],
+            1,
+        )
     }
     .unwrap();
     assert_eq!(all_kd[0].t.dims(), &[1, 1]);
@@ -1114,6 +1288,215 @@ fn rmsnorm_hand_values() {
 }
 
 #[test]
+fn rmsnorm_weight_offset_is_the_declared_weight_convention() {
+    // The trunk convention: y = x/r * (1 + w). weight_offset=1.0 turns the
+    // raw weight [2, 3] into the effective weight [3, 4], so with
+    // x = [3, 4] and r = sqrt((9+16)/2 + 1e-5):
+    //   y[0] = (3/r) * (2+1) = 9/r,  y[1] = (4/r) * (3+1) = 16/r.
+    let x = Owned::f32(&[2], vec![3.0, 4.0]);
+    let w = Owned::f32(&[2], vec![2.0, 3.0]);
+    let outs = unsafe {
+        run_op(
+            op("rmsnorm"),
+            &[&x.t, &w.t],
+            &[af64("weight_offset", 1.0)],
+            1,
+        )
+    }
+    .unwrap();
+    let r = ((9.0f32 + 16.0) / 2.0 + 1e-5).sqrt();
+    assert_close(outs[0].fdata()[0], 9.0 / r, 1e-6, "offset rmsnorm[0]");
+    assert_close(outs[0].fdata()[1], 16.0 / r, 1e-6, "offset rmsnorm[1]");
+}
+
+#[test]
+fn l2norm_hand_values() {
+    // y = x / sqrt(sum(x^2) + eps), SUM not mean, eps inside the sqrt.
+    // x = [3, 4, 0]: sum(x^2) = 25, r = sqrt(25 + 1e-6) ~ 5.
+    let x = Owned::f32(&[3], vec![3.0, 4.0, 0.0]);
+    let outs = unsafe { run_op(op("l2norm"), &[&x.t], &[], 1) }.unwrap();
+    let r = (25.0f32 + 1e-6).sqrt();
+    assert_close(outs[0].fdata()[0], 3.0 / r, 1e-6, "l2norm[0]");
+    assert_close(outs[0].fdata()[1], 4.0 / r, 1e-6, "l2norm[1]");
+    assert_close(outs[0].fdata()[2], 0.0, 1e-6, "l2norm[2]");
+
+    // dim=0 over [[3,4],[4,3]]: column 0 = (3,4) has norm 5, column 1 =
+    // (4,3) has norm 5, so both columns normalise to (0.6, 0.8).
+    let x = Owned::f32(&[2, 2], vec![3.0, 4.0, 4.0, 3.0]);
+    let outs = unsafe { run_op(op("l2norm"), &[&x.t], &[ai64("dim", 0)], 1) }.unwrap();
+    let expected = [3.0 / 5.0, 4.0 / 5.0, 4.0 / 5.0, 3.0 / 5.0];
+    for (i, (got, want)) in outs[0].fdata().iter().zip(&expected).enumerate() {
+        assert_close(*got, *want, 1e-6, &format!("l2norm dim0[{i}]"));
+    }
+}
+
+#[test]
+fn rmsnorm_gated_hand_values() {
+    // y = (x / sqrt(mean(x^2) + eps)) * w * silu(gate), the RAW weight
+    // convention (offset 0.0). x = [3, 4], w = [2, 3], gate = [0, 1]:
+    //   r  = sqrt((9+16)/2 + 1e-6) = sqrt(12.5 + 1e-6)
+    //   y0 = (3/r) * 2 * silu(0) = 0                       (silu(0) = 0)
+    //   y1 = (4/r) * 3 * silu(1), silu(1) = 1/(1+e^-1) = 0.7310586
+    let x = Owned::f32(&[2], vec![3.0, 4.0]);
+    let w = Owned::f32(&[2], vec![2.0, 3.0]);
+    let gate = Owned::f32(&[2], vec![0.0, 1.0]);
+    let outs = unsafe {
+        run_op(
+            op("rmsnorm_gated"),
+            &[&x.t, &w.t, &gate.t],
+            &[af64("eps", 1e-6)],
+            1,
+        )
+    }
+    .unwrap();
+    let r = ((9.0f32 + 16.0) / 2.0 + 1e-6).sqrt();
+    let silu1 = 1.0 / (1.0 + (-1.0f32).exp());
+    assert_close(outs[0].fdata()[0], 0.0, 1e-6, "gated[0]");
+    assert_close(
+        outs[0].fdata()[1],
+        (4.0 / r) * 3.0 * silu1,
+        1e-5,
+        "gated[1]",
+    );
+}
+
+#[test]
+fn causal_conv1d_hand_values() {
+    // Depthwise causal conv, kernel K=3, pad defaults to K-1=2 (left-only).
+    // x = [1, 2, 3] (L=3, C=1), w = [1, 2, 4]:
+    //   out[0] = w0*x[-2] + w1*x[-1] + w2*x[0] = 0 + 0 + 4*1 = 4
+    //   out[1] = w0*x[-1] + w1*x[0]  + w2*x[1] = 0 + 2*1 + 4*2 = 10
+    //   out[2] = w0*x[0]  + w1*x[1]  + w2*x[2] = 1*1 + 2*2 + 4*3 = 17
+    let x = Owned::f32(&[3, 1], vec![1.0, 2.0, 3.0]);
+    let w = Owned::f32(&[1, 1, 3], vec![1.0, 2.0, 4.0]);
+    let attrs = [ai64("kernel", 3)];
+    let outs = unsafe { run_op(op("causal_conv1d"), &[&x.t, &w.t], &attrs, 1) }.unwrap();
+    assert_eq!(outs[0].t.dims(), &[3, 1]);
+    assert_eq!(outs[0].fdata(), &[4.0, 10.0, 17.0]);
+
+    // The fused silu runs in the same sweep: silu([4, 10, 17]).
+    let attrs = [ai64("kernel", 3), astr("activation", "silu")];
+    let outs = unsafe { run_op(op("causal_conv1d"), &[&x.t, &w.t], &attrs, 1) }.unwrap();
+    let silu = |v: f32| v / (1.0 + (-v).exp());
+    assert_eq!(outs[0].fdata(), &[silu(4.0), silu(10.0), silu(17.0)]);
+}
+
+#[test]
+fn gated_delta_rule_hand_values_single_chunk() {
+    // One chunk (S=2, chunk_size=2), vh=1, D=Dv=2. q = k = identity,
+    // v = [[1,0],[2,0]], g = 0 (decay 1), beta = 1.
+    // The query scale is D^-0.5 = 1/sqrt(2), so q' = I/sqrt(2).
+    // cum = [0,0] -> pairwise = [[1,0],[1,1]]; ut[i][j] = (k_i . k_j) * pw:
+    // k is the identity, so ut = [[1,0],[0,1]] (the strictly-lower part is 0);
+    // intra = (q' @ k^T)∘pw = [[1,0],[0,1]]/sqrt(2).
+    // Solve (I + strictly_lower(ut)) x = v_beta:
+    //   x0 = v[0] = [1,0]; x1 = v[1] - 0 = [2,0]  -> new_values = [[1,0],[2,0]].
+    // Scan with S = 0: out = intra @ new_values =
+    //   row0 = [1/sqrt(2), 0]; row1 = [0, 2/sqrt(2)].
+    // Per-token check (the defining order, o_t = q_t^T S_t after the update):
+    //   S_0 = k0 ⊗ (v0 * 1) = [[1,0],[0,0]]; o_0 = q0·S_0 = [1/sqrt(2), 0]
+    //   S_1 = S_0 + k1 ⊗ ((v1 - S_0 k1) * 1) = [[1,0],[0,2]];
+    //   o_1 = q1·S_1 = [0, 2/sqrt(2)]. Same numbers.
+    let q = Owned::f32(&[1, 2, 2], vec![1.0, 0.0, 0.0, 1.0]);
+    let k = Owned::f32(&[1, 2, 2], vec![1.0, 0.0, 0.0, 1.0]);
+    let v = Owned::f32(&[1, 2, 2], vec![1.0, 0.0, 2.0, 0.0]);
+    let g = Owned::f32(&[1, 2, 1], vec![0.0, 0.0]);
+    let beta = Owned::f32(&[1, 2, 1], vec![1.0, 1.0]);
+    let outs = unsafe {
+        run_op(
+            op("gated_delta_rule"),
+            &[&q.t, &k.t, &v.t, &g.t, &beta.t],
+            &[ai64("chunk_size", 2), astr("state_dtype", "f32")],
+            1,
+        )
+    }
+    .unwrap();
+    assert_eq!(outs[0].t.dims(), &[1, 2, 2]);
+    let inv2 = 2.0f32.powf(-0.5);
+    // Output rows are [vh*Dv] = 2 per position: t0 = [1/sqrt(2), 0],
+    // t1 = [2/sqrt(2), 0].
+    assert_close(outs[0].fdata()[0], 1.0 * inv2, 1e-6, "gdn[0]");
+    assert_close(outs[0].fdata()[1], 0.0, 1e-6, "gdn[1]");
+    assert_close(outs[0].fdata()[2], 2.0 * inv2, 1e-6, "gdn[2]");
+    assert_close(outs[0].fdata()[3], 0.0, 1e-6, "gdn[3]");
+}
+
+#[test]
+fn gated_delta_rule_hand_values_two_chunks_with_decay_and_gating() {
+    // Two chunks (S=4, chunk_size=2), vh=1, D=1, Dv=1, q = k = 1,
+    // v = [8,8,8,8], g = ln(0.5) everywhere (decay 0.5), beta = 0.5.
+    // Per-token reference (S_t = S_{t-1}*0.5 + ((v_t - S_{t-1}*0.5) * 0.5),
+    // o_t = S_t — read AFTER the update):
+    //   t0: S = 0*0.5 = 0;        delta = (8-0)*0.5 = 4;   S = 4;     o0 = 4
+    //   t1: S = 4*0.5 = 2;        delta = (8-2)*0.5 = 3;   S = 5;     o1 = 5
+    //   t2: S = 5*0.5 = 2.5;      delta = (8-2.5)*0.5 = 2.75; S = 5.25; o2 = 5.25
+    //   t3: S = 5.25*0.5 = 2.625; delta = (8-2.625)*0.5 = 2.6875; S = 5.3125; o3 = 5.3125
+    // The chunked body must produce the same numbers (the chunk boundary
+    // carries the state through the fp32 scan; all values are exact dyadics).
+    let q = Owned::f32(&[1, 4, 1], vec![1.0, 1.0, 1.0, 1.0]);
+    let k = Owned::f32(&[1, 4, 1], vec![1.0, 1.0, 1.0, 1.0]);
+    let v = Owned::f32(&[1, 4, 1], vec![8.0, 8.0, 8.0, 8.0]);
+    let ln05 = 0.5f32.ln();
+    let g = Owned::f32(&[1, 4, 1], vec![ln05, ln05, ln05, ln05]);
+    let beta = Owned::f32(&[1, 4, 1], vec![0.5, 0.5, 0.5, 0.5]);
+    let outs = unsafe {
+        run_op(
+            op("gated_delta_rule"),
+            &[&q.t, &k.t, &v.t, &g.t, &beta.t],
+            &[ai64("chunk_size", 2)],
+            1,
+        )
+    }
+    .unwrap();
+    assert_eq!(outs[0].t.dims(), &[1, 4, 1]);
+    let expected = [4.0, 5.0, 5.25, 5.3125];
+    for (i, (got, want)) in outs[0].fdata().iter().zip(&expected).enumerate() {
+        assert_close(*got, *want, 1e-5, &format!("gdn decay[{i}]"));
+    }
+}
+
+#[test]
+fn gated_delta_rule_repeats_qk_heads_for_gqa() {
+    // vh=2, D=Dv=2, q/k last dim 2 -> kh=1: the single q/k head is
+    // repeat_interleaved by 2. With g=0, beta=1 and k = identity, each value
+    // head sees the same key: head 0 reads v0 = [1,0],[2,0], head 1 reads
+    // v1 = [3,0],[4,0]. Per the single-chunk arithmetic, head h's output is
+    // [[v_h[0] / sqrt(2), 0], [0, v_h[1] / sqrt(2)]].
+    let q = Owned::f32(&[1, 2, 2], vec![1.0, 0.0, 0.0, 1.0]);
+    let k = Owned::f32(&[1, 2, 2], vec![1.0, 0.0, 0.0, 1.0]);
+    // v[t][h][j] = v[t*4 + h*2 + j]: head0 = (1,0),(2,0); head1 = (3,0),(4,0).
+    let v = Owned::f32(&[1, 2, 4], vec![1.0, 0.0, 3.0, 0.0, 2.0, 0.0, 4.0, 0.0]);
+    let g = Owned::f32(&[1, 2, 2], vec![0.0, 0.0, 0.0, 0.0]);
+    let beta = Owned::f32(&[1, 2, 2], vec![1.0, 1.0, 1.0, 1.0]);
+    let outs = unsafe {
+        run_op(
+            op("gated_delta_rule"),
+            &[&q.t, &k.t, &v.t, &g.t, &beta.t],
+            &[],
+            1,
+        )
+    }
+    .unwrap();
+    assert_eq!(outs[0].t.dims(), &[1, 2, 4]);
+    let inv2 = 2.0f32.powf(-0.5);
+    // Output rows are [vh*Dv] = 4 per position: t0 = [h0, h1] =
+    // [1/sqrt(2), 0, 3/sqrt(2), 0], t1 = [2/sqrt(2), 0, 4/sqrt(2), 0].
+    let expected = [
+        1.0 * inv2, // t0, head0
+        0.0,
+        3.0 * inv2, // t0, head1
+        0.0,
+        2.0 * inv2, // t1, head0
+        0.0,
+        4.0 * inv2, // t1, head1
+        0.0,
+    ];
+    for (i, (got, want)) in outs[0].fdata().iter().zip(&expected).enumerate() {
+        assert_close(*got, *want, 1e-6, &format!("gdn gqa[{i}]"));
+    }
+}
+
+#[test]
 fn layernorm_hand_values() {
     let x = Owned::f32(&[3], vec![1.0, 2.0, 3.0]);
     let outs = unsafe { run_op(op("layernorm"), &[&x.t], &[], 1) }.unwrap();
@@ -1134,15 +1517,88 @@ fn layernorm_hand_values() {
 
 #[test]
 fn rope_hand_values() {
+    // Half-split rotation over the first rotary_dim dims of the last axis.
+    // theta=1 makes every inv_freq[j] = 1^(-2j/4) = 1, so angle_j = pos * 1:
+    // for pos = 1, cos = cos(1) = 0.5403023, sin = sin(1) = 0.8414710.
+    // Pairs are (i, i+h) with h = rotary_dim/2 = 2:
+    //   out[i]   = x[i]*cos - x[i+2]*sin
+    //   out[i+2] = x[i+2]*cos + x[i]*sin
     let x = Owned::f32(&[1, 4], vec![1.0, 2.0, 3.0, 4.0]);
-    let cos = Owned::f32(&[1, 2], vec![0.5, 0.6]);
-    let sin = Owned::f32(&[1, 2], vec![0.7, 0.8]);
-    let outs = unsafe { run_op(op("rope"), &[&x.t, &cos.t, &sin.t], &[], 1) }.unwrap();
-    // NeoX half rotation: y[0]=x0*c0-x1*s0, y[1]=x1*c0+x0*s0, ...
-    assert_eq!(
-        outs[0].fdata(),
-        &[1.0 * 0.5 - 2.0 * 0.7, 2.0 * 0.5 + 1.0 * 0.7, 3.0 * 0.6 - 4.0 * 0.8, 4.0 * 0.6 + 3.0 * 0.8]
+    let y = Owned::f32(&[1, 4], vec![5.0, 6.0, 7.0, 8.0]);
+    let pos = Owned::i64(&[1], vec![1]);
+    let attrs = [
+        ai64("rotary_dim", 4),
+        af64("theta", 1.0),
+        abool("partial_rotary", true),
+    ];
+    let outs = unsafe { run_op(op("rope"), &[&x.t, &y.t, &pos.t], &attrs, 2) }.unwrap();
+    assert_eq!(outs[0].t.dims(), &[1, 4]);
+    assert_eq!(outs[1].t.dims(), &[1, 4]);
+    let (c, s) = (1.0f32.cos(), 1.0f32.sin());
+    let expected = [
+        1.0 * c - 3.0 * s,
+        2.0 * c - 4.0 * s,
+        3.0 * c + 1.0 * s,
+        4.0 * c + 2.0 * s,
+    ];
+    for (i, (got, want)) in outs[0].fdata().iter().zip(&expected).enumerate() {
+        assert_close(*got, *want, 1e-6, &format!("rope x[{i}]"));
+    }
+    let expected = [
+        5.0 * c - 7.0 * s,
+        6.0 * c - 8.0 * s,
+        7.0 * c + 5.0 * s,
+        8.0 * c + 6.0 * s,
+    ];
+    for (i, (got, want)) in outs[1].fdata().iter().zip(&expected).enumerate() {
+        assert_close(*got, *want, 1e-6, &format!("rope y[{i}]"));
+    }
+}
+
+#[test]
+fn rope_partial_rotary_and_default_positions() {
+    // D=6, rotary_dim=4: dims 4..5 pass through untouched. Positions default
+    // to arange(S) = [0, 1] along the FIRST axis (the sequence-first plan
+    // convention). Position 0 has
+    // angle 0 => cos=1, sin=0 => identity on the rotary block.
+    // theta=1e7: inv_freq[0] = 1e7^0 = 1 (angle_0 = pos),
+    // inv_freq[1] = 1e7^(-2/4) = 1/sqrt(1e7) (angle_1 = pos * 1/sqrt(1e7)).
+    // Row t=1, pairs (0,2) and (1,3):
+    //   out[0] = 7*cos(1) - 9*sin(1);        out[2] = 9*cos(1) + 7*sin(1)
+    //   out[1] = 8*cos(f1) - 10*sin(f1);     out[3] = 10*cos(f1) + 8*sin(f1)
+    //   out[4] = 11, out[5] = 12 (pass-through)
+    let x = Owned::f32(
+        &[2, 6],
+        vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ],
     );
+    let attrs = [
+        ai64("rotary_dim", 4),
+        af64("theta", 1e7),
+        abool("partial_rotary", true),
+    ];
+    let outs = unsafe { run_op(op("rope"), &[&x.t, &x.t], &attrs, 2) }.unwrap();
+    let f1 = 1e7f32.powf(-0.5);
+    let (c1, s1) = (1.0f32.cos(), 1.0f32.sin());
+    let (c2, s2) = (f1.cos(), f1.sin());
+    let expected = [
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        5.0,
+        6.0, // t=0: angle 0, identity
+        7.0 * c1 - 9.0 * s1,
+        8.0 * c2 - 10.0 * s2,
+        9.0 * c1 + 7.0 * s1,
+        10.0 * c2 + 8.0 * s2,
+        11.0,
+        12.0,
+    ];
+    for (i, (got, want)) in outs[0].fdata().iter().zip(&expected).enumerate() {
+        assert_close(*got, *want, 1e-5, &format!("partial rope[{i}]"));
+    }
 }
 
 #[test]
@@ -1190,7 +1646,10 @@ fn quantize_per_block_hand_values() {
     let outs = unsafe { run_op(op("quantize"), &[&x.t], &attrs, 2) }.unwrap();
     let s = &outs[1];
     assert_eq!(s.t.dims(), &[2, 2]);
-    assert_eq!(s.fdata(), &[0.5 / 448.0, 1.0 / 448.0, 2.0 / 448.0, 4.0 / 448.0]);
+    assert_eq!(
+        s.fdata(),
+        &[0.5 / 448.0, 1.0 / 448.0, 2.0 / 448.0, 4.0 / 448.0]
+    );
     // Block (0,0): ±448 -> 0x7E/0xFE; (0,1): same; (1,0): same;
     // (1,1): 448 -> 0x7E, 0.5/(4/448) = 56 = 1.75*2^5 -> 0_1100_110 = 0x66.
     assert_eq!(
@@ -1203,16 +1662,28 @@ fn quantize_per_block_hand_values() {
 fn amax_update_hand_values() {
     let x = Owned::f32(&[3], vec![1.0, -5.0, 2.0]);
     let amax = Owned::f32(&[], vec![3.0]);
-    let outs =
-        unsafe { run_op(op("amax_update"), &[&x.t, &amax.t], &[astr("scheme", "per_tensor")], 1) }
-            .unwrap();
+    let outs = unsafe {
+        run_op(
+            op("amax_update"),
+            &[&x.t, &amax.t],
+            &[astr("scheme", "per_tensor")],
+            1,
+        )
+    }
+    .unwrap();
     assert_eq!(outs[0].fdata(), &[5.0]);
 
     let x = Owned::f32(&[2, 3], vec![1.0, -5.0, 2.0, 0.0, -1.0, 3.0]);
     let amax = Owned::f32(&[2], vec![2.0, 2.0]);
-    let outs =
-        unsafe { run_op(op("amax_update"), &[&x.t, &amax.t], &[astr("scheme", "per_token")], 1) }
-            .unwrap();
+    let outs = unsafe {
+        run_op(
+            op("amax_update"),
+            &[&x.t, &amax.t],
+            &[astr("scheme", "per_token")],
+            1,
+        )
+    }
+    .unwrap();
     assert_eq!(outs[0].fdata(), &[5.0, 3.0]);
 }
 
@@ -1220,7 +1691,9 @@ fn amax_update_hand_values() {
 fn embedding_hand_values() {
     let w = Owned::f32(
         &[4, 3],
-        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ],
     );
     let idx = Owned::i32(&[3], vec![3, 0, 2]);
     let outs = unsafe { run_op(op("embedding"), &[&w.t, &idx.t], &[], 1) }.unwrap();
@@ -1244,7 +1717,10 @@ fn gather_hand_values() {
     let idx = Owned::i64(&[2, 4], vec![2, 2, 2, 2, 0, 0, 0, 0]);
     let outs = unsafe { run_op(op("gather"), &[&x.t, &idx.t], &[ai64("axis", 0)], 1) }.unwrap();
     assert_eq!(outs[0].t.dims(), &[2, 4]);
-    assert_eq!(outs[0].fdata(), &[9.0, 10.0, 11.0, 12.0, 1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(
+        outs[0].fdata(),
+        &[9.0, 10.0, 11.0, 12.0, 1.0, 2.0, 3.0, 4.0]
+    );
 }
 
 #[test]
@@ -1253,9 +1729,15 @@ fn scatter_hand_values_and_last_writer_wins() {
     // values[i, k] (row-major [3, 2]): k=0 column is [1,1,2], k=1 is [1,2,2].
     let idx = Owned::i32(&[2], vec![3, 1]);
     let values = Owned::f32(&[3, 2], vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
-    let outs =
-        unsafe { run_op(op("scatter"), &[&x.t, &idx.t, &values.t], &[ai64("axis", -1)], 1) }
-            .unwrap();
+    let outs = unsafe {
+        run_op(
+            op("scatter"),
+            &[&x.t, &idx.t, &values.t],
+            &[ai64("axis", -1)],
+            1,
+        )
+    }
+    .unwrap();
     assert_eq!(outs[0].t.dims(), &[3, 4]);
     // out[:,3] = values[:,0] = [1,1,2]; out[:,1] = values[:,1] = [1,2,2].
     let expected = [
@@ -1269,10 +1751,19 @@ fn scatter_hand_values_and_last_writer_wins() {
     let idx = Owned::i32(&[2], vec![1, 1]);
     // k=0 column [5,5,7], k=1 column [5,7,7]; out[:,1] ends as [5,7,7].
     let values = Owned::f32(&[3, 2], vec![5.0, 5.0, 5.0, 7.0, 7.0, 7.0]);
-    let outs =
-        unsafe { run_op(op("scatter"), &[&x.t, &idx.t, &values.t], &[ai64("axis", -1)], 1) }
-            .unwrap();
-    assert_eq!(outs[0].fdata(), &[0.0, 5.0, 0.0, 0.0, 0.0, 7.0, 0.0, 0.0, 0.0, 7.0, 0.0, 0.0]);
+    let outs = unsafe {
+        run_op(
+            op("scatter"),
+            &[&x.t, &idx.t, &values.t],
+            &[ai64("axis", -1)],
+            1,
+        )
+    }
+    .unwrap();
+    assert_eq!(
+        outs[0].fdata(),
+        &[0.0, 5.0, 0.0, 0.0, 0.0, 7.0, 0.0, 0.0, 0.0, 7.0, 0.0, 0.0]
+    );
 }
 
 #[test]
@@ -1286,14 +1777,31 @@ fn scatter_reduce_add_accumulates_duplicates_bitwise_deterministically() {
     let attrs = [astr("reduce", "add")];
     let r1 = unsafe { run_op(op("scatter"), &[&x.t, &idx.t, &values.t], &attrs, 1) }.unwrap();
     assert_eq!(r1[0].t.dims(), &[3, 4]);
-    assert_eq!(r1[0].fdata(), &[0.0, 5.0, 0.0, 0.0, 0.0, 7.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0]);
+    assert_eq!(
+        r1[0].fdata(),
+        &[0.0, 5.0, 0.0, 0.0, 0.0, 7.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0]
+    );
     // Fixed ascending-k accumulation order: two runs are bitwise identical.
     let r2 = unsafe { run_op(op("scatter"), &[&x.t, &idx.t, &values.t], &attrs, 1) }.unwrap();
-    assert_eq!(r1[0].bytes(), r2[0].bytes(), "scatter add must be bitwise reproducible");
+    assert_eq!(
+        r1[0].bytes(),
+        r2[0].bytes(),
+        "scatter add must be bitwise reproducible"
+    );
     // The default (assign) keeps last-writer-wins: out[:,1] ends as [4,5,6].
-    let r3 = unsafe { run_op(op("scatter"), &[&x.t, &idx.t, &values.t], &[ai64("axis", -1)], 1) }
-        .unwrap();
-    assert_eq!(r3[0].fdata(), &[0.0, 4.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0]);
+    let r3 = unsafe {
+        run_op(
+            op("scatter"),
+            &[&x.t, &idx.t, &values.t],
+            &[ai64("axis", -1)],
+            1,
+        )
+    }
+    .unwrap();
+    assert_eq!(
+        r3[0].fdata(),
+        &[0.0, 4.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0]
+    );
     // assign is also the behaviour when 'reduce' is passed explicitly.
     let r4 = unsafe {
         run_op(
@@ -1339,14 +1847,68 @@ fn sdpa_hand_values() {
 }
 
 #[test]
+fn sdpa_gqa_causal_hand_values() {
+    // GQA, per-head form [.., S, H, D]: num_heads=2, num_kv_heads=1, so both
+    // query heads share one kv head. q [1,2,2,2] (S=2, D=2):
+    // head0 = [[1,0],[0,1]], head1 = [[0,1],[1,0]]; k = identity [1,2,1,2];
+    // v = [[1,2],[3,4]]; scale 1.0 (explicit, for hand math), causal.
+    // head0 scores = q0 @ k^T = [[1,0],[0,1]]; causal masks j > i:
+    //   row0: [1, -inf]  -> probs [1, 0]      -> o0 = v[0] = [1, 2]
+    //   row1: [0, 1]     -> probs [1/(1+e), e/(1+e)]
+    // head1 scores = q1 @ k^T = [[0,1],[1,0]]:
+    //   row0: [0, -inf]  -> probs [1, 0]      -> o1 = v[0] = [1, 2]
+    //   row1: [1, 0]     -> probs [e/(1+e), 1/(1+e)]
+    // q[i][h][dd] = q[i*4 + h*2 + dd].
+    let q = Owned::f32(&[1, 2, 2, 2], vec![1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0]);
+    let k = Owned::f32(&[1, 2, 1, 2], vec![1.0, 0.0, 0.0, 1.0]);
+    let v = Owned::f32(&[1, 2, 1, 2], vec![1.0, 2.0, 3.0, 4.0]);
+    let attrs = [
+        ai64("num_heads", 2),
+        ai64("num_kv_heads", 1),
+        abool("causal", true),
+        af64("scale", 1.0),
+    ];
+    let outs = unsafe { run_op(op("sdpa"), &[&q.t, &k.t, &v.t], &attrs, 1) }.unwrap();
+    assert_eq!(outs[0].t.dims(), &[1, 2, 2, 2]);
+    let e = 1.0f32.exp();
+    let (p0, p1) = (1.0 / (1.0 + e), e / (1.0 + e));
+    // Output rows interleave heads: row0 = [o0[0], o0[1], o1[0], o1[1]].
+    let expected = [
+        1.0,
+        2.0,
+        1.0,
+        2.0, // row 0: both heads attend only j=0 -> v[0]
+        p0 * 1.0 + p1 * 3.0,
+        p0 * 2.0 + p1 * 4.0,
+        p1 * 1.0 + p0 * 3.0,
+        p1 * 2.0 + p0 * 4.0,
+    ];
+    for (i, (got, want)) in outs[0].fdata().iter().zip(&expected).enumerate() {
+        assert_close(*got, *want, 1e-6, &format!("sdpa gqa[{i}]"));
+    }
+}
+
+#[test]
+fn sdpa_additive_mask_hand_values() {
+    // The legacy flat form with an additive mask: q = k = identity,
+    // v = [[1,2],[3,4]], mask [0, -inf] (broadcast over S): every row may
+    // attend only j=0, so the output is v[0] = [1, 2] for both rows.
+    let q = Owned::f32(&[1, 2, 2], vec![1.0, 0.0, 0.0, 1.0]);
+    let k = Owned::f32(&[1, 2, 2], vec![1.0, 0.0, 0.0, 1.0]);
+    let v = Owned::f32(&[1, 2, 2], vec![1.0, 2.0, 3.0, 4.0]);
+    let mask = Owned::f32(&[2], vec![0.0, f32::NEG_INFINITY]);
+    let outs = unsafe { run_op(op("sdpa"), &[&q.t, &k.t, &v.t, &mask.t], &[], 1) }.unwrap();
+    assert_eq!(outs[0].fdata(), &[1.0, 2.0, 1.0, 2.0]);
+}
+
+#[test]
 fn cross_entropy_hand_values() {
     let logits = Owned::f32(&[2, 3], vec![1.0, 2.0, 3.0, 0.0, 0.0, 0.0]);
     let targets = Owned::i32(&[2], vec![2, 0]);
     let outs = unsafe { run_op(op("cross_entropy"), &[&logits.t, &targets.t], &[], 1) }.unwrap();
     assert_eq!(outs[0].t.rank, 0);
     // row 0: ln(e^-2 + e^-1 + 1); row 1: ln(3); mean of the two.
-    let expected =
-        (((-2.0f64).exp() + (-1.0f64).exp() + 1.0).ln() + 3.0f64.ln()) / 2.0;
+    let expected = (((-2.0f64).exp() + (-1.0f64).exp() + 1.0).ln() + 3.0f64.ln()) / 2.0;
     assert_close(outs[0].fdata()[0], expected as f32, 1e-6, "cross_entropy");
 }
 
@@ -1439,7 +2001,10 @@ fn softmax_is_stable_for_large_magnitude_inputs() {
     let x = Owned::f32(&[3], vec![1000.0, 1000.0, 0.0]);
     let outs = unsafe { run_op(op("softmax"), &[&x.t], &[], 1) }.unwrap();
     let r = outs[0].fdata();
-    assert_eq!(r[0], 0.5, "exp(0)/(exp(0)+exp(0)+exp(-1000)) is exactly 0.5");
+    assert_eq!(
+        r[0], 0.5,
+        "exp(0)/(exp(0)+exp(0)+exp(-1000)) is exactly 0.5"
+    );
     assert_eq!(r[1], 0.5);
     assert_eq!(r[2], 0.0);
     assert!(r.iter().all(|v| v.is_finite()));
@@ -1469,7 +2034,10 @@ fn rmsnorm_is_stable_for_near_zero_inputs() {
     let r = 1e-5f32.sqrt();
     let r0 = outs[0].fdata()[0];
     let r1 = outs[0].fdata()[1];
-    assert!(r0.is_finite() && r1.is_finite(), "near-zero input must not produce NaN");
+    assert!(
+        r0.is_finite() && r1.is_finite(),
+        "near-zero input must not produce NaN"
+    );
     assert_close(r0, 1e-30 / r, 1e-34, "rmsnorm near-zero [0]");
     assert_close(r1, -1e-30 / r, 1e-34, "rmsnorm near-zero [1]");
 }
@@ -1479,9 +2047,7 @@ fn rmsnorm_is_stable_for_near_zero_inputs() {
 #[test]
 fn quantize_dequantize_round_trip_stays_within_format_resolution() {
     let mut rng = Lcg(0xdeadbeef);
-    let values: Vec<f32> = (0..64)
-        .map(|_| 0.01 + 99.99 * rng.f32())
-        .collect();
+    let values: Vec<f32> = (0..64).map(|_| 0.01 + 99.99 * rng.f32()).collect();
     let x = Owned::f32(&[64], values.clone());
     for format in ["f8e4m3", "f8e5m2"] {
         let half_ulp = if format == "f8e4m3" { 0.0625 } else { 0.125 };
@@ -1514,26 +2080,38 @@ fn quantize_dequantize_round_trips_grid_values_exactly() {
 fn fp8_emulation_grid_is_correct() {
     // Spot-check the documented grid: RNE onto exponent/mantissa pairs.
     // e4m3: 0.5 = 2^-1 -> 0_0110_000 = 0x30.
-    let v = |x: f32| rustrain_kernels::op::quant::f32_to_fp8(x, rustrain_kernels::op::quant::Fp8Format::E4M3);
+    let v = |x: f32| {
+        rustrain_kernels::op::quant::f32_to_fp8(x, rustrain_kernels::op::quant::Fp8Format::E4M3)
+    };
     assert_eq!(v(0.0), 0x00);
     assert_eq!(v(-0.0), 0x80);
     assert_eq!(v(0.5), 0x30);
     assert_eq!(v(1.0), 0x38);
     assert_eq!(v(448.0), 0x7E);
     assert_eq!(v(449.0), 0x7E, "449 still rounds down to 448 (RNE)");
-    assert_eq!(v(465.0), 0x7F, "past the RNE boundary, e4m3 has no infinity: NaN");
+    assert_eq!(
+        v(465.0),
+        0x7F,
+        "past the RNE boundary, e4m3 has no infinity: NaN"
+    );
     // RNE tie: 1.5 + 1/16 ulp boundary. e4m3 ulp at 1.5 is 2^-4 = 0.0625;
     // 1.5625 is halfway between 1.5 (mant 100) and 1.625 (mant 101).
     assert_eq!(v(1.5625), 0x3C, "1.5 -> 0_0111_100");
-    let f = |b: u8| rustrain_kernels::op::quant::fp8_to_f32(b, rustrain_kernels::op::quant::Fp8Format::E4M3);
+    let f = |b: u8| {
+        rustrain_kernels::op::quant::fp8_to_f32(b, rustrain_kernels::op::quant::Fp8Format::E4M3)
+    };
     assert_eq!(f(0x30), 0.5);
     assert_eq!(f(0x7E), 448.0);
     assert!(f(0x7F).is_nan());
     // Subnormal: min subnormal unit is 2^-9.
     assert_eq!(f(0x01), 2f32.powi(-9));
 
-    let v5 = |x: f32| rustrain_kernels::op::quant::f32_to_fp8(x, rustrain_kernels::op::quant::Fp8Format::E5M2);
-    let f5 = |b: u8| rustrain_kernels::op::quant::fp8_to_f32(b, rustrain_kernels::op::quant::Fp8Format::E5M2);
+    let v5 = |x: f32| {
+        rustrain_kernels::op::quant::f32_to_fp8(x, rustrain_kernels::op::quant::Fp8Format::E5M2)
+    };
+    let f5 = |b: u8| {
+        rustrain_kernels::op::quant::fp8_to_f32(b, rustrain_kernels::op::quant::Fp8Format::E5M2)
+    };
     assert_eq!(v5(1.0), 0x3C); // 0_01111_00
     assert_eq!(v5(57344.0), 0x7B); // 0_11110_11
     assert_eq!(v5(1e10), 0x7C, "e5m2 overflow is +inf");
@@ -1548,7 +2126,12 @@ fn fp8_emulation_grid_is_correct() {
 #[allow(clippy::vec_init_then_push)] // 26 tuple pushes read as a table; a vec! literal is noise
 fn determinism_cases() -> Vec<(&'static str, Vec<Owned>, Vec<RsAttr>, usize)> {
     let mut cases: Vec<(&'static str, Vec<Owned>, Vec<RsAttr>, usize)> = Vec::new();
-    cases.push(("view", vec![Owned::f32(&[2, 3], (1..=6).map(|v| v as f32).collect())], vec![], 1));
+    cases.push((
+        "view",
+        vec![Owned::f32(&[2, 3], (1..=6).map(|v| v as f32).collect())],
+        vec![],
+        1,
+    ));
     cases.push((
         "reshape",
         vec![Owned::f32(&[2, 3], (1..=6).map(|v| v as f32).collect())],
@@ -1666,25 +2249,22 @@ fn determinism_cases() -> Vec<(&'static str, Vec<Owned>, Vec<RsAttr>, usize)> {
         1,
     ));
     cases.push((
-        "rope",
-        vec![
-            Owned::f32(&[1, 4], vec![1.0, 2.0, 3.0, 4.0]),
-            Owned::f32(&[1, 2], vec![0.5, 0.6]),
-            Owned::f32(&[1, 2], vec![0.7, 0.8]),
-        ],
-        vec![],
-        1,
-    ));
-    cases.push((
         "quantize",
-        vec![Owned::f32(&[2, 4], vec![0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, 0.5])],
+        vec![Owned::f32(
+            &[2, 4],
+            vec![0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, 0.5],
+        )],
         vec![astr("scheme", "per_token"), astr("format", "f8e4m3")],
         2,
     ));
     cases.push((
         "dequantize",
         vec![
-            Owned::u8(RsDtype::F8E4M3, &[2, 4], vec![0x7E, 0xFE, 0x76, 0x7E, 0x30, 0x38, 0x40, 0x66]),
+            Owned::u8(
+                RsDtype::F8E4M3,
+                &[2, 4],
+                vec![0x7E, 0xFE, 0x76, 0x7E, 0x30, 0x38, 0x40, 0x66],
+            ),
             Owned::f32(&[2], vec![1.0 / 448.0, 2.0 / 448.0]),
         ],
         vec![astr("scheme", "per_token"), astr("format", "f8e4m3")],
@@ -1702,7 +2282,10 @@ fn determinism_cases() -> Vec<(&'static str, Vec<Owned>, Vec<RsAttr>, usize)> {
     cases.push((
         "embedding",
         vec![
-            Owned::f32(&[5, 2], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]),
+            Owned::f32(
+                &[5, 2],
+                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+            ),
             Owned::i32(&[3], vec![4, 0, 2]),
         ],
         vec![],
@@ -1732,7 +2315,10 @@ fn determinism_cases() -> Vec<(&'static str, Vec<Owned>, Vec<RsAttr>, usize)> {
         vec![
             Owned::f32(&[3, 4], vec![0.0; 12]),
             Owned::i32(&[3], vec![1, 1, 2]),
-            Owned::f32(&[3, 3], vec![0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 0.25, 0.5, 1.0]),
+            Owned::f32(
+                &[3, 3],
+                vec![0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 0.25, 0.5, 1.0],
+            ),
         ],
         vec![astr("reduce", "add")],
         1,
@@ -1769,8 +2355,61 @@ fn determinism_cases() -> Vec<(&'static str, Vec<Owned>, Vec<RsAttr>, usize)> {
     ));
     cases.push((
         "topk_router",
-        vec![Owned::f32(&[2, 4], vec![1.0, 3.0, 2.0, 4.0, 4.0, 1.0, 3.0, 2.0])],
+        vec![Owned::f32(
+            &[2, 4],
+            vec![1.0, 3.0, 2.0, 4.0, 4.0, 1.0, 3.0, 2.0],
+        )],
         vec![ai64("top_k", 2)],
+        2,
+    ));
+    cases.push((
+        "l2norm",
+        vec![Owned::f32(&[2, 4], (1..=8).map(|v| v as f32).collect())],
+        vec![ai64("dim", -1), af64("eps", 1e-6)],
+        1,
+    ));
+    cases.push((
+        "rmsnorm_gated",
+        vec![
+            Owned::f32(&[2, 4], (1..=8).map(|v| v as f32).collect()),
+            Owned::f32(&[4], vec![1.0, 2.0, 1.0, 2.0]),
+            Owned::f32(&[2, 4], (1..=8).map(|v| v as f32 * 0.5).collect()),
+        ],
+        vec![af64("eps", 1e-6), astr("gate_act", "silu")],
+        1,
+    ));
+    cases.push((
+        "causal_conv1d",
+        vec![
+            Owned::f32(&[3, 2], (1..=6).map(|v| v as f32).collect()),
+            Owned::f32(&[2, 1, 3], vec![0.5, 1.0, 1.5, 0.25, 0.75, 1.25]),
+        ],
+        vec![ai64("kernel", 3), astr("activation", "silu")],
+        1,
+    ));
+    cases.push((
+        "gated_delta_rule",
+        vec![
+            Owned::f32(&[1, 4, 2], (1..=8).map(|v| v as f32).collect()),
+            Owned::f32(&[1, 4, 2], (1..=8).map(|v| v as f32 * 0.5).collect()),
+            Owned::f32(&[1, 4, 2], (1..=8).map(|v| v as f32 * 0.25).collect()),
+            Owned::f32(&[1, 4, 1], vec![-0.5, -0.5, -0.5, -0.5]),
+            Owned::f32(&[1, 4, 1], vec![0.25, 0.5, 0.75, 1.0]),
+        ],
+        vec![ai64("chunk_size", 2)],
+        1,
+    ));
+    cases.push((
+        "rope",
+        vec![
+            Owned::f32(&[2, 6], (1..=12).map(|v| v as f32).collect()),
+            Owned::f32(&[2, 6], (1..=12).map(|v| v as f32 * 0.5).collect()),
+        ],
+        vec![
+            ai64("rotary_dim", 4),
+            af64("theta", 1e7),
+            abool("partial_rotary", true),
+        ],
         2,
     ));
     cases
@@ -1822,7 +2461,10 @@ fn every_op_is_bitwise_deterministic() {
 #[test]
 fn infer_produces_documented_shapes_and_dtypes() {
     unsafe {
-        let infer_ok = |o: &'static RsOpDesc, ins: &[&RsTensor], attrs: &[RsAttr], n_out: usize|
+        let infer_ok = |o: &'static RsOpDesc,
+                        ins: &[&RsTensor],
+                        attrs: &[RsAttr],
+                        n_out: usize|
          -> Vec<RsTensor> {
             let mut descs: Vec<RsTensor> = (0..n_out).map(|_| RsTensor::default()).collect();
             call_infer(o, ins, &mut descs, attrs).unwrap();
@@ -1831,7 +2473,12 @@ fn infer_produces_documented_shapes_and_dtypes() {
 
         // reduce: negative axis and the no-axis scalar case.
         let x = Owned::f32(&[2, 3, 4], vec![0.0; 24]);
-        let d = infer_ok(op("reduce"), &[&x.t], &[astr("kind", "sum"), ai64("axis", -1)], 1);
+        let d = infer_ok(
+            op("reduce"),
+            &[&x.t],
+            &[astr("kind", "sum"), ai64("axis", -1)],
+            1,
+        );
         assert_eq!(d[0].dims(), &[2, 3]);
         let d = infer_ok(op("reduce"), &[&x.t], &[astr("kind", "sum")], 1);
         assert_eq!(d[0].rank, 0);
@@ -1842,7 +2489,11 @@ fn infer_produces_documented_shapes_and_dtypes() {
         let d = infer_ok(
             op("reduce"),
             &[&x.t],
-            &[astr("kind", "sum"), ai64("axis", -1), abool("keepdim", true)],
+            &[
+                astr("kind", "sum"),
+                ai64("axis", -1),
+                abool("keepdim", true),
+            ],
             1,
         );
         assert_eq!(d[0].dims(), &[2, 3, 1]);
@@ -1857,7 +2508,12 @@ fn infer_produces_documented_shapes_and_dtypes() {
         let sx = Owned::f32(&[4], vec![0.0; 4]);
         let si = Owned::i32(&[2], vec![0, 1]);
         let sv = Owned::f32(&[2], vec![1.0, 2.0]);
-        let d = infer_ok(op("scatter"), &[&sx.t, &si.t, &sv.t], &[astr("reduce", "add")], 1);
+        let d = infer_ok(
+            op("scatter"),
+            &[&sx.t, &si.t, &sv.t],
+            &[astr("reduce", "add")],
+            1,
+        );
         assert_eq!(d[0].dims(), &[4]);
 
         // gather: torch convention — indices share x's rank; the gathered
@@ -1972,6 +2628,62 @@ fn infer_produces_documented_shapes_and_dtypes() {
         let vv = Owned::f32(&[2, 2], vec![0.0; 4]);
         let d = infer_ok(op("adamw"), &[&p.t, &g.t, &m.t, &vv.t], &[], 3);
         assert!(d.iter().all(|o| o.dims() == [2, 2]));
+
+        // l2norm: shape preserved for any dim.
+        let d = infer_ok(op("l2norm"), &[&x.t], &[ai64("dim", -1)], 1);
+        assert_eq!(d[0].dims(), &[2, 3, 4]);
+
+        // rmsnorm_gated: shape preserved; the weight fixes the row width.
+        let w = Owned::f32(&[4], vec![0.0; 4]);
+        let gate = Owned::f32(&[2, 3, 4], vec![0.0; 24]);
+        let d = infer_ok(op("rmsnorm_gated"), &[&x.t, &w.t, &gate.t], &[], 1);
+        assert_eq!(d[0].dims(), &[2, 3, 4]);
+
+        // causal_conv1d: shape preserved.
+        let cx = Owned::f32(&[5, 3], vec![0.0; 15]);
+        let cw = Owned::f32(&[3, 1, 4], vec![0.0; 12]);
+        let d = infer_ok(op("causal_conv1d"), &[&cx.t, &cw.t], &[], 1);
+        assert_eq!(d[0].dims(), &[5, 3]);
+
+        // gated_delta_rule: [.., S, kh*D] -> [.., S, vh*Dv] (D = Dv = 2).
+        let qq = Owned::f32(&[1, 4, 2], vec![0.0; 8]);
+        let kk = Owned::f32(&[1, 4, 2], vec![0.0; 8]);
+        let vv3 = Owned::f32(&[1, 4, 2], vec![0.0; 8]);
+        let gg = Owned::f32(&[1, 4, 1], vec![0.0; 4]);
+        let d = infer_ok(
+            op("gated_delta_rule"),
+            &[&qq.t, &kk.t, &vv3.t, &gg.t, &gg.t],
+            &[ai64("chunk_size", 2)],
+            1,
+        );
+        assert_eq!(d[0].dims(), &[1, 4, 2]);
+
+        // rope: two outputs, both the input shape.
+        let r = Owned::f32(&[2, 6], vec![0.0; 12]);
+        let d = infer_ok(
+            op("rope"),
+            &[&r.t, &r.t],
+            &[ai64("rotary_dim", 4), abool("partial_rotary", true)],
+            2,
+        );
+        assert_eq!(d[0].dims(), &[2, 6]);
+        assert_eq!(d[1].dims(), &[2, 6]);
+
+        // sdpa GQA, per-head form [.., S, H, D]: the head axis is declared.
+        let qg = Owned::f32(&[1, 2, 2, 4], vec![0.0; 16]);
+        let kg = Owned::f32(&[1, 2, 1, 4], vec![0.0; 8]);
+        let vg = Owned::f32(&[1, 2, 1, 4], vec![0.0; 8]);
+        let d = infer_ok(
+            op("sdpa"),
+            &[&qg.t, &kg.t, &vg.t],
+            &[
+                ai64("num_heads", 2),
+                ai64("num_kv_heads", 1),
+                abool("causal", true),
+            ],
+            1,
+        );
+        assert_eq!(d[0].dims(), &[1, 2, 2, 4]);
     }
 }
 
@@ -2051,6 +2763,79 @@ fn unknown_attribute_values_are_hard_errors_naming_the_accepted_values() {
         // message naming what is required.
         let err = call_exec(op("reduce"), &[&x.t], &mut [&mut out], &[]).unwrap_err();
         assert!(err.contains("required"), "missing kind message: {err}");
+
+        // The new primitives' string attributes: a value the description
+        // wrote but the vocabulary does not know is a hard error naming the
+        // accepted set — never a silent fallback to the default.
+        let g = Owned::f32(&[4], vec![0.0; 4]);
+        let err = call_exec(
+            op("rmsnorm_gated"),
+            &[&x.t, &Owned::f32(&[4], vec![1.0; 4]).t, &g.t],
+            &mut [&mut out],
+            &[astr("gate_act", "gelu")],
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("gate_act") && err.contains("silu") && err.contains("gelu"),
+            "rmsnorm_gated gate_act message: {err}"
+        );
+
+        let err = call_exec(
+            op("causal_conv1d"),
+            &[
+                &Owned::f32(&[3, 1], vec![0.0; 3]).t,
+                &Owned::f32(&[1, 1, 3], vec![0.0; 3]).t,
+            ],
+            &mut [&mut out],
+            &[astr("groups", "dense")],
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("groups") && err.contains("channels") && err.contains("dense"),
+            "causal_conv1d groups message: {err}"
+        );
+
+        let err = call_exec(
+            op("gated_delta_rule"),
+            &[
+                &Owned::f32(&[1, 2, 2], vec![0.0; 4]).t,
+                &Owned::f32(&[1, 2, 2], vec![0.0; 4]).t,
+                &Owned::f32(&[1, 2, 2], vec![0.0; 4]).t,
+                &Owned::f32(&[1, 2, 1], vec![0.0; 2]).t,
+                &Owned::f32(&[1, 2, 1], vec![0.0; 2]).t,
+            ],
+            &mut [&mut out],
+            &[astr("state_dtype", "bf16")],
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("state_dtype") && err.contains("f32") && err.contains("bf16"),
+            "gated_delta_rule state_dtype message: {err}"
+        );
+
+        // rope: an odd rotary_dim is refused (pairs cannot be built), and a
+        // rotary_dim below D without partial_rotary is refused rather than
+        // guessed.
+        let r6 = Owned::f32(&[1, 6], vec![0.0; 6]);
+        let err = call_exec(
+            op("rope"),
+            &[&r6.t, &r6.t],
+            &mut [&mut RsTensor::default(), &mut RsTensor::default()],
+            &[ai64("rotary_dim", 3)],
+        )
+        .unwrap_err();
+        assert!(err.contains("rotary_dim"), "rope odd rotary_dim: {err}");
+        let err = call_exec(
+            op("rope"),
+            &[&r6.t, &r6.t],
+            &mut [&mut RsTensor::default(), &mut RsTensor::default()],
+            &[ai64("rotary_dim", 4)],
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("partial_rotary"),
+            "rope partial declaration missing: {err}"
+        );
     }
 }
 
@@ -2088,11 +2873,7 @@ fn execute_revalidates_input_shapes() {
 fn dequantize_rejects_a_scale_shape_inconsistent_with_the_declared_scheme() {
     unsafe {
         // Declared per_token wants scale [2]; give it [4].
-        let q = Owned::u8(
-            RsDtype::F8E4M3,
-            &[2, 4],
-            vec![0x7E; 8],
-        );
+        let q = Owned::u8(RsDtype::F8E4M3, &[2, 4], vec![0x7E; 8]);
         let scale = Owned::f32(&[4], vec![0.0; 4]);
         let err = call_exec(
             op("dequantize"),
@@ -2115,7 +2896,13 @@ fn non_contiguous_inputs_are_rejected_with_a_clear_message() {
         // Transpose produces a non-contiguous [3, 3] view (strides [1, 3]),
         // whose shape still passes matmul's dim checks — so the contiguity
         // rule is what must fire.
-        let t = run_op(op("transpose"), &[&x.t], &[ai64("dim0", 0), ai64("dim1", 1)], 1).unwrap();
+        let t = run_op(
+            op("transpose"),
+            &[&x.t],
+            &[ai64("dim0", 0), ai64("dim1", 1)],
+            1,
+        )
+        .unwrap();
         let y = Owned::f32(&[3, 3], vec![0.0; 9]);
         let out = Owned::f32(&[3, 3], vec![0.0; 9]);
         let mut o = out.t;
@@ -2136,7 +2923,10 @@ fn wrong_output_shape_or_dtype_is_rejected_not_corrupted() {
         let wrong = Owned::f32(&[2, 3], vec![0.0; 6]);
         let mut w = wrong.t;
         let err = call_exec(op("matmul"), &[&a.t, &b.t], &mut [&mut w], &[]).unwrap_err();
-        assert!(err.contains("shape") && err.contains("infer()"), "message: {err}");
+        assert!(
+            err.contains("shape") && err.contains("infer()"),
+            "message: {err}"
+        );
         // Null data is rejected.
         let mut null_out = RsTensor::new(RsDtype::F32, &[2, 2]);
         let err = call_exec(op("matmul"), &[&a.t, &b.t], &mut [&mut null_out], &[]).unwrap_err();
