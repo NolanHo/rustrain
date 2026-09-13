@@ -2,6 +2,11 @@
 
 > 只描述**今天**代码里的事实：`Plan` 的字段、`Compiler::compile` 的 pass 顺序、`CompiledPlan` 的产物、intrinsic 词汇表、`ParallelLayout` 的表达能力、运行期的消费方式，以及模型描述层必须满足的接口。每条断言带 `file:line`；不存在的东西写 "not found"。不含建议与设计意见。
 >
+> **快照时间：D3 之前（2026-09）。** 本文描述的 `GroupKind` / 单值 `ParallelLayout` / `ProcessGroups` /
+> `intrinsic.ATTR_GROUP` 六值字符串已在 **D3** 被 `Mesh` + `GroupMask` + 多分片 `ParallelLayout` 取代，
+> 其中的 `file:line` 也随之漂移 —— 读它的时候请当作**历史基线**，不是现状。D3 之后的事实以
+> `docs/architecture.md` §1 与 `docs/design/model-description.md` §1–§2 为准。
+>
 > 标注约定：**死钩子** = 全仓无读者，或只有构造者 / 测试在写的字段、方法或变体。
 
 ## 1. 类型逐字段清点

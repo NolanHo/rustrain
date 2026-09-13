@@ -895,7 +895,7 @@ fn check(args: CheckArgs) -> Result<()> {
                                 "the description loads and expands into one global plan that passes \
                                  `check_structure` (topological order, every node produces \
                                  something, no slot written twice): {} node(s), {} slot(s), every \
-                                 layout `Replicate`. C2's compile-dependent L1 sub-checks are not \
+                                 layout replicated. C2's compile-dependent L1 sub-checks are not \
                                  covered by this item; they are reported separately",
                                 plan.plan.nodes.len(),
                                 plan.plan.slots.len()
@@ -1151,7 +1151,7 @@ fn compile_dependent_l1_checks(expanded: bool) -> Vec<CheckItem> {
         ),
         (
             "l1.layout_propagation",
-            "sharding is propagated by a compile pass, and the global plan stays `Replicate` until \
+            "sharding is propagated by a compile pass, and the global plan stays replicated until \
              `instantiate` sees a mesh (D3)",
         ),
         (

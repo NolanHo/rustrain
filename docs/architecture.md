@@ -49,7 +49,7 @@ kernel 做对照**，对研究比编译期检查更有价值。
 
 | 事实 | 归属 | 求值时机 |
 |---|---|---|
-| mesh：轴名 → degree / ranks | 编译输入 + 运行输入（`ProcessGroups`）。**不进 plan。** | 编译期 |
+| mesh：**有序**轴名 → degree | 编译输入 + 运行输入（`Mesh`；plan 只存 `MeshFingerprint`）。**不进 plan。** | 编译期 |
 | 张量轴 → mesh 轴的**指派** | 模型描述（符号：**多个 `(dim, group)` 分片 + 至多一个 partial**） | 编译期求值 |
 | 具体 layout（含度数）、axis id、形状、节点集合 | **plan 产物** | 编译后 |
 | topology **指纹**（不是对象） | plan 的 meta / digest | 编译后 |
@@ -67,9 +67,10 @@ kernel 做对照**，对研究比编译期检查更有价值。
 因此 checkpoint 映射挂在**描述**上（全局参数空间），不挂在 plan 上（局部）。
 副产品：§4.4 的 L2 检查**完全不需要 topology**，只有 L1 需要。
 
-**必须改的钉子**：`GroupKind` 现在是封闭枚举（Tp/Dp/Pp/Ep），hybrid mesh（HSDP、tp×ep×dp 组合）表达不了。
-它应演进成 **`GroupMask`（轴掩码，可表达 `tp|ep` 这类组合组）** —— 单一的 axis id 表达不了组合，
-而掩码是结果、不是拓扑对象（`docs/design/model-description.md` §1.2）。
+**这枚钉子已经拆掉（D3，2026-09）**：`GroupKind` 那个封闭枚举（Tp/Dp/Pp/Ep）表达不了 hybrid mesh
+（HSDP、tp×ep×dp 组合），现在换成了 **`GroupMask`（轴掩码，可表达 `tp|ep` 这类组合组）**。
+掩码是结果、不是拓扑对象：名字与 degree 留在 `Mesh` 里，plan 只带 `MeshFingerprint`
+（`docs/design/model-description.md` §1）。
 
 ### 1.2 模型是数据
 
@@ -106,7 +107,7 @@ kernel 做对照**，对研究比编译期检查更有价值。
 
 | 概念 | 载体 | 是什么 |
 |---|---|---|
-| 度数（tp=8 / ep=2） | `ProcessGroups`（`ParallelConfig`） | 编译输入；进程生命周期常量 |
+| 度数（tp=8 / ep=2） | `Mesh`（由 `ParallelConfig` 建出） | 编译输入；进程生命周期常量 |
 | 轴（这条边属于哪条 mesh 轴） | axis id + 节点属性 `ATTR_GROUP` | **节点属性**，不是 tensor operand |
 | layout（哪个张量轴被切） | **多个 `(dim, group)` 分片 + 至多一个 partial**（`docs/design/model-description.md` §2.1） | **slot 声明** |
 
@@ -369,7 +370,7 @@ rustrain check --model <model-dir> [--checkpoint <dir>] [--tp N --cp N --ep N --
 
 **它保证什么**（声明之间自洽）：每个节点都有实现（dtype / layout / target 满足）；每个边界的形状 /
 strides / dtype 一致；每个 buffer 都被分配、无别名冲突；每个 collective 都有组
-（"组在拓扑里存在"是**目标**：今天 `GroupUnavailable` 从未被构造，见 §7）；
+（"组在拓扑里存在"**自 D3 起是真的**：掩码要对着 plan 自己的 mesh 指纹校验，越界的组位报 `GroupUnavailable`）；
 每个 slot 都有来源（L2）；每个算子有反向接线或可推导。
 
 **它不保证什么**：**数值**（NaN / Inf / 精度 / 发散 —— 那是 kernel 的责任）；**模型是对的**
@@ -491,15 +492,15 @@ P2/P6 直接服务 §0 的边界契约，优先级高于 P1/P4/P5。
 
 **死钩子的完整清单见 `docs/design/plan-ir-baseline.md`** —— 本节只列与 §1 / §2 差距直接相关的那些，不复制全表。
 
-- `shard::propagate` 收到 `ProcessGroups` 后丢弃（`shard.rs:236`）→ `GroupUnavailable` 从未被构造：
-  plan 可以声明 `GroupKind::Ep` 而拓扑里 expert=1 而不报错。**§1.1 的"编译期求值拓扑"缺的就是这一步。**
+- ~~`shard::propagate` 收到 `ProcessGroups` 后丢弃 → `GroupUnavailable` 从未被构造~~ **D3 已闭合**：
+  `propagate` 现在拿 plan 的 mesh 指纹校验每个 layout 的掩码与维度，越界即报错并点名节点 / 算子 / 掩码。
 - `CollectiveBackend::execute` 的签名里没有 rank / world size / 组句柄（`runtime/lib.rs:170-179`）→
   **§2.2 说的"执行期由 runtime 绑定句柄"今天没有通道**；`intrinsic.sync` 与 `intrinsic.broadcast`
   编译期被接受、运行期落空。
 - digest 把 `seed` / `checkpoint` / `Trace.path`（后者只是诊断字符串）纳入，却把**整个 `MemoryPlan`** 排除
   （`compile.rs:696-716`）→ 改诊断路径会改 digest，改内存策略不会。与 §0 推论 3 的意图相反。
-- `GroupKind` 是封闭六值枚举 + `ProcessGroups.groups: [_; 6]` 定长数组（`group.rs:20-49, 142`）→
-  §1.1 的 `GroupMask`（轴掩码）迁移是表达 hybrid mesh 的前置条件。
+- ~~`GroupKind` 是封闭六值枚举 + `[_; 6]` 定长数组~~ **D3 已完成**：`Mesh` + `GroupMask` + 多分片
+  `ParallelLayout`，旧算术有逐 rank 对拍测试。剩下的是 D4 的 `instantiate`。
 - **`SlotKind::State` / `Gradient` 无任何构造点（`memory.rs:551` 会读）→ §1.7 的状态管理今天没有承载。**
 - **`RsMemReq.save_for_backward_bytes` 是死钩子**（ABI 里有，`ffi.rs:418`；只有测试读，
   `memory.rs:644` 构造后从不累加）→ 融合 kernel 自己保存的激活不计入预算，**激活峰值被低估**。
@@ -525,7 +526,7 @@ P2/P6 直接服务 §0 的边界契约，优先级高于 P1/P4/P5。
 
 **模型面**
 - 模型描述格式：结构由数据承载（§1.2 / D8）
-- `GroupKind` → `GroupMask`（轴掩码，§1.1 / D9）
+- ~~`GroupKind` → `GroupMask`（轴掩码，§1.1 / D9）~~ **已完成（D3）**
 - 模块树是否必要：今天它只贡献 `Trace.path` 这一个可读字符串，没有任何东西**遍历**它。
   只有当某个消费者必须走树时（checkpoint 映射、显式 optimizer 分区、state 管理）才值得引入
 
@@ -541,7 +542,7 @@ P2/P6 直接服务 §0 的边界契约，优先级高于 P1/P4/P5。
 | D5 | 训练循环归属、微批与梯度累积对 plan 的影响 | 未定 |
 | D6 | P1/P2/P4/P5/P6/P7 的落地顺序 | 待 D8 定 |
 | D8 | **描述文件的具体语法与展开语义**（重复、逐层覆盖、按名接线；必须容纳 §5.2 的两种形式） | **已设计完成**：`docs/design/model-description.md` §3–§4；执行入口是 `docs/design/qwen36-text/spec.md` |
-| D9 | `GroupKind` → `GroupMask`（轴掩码，可表达 `tp\|ep` 这类组合组）的迁移（涉及 ABI 面） | **已设计完成**：`docs/design/model-description.md` §1；执行入口是 `docs/design/qwen36-text/spec.md` |
+| D9 | `GroupKind` → `GroupMask`（轴掩码，可表达 `tp\|ep` 这类组合组）的迁移 | **已落地（D3）**：`Mesh` / `GroupMask` / 多分片 `ParallelLayout` / 形状算术；plan 带 `MeshFingerprint`、`ATTR_GROUP` 变成掩码整数、`GroupUnavailable` 成为真实错误。设计见 `docs/design/model-description.md` §1–§2，证据见 `docs/design/qwen36-text/spec.md` D3。**ABI 面未动**：`RsGroupKind` 是插件的**能力声明**（"我要在哪些轴上做集合通信"），与 plan 的 layout 掩码是两个概念；若将来要统一，那是 ABI v2 |
 | D10 | `SlotKind::State` 与持久化：激活 / optimizer state / 循环层 state | 未定 |
 | D11 | 融合替换的合法性检查落地（collectives 集合相等） | 未定 |
 | D7 | `rustrain check` 的层级划分与 L1/L2 落地顺序（§4.4） | 依赖 D8 |
