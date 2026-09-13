@@ -38,17 +38,19 @@ use std::process::Command;
 
 use serde_json::Value;
 
-/// C6's "check id 的完整清单": fifteen ids — the six C6 fixes in its report paragraph, plus the nine
-/// this unit added (the six compile-dependent L1 sub-checks, description-side binding coverage, the
-/// `ignore` coverage item, and the argument check). This is the whole vocabulary a report may use:
-/// an id outside it means the contract changed without this test, and an id missing from the
-/// rejected-arguments run below means a check no longer runs.
-const C6_CHECK_IDS: [&str; 15] = [
+/// C6's "check id 的完整清单": sixteen ids — the six C6 fixes in its report paragraph, plus the
+/// ten this unit added (the six compile-dependent L1 sub-checks, description-side binding
+/// coverage, the `ignore` coverage item, the argument check, and D4's `l1.instantiate`). This is
+/// the whole vocabulary a report may use: an id outside it means the contract changed without
+/// this test, and an id missing from the rejected-arguments run below means a check no longer
+/// runs.
+const C6_CHECK_IDS: [&str; 16] = [
     "cli.arguments",
     "l1.binding_coverage",
     "l1.collective_axes",
     "l1.compile",
     "l1.implementation_availability",
+    "l1.instantiate",
     "l1.layout_propagation",
     "l1.operator_shapes",
     "l1.partial_fulfillment",
@@ -61,16 +63,16 @@ const C6_CHECK_IDS: [&str; 15] = [
     "l2.tensor_consumption",
 ];
 
-/// The six C2 sub-checks that need `Plan::compile` (a mesh: D3/D4), plus implementation
-/// availability — five primitives of this description have no implementation on this host, which
-/// C2 makes a `skip`, never a `fail` and never a silent `pass`.
-const EXPECTED_SKIPS: [&str; 7] = [
-    "l1.collective_axes",
+/// The four L1 sub-checks that still need `Plan::compile` (a **resolved** implementation for
+/// every node), plus implementation availability — five primitives of this description have no
+/// implementation on this host, which C2 makes a `skip`, never a `fail` and never a silent
+/// `pass`. D4 turned the other three compile-dependent sub-checks real: with the mesh, `instantiate`
+/// and the propagation pass run without any implementation, so `l1.layout_propagation`,
+/// `l1.partial_fulfillment` and `l1.collective_axes` are `pass` on this fixture now.
+const EXPECTED_SKIPS: [&str; 4] = [
     "l1.compile",
     "l1.implementation_availability",
-    "l1.layout_propagation",
     "l1.operator_shapes",
-    "l1.partial_fulfillment",
     "l1.slot_allocation",
 ];
 
@@ -197,18 +199,21 @@ impl Status {
 }
 
 /// The status of every id the real fixture produces **when the arguments are accepted**, which is
-/// the fourteen ids a normal run has: `cli.arguments` exists only to reject bad arguments.
+/// the fifteen ids a normal run has: `cli.arguments` exists only to reject bad arguments.
 ///
-/// Pinning the status is the point. `l1.structure` passing is not evidence that L1 ran: the six
-/// compile-dependent sub-checks and the availability check are the ones that would have caught a
-/// description that cannot compile, and they are `skip` today by contract.
-const EXPECTED_STATUS: [(&str, Status); 14] = [
+/// Pinning the status is the point. `l1.structure` passing is not evidence that L1 ran: the three
+/// compile-dependent sub-checks that still need resolution and the availability check are the
+/// ones that would have caught a description that cannot compile, and they are `skip` today by
+/// contract — while `l1.instantiate` and the three propagation checks D4 made real must be `pass`
+/// on this fixture, or the D4 headline acceptance silently stopped running.
+const EXPECTED_STATUS: [(&str, Status); 15] = [
     ("l1.structure", Status::Pass),
+    ("l1.instantiate", Status::Pass),
     ("l1.compile", Status::Skip),
     ("l1.operator_shapes", Status::Skip),
-    ("l1.layout_propagation", Status::Skip),
-    ("l1.partial_fulfillment", Status::Skip),
-    ("l1.collective_axes", Status::Skip),
+    ("l1.layout_propagation", Status::Pass),
+    ("l1.partial_fulfillment", Status::Pass),
+    ("l1.collective_axes", Status::Pass),
     ("l1.slot_allocation", Status::Skip),
     ("l1.implementation_availability", Status::Skip),
     ("l1.binding_coverage", Status::Pass),
@@ -577,9 +582,9 @@ fn assert_id_set(observed: &BTreeMap<String, Status>, expected: &[&str], what: &
     );
 }
 
-/// F3: on this machine the six compile-dependent L1 sub-checks and implementation availability are
-/// `skip` — no more, no fewer. If D3/D4 make one of them real, or a description stops expanding,
-/// this fails and says which.
+/// F3: on this machine the three resolution-dependent L1 sub-checks and implementation
+/// availability are `skip` — no more, no fewer. If D5 makes one of them real, or a description
+/// stops expanding, this fails and says which.
 fn assert_skip_set(observed: &BTreeMap<String, Status>) {
     let mut skips: Vec<&str> = observed
         .iter()
@@ -596,7 +601,7 @@ fn assert_skip_set(observed: &BTreeMap<String, Status>) {
 }
 
 /// One **accepted** run: `check(&extra)` must exit 0, and the report must be C6's shape with exactly
-/// the fourteen ids a normal run has and the statuses pinned in `EXPECTED_STATUS`.
+/// the fifteen ids a normal run has and the statuses pinned in `EXPECTED_STATUS`.
 ///
 /// The per-object `details` are deliberately not part of this: availability is dtype-dependent (at
 /// `--dtype f32` the five primitives no plugin publishes are all that is left; at the description's
@@ -615,8 +620,8 @@ fn accepted_run(extra: &[&str], expected_dtype: &str) -> (Value, Vec<Item>) {
     let items = items(&doc);
     let observed = statuses(&items);
 
-    // C6's fifteen ids, minus `cli.arguments`: that item exists to reject the arguments, and these
-    // arguments are accepted. The rejected-arguments test below covers the fifteenth.
+    // C6's sixteen ids, minus `cli.arguments`: that item exists to reject the arguments, and these
+    // arguments are accepted. The rejected-arguments test below covers the sixteenth.
     let accepted: Vec<&str> = C6_CHECK_IDS
         .iter()
         .copied()
@@ -636,7 +641,7 @@ fn accepted_run(extra: &[&str], expected_dtype: &str) -> (Value, Vec<Item>) {
         "the status of at least one check changed; the expectation is pinned in EXPECTED_STATUS"
     );
 
-    // The seven skips are pinned twice on purpose: as a set (F3's assertion) and inside the status
+    // The four skips are pinned twice on purpose: as a set (F3's assertion) and inside the status
     // table. A table that drifted from the set would make one of the two red.
     let pinned: Vec<&str> = EXPECTED_STATUS
         .iter()
@@ -699,8 +704,8 @@ fn an_explicit_dtype_run_is_gated_at_every_dtype_it_accepts() {
 }
 
 /// `cli.arguments` is the one id a normal run does not have, and C2 wants a full report even when
-/// the arguments are rejected. A rejected `--dtype` therefore produces **all fifteen** ids, with
-/// the other fourteen unchanged: an argument error must not silently change what was checked.
+/// the arguments are rejected. A rejected `--dtype` therefore produces **all sixteen** ids, with
+/// the other fifteen unchanged: an argument error must not silently change what was checked.
 ///
 /// The counters are pinned here too (`assert_c6_shape` runs on both reports), because a rejected
 /// argument must not change what was *found* either. The availability `details` are deliberately not
@@ -708,7 +713,7 @@ fn an_explicit_dtype_run_is_gated_at_every_dtype_it_accepts() {
 /// for, so that list legitimately differs (C2's `skip` still says what is missing, one operator per
 /// line). The ignore coverage is dtype-independent and is covered by the accepted run above.
 #[test]
-fn a_rejected_argument_emits_the_fifteenth_id_and_changes_nothing_else() {
+fn a_rejected_argument_emits_the_sixteenth_id_and_changes_nothing_else() {
     let accepted = statuses(&items(&check(&["--dtype", "f32"]).json()));
 
     let run = check(&["--dtype", "not-a-dtype"]);
@@ -753,4 +758,86 @@ fn a_rejected_argument_emits_the_fifteenth_id_and_changes_nothing_else() {
         "the `cli.arguments` reason must name the rejected flag and value: {}",
         argument.reason
     );
+}
+
+/// **D4's headline acceptance.** The five-axis mesh `tp=2, cp=2, ep=4, dp=2, pp=2` must produce
+/// exactly the same report an accepted run does: every id, every status, every counter, the same
+/// availability list — and exit 0. `instantiate` and the three propagation checks run for real on
+/// rank 0, so the whole `EXPECTED_STATUS` table (with the four `pass` items D4 made real) is
+/// re-pinned at the acceptance mesh, not only at the trivial all-ones mesh.
+#[test]
+fn the_five_axis_acceptance_mesh_exits_zero_with_the_same_report() {
+    let (doc, items) = accepted_run(
+        &[
+            "--dtype", "f32", "--tp", "2", "--cp", "2", "--ep", "4", "--dp", "2", "--pp", "2",
+        ],
+        "f32",
+    );
+    assert_details(&doc, &items, &F32_AVAILABILITY);
+}
+
+/// **D4's rejection acceptance.** `--tp 3` must exit non-zero and name the constraint the
+/// description violates: `embed.w` shards dim 0 (the vocabulary, 248320 tokens) over `tp`, and
+/// `248320 % 3 != 0` — the `NotDivisible` from `local_shape`, reported per slot, not a panic and
+/// not a silent fallback. The three propagation checks then say why they could not run, and the
+/// id set stays complete — a `fail` must not silently drop checks from the report.
+#[test]
+fn a_non_divisible_degree_exits_non_zero_naming_the_constraint() {
+    let run = check(&["--dtype", "f32", "--tp", "3"]);
+    assert_eq!(
+        run.code,
+        Some(1),
+        "a non-divisible degree is a `fail`, so the exit code is 1\n{}",
+        run.stdout
+    );
+
+    let doc = run.json();
+    let items = items(&doc);
+    let observed = statuses(&items);
+    // The degrees are *accepted* — the failure is the description's non-divisible shard, so the
+    // report carries the fifteen ids of an accepted run, not `cli.arguments`.
+    let accepted: Vec<&str> = C6_CHECK_IDS
+        .iter()
+        .copied()
+        .filter(|id| *id != "cli.arguments")
+        .collect();
+    assert_id_set(&observed, &accepted, "rejected degrees");
+
+    let instantiate = items
+        .iter()
+        .find(|item| item.id == "l1.instantiate")
+        .expect("l1.instantiate must be present");
+    assert_eq!(
+        instantiate.status,
+        Status::Fail,
+        "the non-divisible shard must be an `l1.instantiate` failure"
+    );
+    let text = format!("{} {}", instantiate.reason, run.stdout);
+    assert!(
+        text.contains("dim 0") && text.contains("248320") && text.contains('3'),
+        "the failure must name the constraint — the dim, the global size and the divisor: {}",
+        instantiate.reason
+    );
+    assert!(
+        text.contains("embed.w"),
+        "the failure names the slot, which names the constraint: {}",
+        instantiate.reason
+    );
+    assert!(
+        !run.stdout.contains("panicked at"),
+        "the rejection is a report, not a panic\n{}",
+        run.stdout
+    );
+
+    for id in [
+        "l1.layout_propagation",
+        "l1.partial_fulfillment",
+        "l1.collective_axes",
+    ] {
+        assert_eq!(
+            observed.get(id),
+            Some(&Status::Skip),
+            "`{id}` cannot run when `l1.instantiate` failed, and must say so"
+        );
+    }
 }

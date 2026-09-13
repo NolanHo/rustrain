@@ -263,10 +263,10 @@ checkpoint），所以它确实需要，且不是新需求。
 **落地时框架该做什么**：executor **预留**声明的字节；kernel 实际保存超过声明 → 在那个算子处分配失败，
 而不是静默 OOM。声明错仍只能靠"跑起来"发现 —— **门禁证的是数值等价，不是内存**。
 
-**但这一条现在不做**（§8 D12）：内存管理整个留空。**目标行为**是预算只警告、不拦编译；但**代码里
-`enforce_budget` 目前仍是硬失败**（`memory.rs` 返回 `MemoryBudgetExceeded`），这一项由
-`docs/design/qwen36-text/spec.md` 的 **D4** 交付。好消息是这两件事不冲突 —— 预算一旦不再拦编译，
-**融合实验就不会被内存投影阻塞**，等做内存管理时再激活这两个钩子。
+**但这一条现在不做**（§8 D12）：内存管理整个留空。**D4 已把预算改成只警告、不拦编译**：
+`memory::enforce_budget` 仍是唯一的检测点，但它的结论不再让 `Compiler::compile` 失败，而是作为
+`CompiledPlan.warnings` 里的投影警告报出来（`plan explain` 会打印）。于是**融合实验不会被内存投影
+阻塞**，等做内存管理时再激活那两个钩子。
 
 ---
 
@@ -290,7 +290,7 @@ checkpoint），所以它确实需要，且不是新需求。
  │    3 resolve_node ×N      Registry + Recipe → 每个节点的具体实现
  │     │                      融合体在此替换其 expansion；替换前校验 collectives 集合相等（§2.3）
  │    4 memory::plan         寿命分析 → 偏移复用 → 峰值投影；调每个算子的 memory() 取 workspace
- │    5 enforce_budget       峰值**投影**超 budget_bytes → **目标**只 Warning；**今天仍硬失败**（§8 D12，D4 交付）
+ │    5 enforce_budget       峰值**投影**超 budget_bytes → **只 Warning**（D4 已落地，§8 D12）
  │    6 validate_shapes      调插件的 infer()，与 plan 声明的形状比对
  │    7 compute_digest       把全部决策哈希（不含 recipe 原文，只含它产生的决策）
  │
@@ -552,9 +552,8 @@ P2/P6 直接服务 §0 的边界契约，优先级高于 P1/P4/P5。
 
 峰值是**估**出来的，而估错的代价是**单向**的：投影偏低（融合体保存量未声明、分配器碎片、重算/卸载策略尚未实现）
 会在训练时 OOM；投影偏高会**错杀**一个本来跑得动的配置。**让不准的东西去否决准的东西，是划不来的。**
-所以现在：`memory::plan` 照旧算（它仍是 executor 分配"常驻区 + 激活池"两块的依据）；**目标**是
-`enforce_budget` 只 Warning，但代码里它**今天仍是硬失败**（`MemoryBudgetExceeded`，由
-`docs/design/qwen36-text/spec.md` 的 D4 交付）。
+所以现在：`memory::plan` 照旧算（它仍是 executor 分配"常驻区 + 激活池"两块的依据）；
+`enforce_budget` **只 Warning**（D4 已落地：编译不再因为内存投影失败，警告随 `CompiledPlan.warnings` 走）。
 **未来**告警要准确，前提是该字段被声明；现在字段与预算一起留空（D12）。
 
 **vLLM 的先例支持这个方向**：它不解析式地算激活峰值，而是跑一次 `profile_run` **测量**，

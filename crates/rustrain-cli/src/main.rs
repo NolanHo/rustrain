@@ -396,6 +396,8 @@ fn plan_explain(
                 "max_workspace_bytes": compiled.memory.max_workspace_bytes,
                 "budget_bytes": compiled.memory.budget_bytes,
             },
+            // D12: advisories the compiler did not refuse (a projected peak over budget is one).
+            "warnings": compiled.warnings,
         });
         println!("{}", serde_json::to_string_pretty(&doc)?);
         return Ok(());
@@ -814,12 +816,6 @@ fn check(args: CheckArgs) -> Result<()> {
         pp,
         json,
     } = args;
-    if [tp, cp, ep, dp, pp].iter().any(|degree| *degree != 1) {
-        eprintln!(
-            "note: --tp/--cp/--ep/--dp/--pp are accepted (C2's interface) but this unit does not \
-             use them: L1 structure and L2 loading are mesh-free, and instantiate is D3/D4"
-        );
-    }
 
     // C6: `--dtype` is an L1 input, never an L2 one, and the report records the precision the
     // checks actually ran at — the flag when given, else the description's own default.
@@ -851,8 +847,50 @@ fn check(args: CheckArgs) -> Result<()> {
         checks: Vec::new(),
     };
     if let Some(reason) = dtype_error {
-        report.checks.push(CheckItem::fail("cli.arguments", reason, Vec::new()));
+        report
+            .checks
+            .push(CheckItem::fail("cli.arguments", reason, Vec::new()));
     }
+
+    // D4: the five degrees build the mesh the L1 propagation checks run on. A degree of 0 is not
+    // a mesh — it is rejected as an argument error the same way `--dtype` is, and the
+    // mesh-dependent items are then reported as `skip` naming that reason.
+    let zero_degree = [
+        ("--tp", tp),
+        ("--cp", cp),
+        ("--ep", ep),
+        ("--dp", dp),
+        ("--pp", pp),
+    ]
+    .iter()
+    .find(|(_, degree)| *degree == 0)
+    .map(|(flag, _)| *flag);
+    if let Some(flag) = zero_degree {
+        let reason =
+            format!("`{flag} 0` is not a mesh degree: every axis degree must be at least 1");
+        match report
+            .checks
+            .iter_mut()
+            .find(|item| item.id == "cli.arguments")
+        {
+            Some(item) => item.reason = format!("{}; {reason}", item.reason),
+            None => report
+                .checks
+                .push(CheckItem::fail("cli.arguments", reason, Vec::new())),
+        }
+    }
+    let mesh = if zero_degree.is_none() {
+        Some(Mesh::from_config(&ParallelConfig {
+            tensor: tp,
+            context: cp,
+            expert: ep,
+            data: dp,
+            pipeline: pp,
+        }))
+    } else {
+        None
+    };
+    let mesh_names = format!("tp={tp}, cp={cp}, ep={ep}, dp={dp}, pp={pp}");
 
     // ---- L1: the description expands into one sound global plan -------------
     //
@@ -917,6 +955,107 @@ fn check(args: CheckArgs) -> Result<()> {
                         expanded = Some((model, plan));
                     }
                 },
+            }
+        }
+    }
+
+    // ---- L1: instantiate on rank 0, then the propagation checks (D4) ----------
+    //
+    // `instantiate` needs no implementation: it joins the description's declarations with the
+    // mesh and the real shapes, so its errors — a shard that does not divide, an axis the mesh
+    // lacks, a stage the pipeline degree cannot address — are `fail` items even when operator
+    // resolution below is incomplete. Propagation is implementation-free too, which is what
+    // turns `l1.layout_propagation`, `l1.partial_fulfillment` and `l1.collective_axes` from the
+    // D2 `skip`s into real checks.
+    match (&expanded, mesh.as_ref()) {
+        (Some((_, plan)), Some(mesh)) => {
+            match rustrain_plan::instantiate(&plan.plan, &plan.declarations(), mesh, 0) {
+                Err(e) => {
+                    report.checks.push(CheckItem::fail(
+                        "l1.instantiate",
+                        format!(
+                            "the plan does not instantiate on rank 0 of the {mesh_names} mesh: {e}"
+                        ),
+                        Vec::new(),
+                    ));
+                    for id in [
+                        "l1.layout_propagation",
+                        "l1.partial_fulfillment",
+                        "l1.collective_axes",
+                    ] {
+                        report.checks.push(CheckItem::skip(
+                            id,
+                            "not evaluated: `l1.instantiate` did not produce a rank-0 plan",
+                        ));
+                    }
+                }
+                Ok(instantiated) => {
+                    report.checks.push(CheckItem::pass(
+                        "l1.instantiate",
+                        format!(
+                            "the global plan instantiates on rank 0 of the {mesh_names} mesh: {} \
+                             node(s), {} slot(s), every declared shard divides into a local shape",
+                            instantiated.nodes.len(),
+                            instantiated.slots.len()
+                        ),
+                    ));
+                    match rustrain_plan::shard::propagate(&instantiated) {
+                        Err(e) => {
+                            report.checks.push(CheckItem::fail(
+                                "l1.layout_propagation",
+                                format!("sharding does not propagate on the rank-0 plan: {e}"),
+                                Vec::new(),
+                            ));
+                            for id in ["l1.partial_fulfillment", "l1.collective_axes"] {
+                                report.checks.push(CheckItem::skip(
+                                    id,
+                                    "not evaluated: layout propagation did not succeed",
+                                ));
+                            }
+                        }
+                        Ok(propagation) => {
+                            report.checks.push(CheckItem::pass(
+                                "l1.layout_propagation",
+                                format!(
+                                    "sharding propagated on the rank-0 plan: {} collective(s) \
+                                     inserted to reconcile declared and derived layouts",
+                                    propagation.inserted.len()
+                                ),
+                            ));
+                            report.checks.push(partial_fulfillment(&propagation));
+                            report.checks.push(collective_axes(&propagation, mesh));
+                        }
+                    }
+                }
+            }
+        }
+        (Some(_), None) => {
+            // `cli.arguments` already failed on the zero degree; the mesh-dependent items
+            // cannot run and say why.
+            for id in [
+                "l1.instantiate",
+                "l1.layout_propagation",
+                "l1.partial_fulfillment",
+                "l1.collective_axes",
+            ] {
+                report.checks.push(CheckItem::skip(
+                    id,
+                    "not evaluated: an axis degree of 0 is not a mesh, so there is no rank 0 to \
+                     instantiate on",
+                ));
+            }
+        }
+        (None, _) => {
+            for id in [
+                "l1.instantiate",
+                "l1.layout_propagation",
+                "l1.partial_fulfillment",
+                "l1.collective_axes",
+            ] {
+                report.checks.push(CheckItem::skip(
+                    id,
+                    "not evaluated: the description did not expand into a plan to instantiate",
+                ));
             }
         }
     }
@@ -1128,44 +1267,128 @@ fn binding_coverage_from_the_description(plan: &rustrain_model::Expanded) -> Che
     )
 }
 
-/// C2's L1 sub-checks that the `--model` path cannot run today, one `skip` each.
+/// C2's "every Partial is fulfilled": after propagation, a slot that still carries a partial must
+/// be consumed only by the intrinsic that completes it — a compute node reading a partial means
+/// no collective was inserted for it, and the plan is not runnable as declared. This is the
+/// implementation-free half of the contract: the collectives are `propagate`'s output, so the
+/// check can run before any operator resolves.
+fn partial_fulfillment(propagation: &rustrain_plan::shard::ShardPropagation) -> CheckItem {
+    const ID: &str = "l1.partial_fulfillment";
+    let plan = &propagation.plan;
+    let mut unfulfilled: Vec<String> = Vec::new();
+    let mut fulfilled = 0usize;
+    for (index, slot) in plan.slots.iter().enumerate() {
+        if slot.layout.partial.is_none() {
+            continue;
+        }
+        let read_by_compute = plan
+            .nodes
+            .iter()
+            .filter(|node| node.inputs.iter().any(|input| input.0 == index))
+            .any(|node| !rustrain_plan::ir::intrinsic::is_intrinsic(&node.op.name));
+        if read_by_compute {
+            unfulfilled.push(slot.name.clone());
+        } else {
+            fulfilled += 1;
+        }
+    }
+    if unfulfilled.is_empty() {
+        return CheckItem::pass(
+            ID,
+            format!(
+                "every one of the {fulfilled} partial slot(s) is fulfilled by an inserted \
+                 collective ({} insertion(s) in total)",
+                propagation.inserted.len()
+            ),
+        );
+    }
+    CheckItem::fail(
+        ID,
+        format!(
+            "{} partial slot(s) are read by a compute node with no inserted collective \
+             completing them: {}",
+            unfulfilled.len(),
+            unfulfilled.join(", ")
+        ),
+        Vec::new(),
+    )
+}
+
+/// C2's "every collective is bound to its axes": each inserted collective's group mask must
+/// address axes of the mesh, and each dim must be an axis of the tensor it converts. Propagation
+/// already enforces both — the check re-reads its output so the contract is verified, not assumed.
+fn collective_axes(
+    propagation: &rustrain_plan::shard::ShardPropagation,
+    mesh: &Mesh,
+) -> CheckItem {
+    const ID: &str = "l1.collective_axes";
+    let mut unbound: Vec<String> = Vec::new();
+    for collective in &propagation.inserted {
+        if collective.group.validate(mesh).is_err() {
+            unbound.push(format!(
+                "{} group {} is not a group of the mesh",
+                collective.op, collective.group
+            ));
+            continue;
+        }
+        if let Some(dim) = collective.dim {
+            let rank = propagation.plan.slot(collective.produced_slot).shape.len() as i64;
+            if dim < 0 || dim >= rank {
+                unbound.push(format!(
+                    "{} dim {dim} is not an axis of the tensor it converts",
+                    collective.op
+                ));
+            }
+        }
+    }
+    if unbound.is_empty() {
+        return CheckItem::pass(
+            ID,
+            format!(
+                "all {} inserted collective(s) bind to axes of the mesh",
+                propagation.inserted.len()
+            ),
+        );
+    }
+    CheckItem::fail(
+        ID,
+        format!(
+            "{} inserted collective(s) are not bound to the mesh axes: {}",
+            unbound.len(),
+            unbound.join("; ")
+        ),
+        Vec::new(),
+    )
+}
+
+/// C2's remaining L1 sub-checks that still cannot run, one `skip` each.
 ///
 /// C2 lists seven things L1 covers. `l1.structure` covers what `load` + `expand` +
-/// `check_structure` can answer and `l1.implementation_availability` covers operator resolution;
-/// **everything else needs `Plan::compile`**, which needs a mesh (D3) and an implementation to ask
-/// for shapes. Reporting them as one `pass` would claim seven checks while running two, so each
-/// one is its own item, with what is missing and which delivery supplies it.
+/// `check_structure` can answer, `l1.implementation_availability` covers operator resolution, and
+/// with D4 the mesh exists — `l1.instantiate`, `l1.layout_propagation`, `l1.partial_fulfillment`
+/// and `l1.collective_axes` now run for real. The three left over all need a **resolved**
+/// implementation for every node, which this host does not have, so each says so instead of
+/// claiming a compile that never ran.
 fn compile_dependent_l1_checks(expanded: bool) -> Vec<CheckItem> {
-    // `(id, why this sub-check needs a compiled plan)`, in C2's order.
-    const SUBCHECKS: [(&str, &str); 6] = [
+    // `(id, why this sub-check needs a resolved plan)`, in C2's order.
+    const SUBCHECKS: [(&str, &str); 3] = [
         (
             "l1.compile",
-            "`Plan::compile` needs a mesh to propagate into (D3) and a resolved implementation for \
-             every node, and `--model` expands without compiling",
+            "`Plan::compile` needs a resolved implementation for every node, and resolution is \
+             incomplete on this host: five primitives have no provider at f32, and the reference \
+             provider's f32-only variants reject every node at the description's own bf16 (D5 \
+             lands the missing primitives; until then this sub-check cannot run)",
         ),
         (
             "l1.operator_shapes",
             "operators are only asked for their shapes by the compiler's shape-inference pass, \
-             which runs after resolution (D4/D5: five primitives of this description have no \
-             implementation on this host)",
-        ),
-        (
-            "l1.layout_propagation",
-            "sharding is propagated by a compile pass, and the global plan stays replicated until \
-             `instantiate` sees a mesh (D3)",
-        ),
-        (
-            "l1.partial_fulfillment",
-            "the collectives that fulfil a `Partial` are the compile pass's output (D3)",
-        ),
-        (
-            "l1.collective_axes",
-            "collectives are placed and bound to their axes by the compile pass (D3)",
+             which runs after resolution — and resolution is incomplete on this host (five \
+             primitives of this description have no implementation; D5)",
         ),
         (
             "l1.slot_allocation",
-            "allocation and alias analysis live in the plan's memory pass, which `Plan::compile` \
-             runs (D4)",
+            "allocation and alias analysis live in the plan's memory pass, which runs after \
+             resolution — and resolution is incomplete on this host (D5)",
         ),
     ];
     SUBCHECKS
@@ -1174,13 +1397,12 @@ fn compile_dependent_l1_checks(expanded: bool) -> Vec<CheckItem> {
             let reason = if expanded {
                 format!(
                     "not evaluated: {why}. `l1.structure` covers expansion and `check_structure` \
-                     only and does not stand in for this sub-check, which becomes a real check \
-                     with D3/D4"
+                     only and does not stand in for this sub-check"
                 )
             } else {
                 format!(
                     "not evaluated: the description did not expand into a plan, and `{id}` needs a \
-                     compiled one (D3/D4)"
+                     compiled one (D5)"
                 )
             };
             CheckItem::skip(id, reason)
