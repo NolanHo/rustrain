@@ -2,3 +2,4 @@
 /_internal_docs/
 /runs/
 .xbot
+__pycache__/
