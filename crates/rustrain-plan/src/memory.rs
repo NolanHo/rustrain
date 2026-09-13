@@ -613,6 +613,16 @@ fn slot_bytes(plan: &Plan) -> Vec<u64> {
         .collect()
 }
 
+/// The view family: single-input, single-output operators whose output aliases
+/// their input's storage. `reshape` belongs here even though it materialises a
+/// *strided* input — the conservative choice keeps the input alive either way.
+fn is_view_op(name: &str) -> bool {
+    matches!(
+        name,
+        "view" | "reshape" | "narrow" | "transpose" | "broadcast"
+    )
+}
+
 fn compute_lifetimes(plan: &Plan, sizes: &[u64]) -> Vec<Lifetime> {
     let n_steps = plan.nodes.len();
     let mut born = vec![0usize; plan.slots.len()];
@@ -632,15 +642,26 @@ fn compute_lifetimes(plan: &Plan, sizes: &[u64]) -> Vec<Lifetime> {
         }
     }
 
-    // A `view` output aliases its input's storage — the operator hands back
-    // the input's own descriptor and the executor adopts it, no copy — so the
-    // input must stay live exactly as long as the output. Without this
-    // extension a view whose output is kept to the end of the plan (the
-    // runner's hidden-state keeper) would "keep alive" a buffer the pool has
-    // already handed to a later activation, and reading the input afterwards
-    // reads that later activation instead.
-    for node in &plan.nodes {
-        if node.op.name == "view" && node.inputs.len() == 1 && node.outputs.len() == 1 {
+    // A view-family output aliases its input's storage — `view`, `reshape`,
+    // `narrow`, `transpose` and `broadcast` all hand back the input's own
+    // descriptor (an offset pointer for `narrow`, a stride-0 stretch for
+    // `broadcast`) and the executor adopts it, no copy — so the input must stay
+    // live exactly as long as the output. Without this extension a reshape
+    // whose output is kept to the end of the plan (the runner's hidden-state
+    // keeper) "keeps alive" a buffer the pool has already handed to a later
+    // activation, and reading the input afterwards reads that activation
+    // instead. Extending only `view` left the other four uncovered, and the
+    // qwen36 full-attention layer chains `reshape` -> `narrow` -> `reshape` on
+    // the q_proj output: the pool reused that buffer for later MoE activations
+    // and every full-attention layer inherited it. `reshape` copies when its
+    // input is strided (the kernels' contract), so extending its input is
+    // conservative rather than exact — the cost is one pool block held a little
+    // longer.
+    // Reverse plan order, so a *chain* of alias ops (a -> reshape -> narrow)
+    // propagates the chain's tail back to its head in one pass: a node's input
+    // is extended with its output's already-final death.
+    for node in plan.nodes.iter().rev() {
+        if is_view_op(&node.op.name) && node.inputs.len() == 1 && node.outputs.len() == 1 {
             let input = node.inputs[0];
             let output = node.outputs[0];
             let out_dies = dies[output.0].unwrap_or(n_steps);
@@ -656,7 +677,7 @@ fn compute_lifetimes(plan: &Plan, sizes: &[u64]) -> Vec<Lifetime> {
     // the embedding's `all_reduce` (degree-1, tp) aliased the embedding output, whose own last
     // reader was that collective, so the pool gave its bytes to the next normalisation and every
     // hidden-state summary after `embed.y` was computed from the wrong tensor.
-    for node in &plan.nodes {
+    for node in plan.nodes.iter().rev() {
         if !intrinsic::is_intrinsic(&node.op.name) {
             continue;
         }
@@ -693,7 +714,7 @@ fn compute_lifetimes(plan: &Plan, sizes: &[u64]) -> Vec<Lifetime> {
 /// input → output. A `reduce_scatter` (smaller output) still aliases.
 fn compute_aliases(plan: &Plan, sizes: &[u64]) -> Vec<Option<SlotId>> {
     let mut aliases: Vec<Option<SlotId>> = vec![None; plan.slots.len()];
-    for node in &plan.nodes {
+    for node in plan.nodes.iter().rev() {
         if !intrinsic::is_intrinsic(&node.op.name) {
             continue;
         }
@@ -946,6 +967,93 @@ mod tests {
             offset_of(&mem, a),
             offset_of(&mem, c),
             "the collective's input bytes were handed to a later activation"
+        );
+    }
+
+    /// A view-family output aliases its input's storage, so the input must stay
+    /// live as long as the output — for `reshape`/`narrow`/`transpose`/`broadcast`
+    /// as much as for `view`.
+    ///
+    /// The qwen36 full-attention layer chains `reshape` -> `narrow` -> `reshape`
+    /// on its q_proj output, and every one of those slots points into the q_proj
+    /// buffer. With only `view` covered, the pool handed that buffer to a later
+    /// MoE activation while the attention still read it: the layer's output was
+    /// computed from overwritten bytes, which is what made the D5 comparison
+    /// diverge by ~2x from the first full-attention layer on.
+    #[test]
+    fn a_reshape_chains_input_stays_live_for_its_output() {
+        let mut b = PlanBuilder::new(
+            "view-chain",
+            Phase::Forward,
+            Mesh::from_config(&ParallelConfig::default()).fingerprint(),
+        );
+        let x = b.slot("x", RsDtype::F32, vec![8], SlotKind::Input);
+        let a = b.slot("a", RsDtype::F32, vec![2, 8], SlotKind::Activation);
+        // `b` is `a` read through a reshape (same storage), `c` is a reshape of
+        // `b`, and both are read late; `d` is an activation born after the chain
+        // whose size would fit `a`'s block.
+        let view_a = b.slot("view_a", RsDtype::F32, vec![2, 8], SlotKind::Activation);
+        let narrow_a = b.slot("narrow_a", RsDtype::F32, vec![2, 4], SlotKind::Activation);
+        let d = b.slot("d", RsDtype::F32, vec![2, 8], SlotKind::Activation);
+        b.node(
+            OpRef::new("elementwise_unary"),
+            vec![x],
+            vec![a],
+            Attrs::new(),
+            "n0",
+        );
+        b.node(
+            OpRef::new("reshape"),
+            vec![a],
+            vec![view_a],
+            Attrs::new(),
+            "n1",
+        );
+        b.node(
+            OpRef::new("narrow"),
+            vec![view_a],
+            vec![narrow_a],
+            Attrs::new(),
+            "n2",
+        );
+        // Born at step 3: reused `a`'s bytes whenever `a` died at step 1.
+        b.node(
+            OpRef::new("elementwise_unary"),
+            vec![narrow_a],
+            vec![d],
+            Attrs::new(),
+            "n3",
+        );
+
+        let plan = b.build().unwrap();
+        let sizes = slot_bytes(&plan);
+        let lt = compute_lifetimes(&plan, &sizes);
+
+        assert_eq!(
+            lt[view_a.0].dies, lt[narrow_a.0].dies,
+            "a reshape's input must live as long as the reshape's output"
+        );
+        assert!(
+            lt[a.0].dies >= lt[view_a.0].dies,
+            "the reshape chain's root must stay live for the whole chain"
+        );
+        assert!(
+            lt[a.0].dies >= lt[d.0].born,
+            "an activation born while the chain is still live may not take its bytes"
+        );
+        // And the pool agrees: `d` cannot be placed inside `a`'s storage.
+        let mem = run_memory_pass(
+            &plan,
+            &no_ops(&plan),
+            &MemoryRecipe::default(),
+            RuntimeCapabilities::none(),
+            1,
+        )
+        .unwrap();
+        assert_ne!(
+            offset_of(&mem, a),
+            offset_of(&mem, d),
+            "the reshape chain's bytes were handed to a later activation"
         );
     }
 

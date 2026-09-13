@@ -1319,6 +1319,28 @@ pub fn default_cases() -> Vec<Case> {
                 .set("partial_rotary", true),
         ),
     );
+    // rope's layout rule: the position axis is the FIRST one, so a
+    // `[seq, heads, head_dim]` input turns every head of a position by that
+    // position's own angle. The rank-2 cases above cannot see the difference —
+    // with one row per position both index orders agree — and the plan's q/k
+    // are exactly this shape, which is why this case exists.
+    cases.push(
+        Case::new(
+            "rope",
+            vec![
+                InputSpec::f32("q", vec![3, 2, 6], Ramp),
+                InputSpec::f32("k", vec![3, 2, 6], Pseudo { seed: 71 }),
+            ],
+        )
+        .outputs(2)
+        .attrs(
+            Attrs::new()
+                .set("rotary_dim", 4i64)
+                .set("theta", 1e7f64)
+                .set("partial_rotary", true),
+        ),
+    );
+
     // sdpa's T2 completion: GQA + causal (the declared expansion cannot
     // replay GQA, so its expansion check skips with that reason — the fused
     // body and determinism are still exercised).
