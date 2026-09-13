@@ -303,7 +303,14 @@ HF transformers 的 logits 在容差内一致；每层 hidden 的 mean/std/max �
   工作区 **304 passed** / clippy 0 warning / `ops check` exit 0；
   独立审查**五轮**：第三轮 `APPROVED_WITH_NOTES`（N1 已关；N2 锚定只约束首段、N3 前后空白当字面段 → `model-description.md` §3.8）；第四、五轮（三个独立视角）各自复现了"报告无用但门禁全绿"的路径（`dtype`/`model`/`checkpoint` 谎报、同一 id 两条、reason 与 details 数目不符、默认 dtype 下清空 details、bf16 表可被截断、显式 dtype 无门禁、reason 可篡改总数、`why` 可自相矛盾），**全部已修并各自反证**。
   已知局限（写在这里而不是假装不存在）：`model`/`checkpoint` 只能断言"回显了传进去的路径"，一个回显 argv 却读别处描述的实现在这份门禁下仍是绿的；被拒绝的 `--dtype` 那一次运行的 `details` 内容按设计不钉（该列表随 dtype 变化）。
-- [ ] D3 — 轴与 mesh + 形状算术
+- [x] **D3 — 轴与 mesh + 形状算术** —— 证据：提交 `3fe05a5`（`rustrain-parallel`：`Mesh` / `GroupMask` / 多分片 `ParallelLayout` / 形状算术）+ `b00b22a`（`rustrain-plan`：plan 带 mesh 指纹、`ATTR_GROUP` 变成掩码整数、`GroupUnavailable` 首次真正触发）+ `cfe60b3`（runtime / model / cli 收尾，工作区转绿）+ `a11d6c0`（D3 让哪些文档失效就更正哪些）+ `ce5bbca`（对抗审查复现的 5 条错误答案一律改为拒绝）；
+  `GroupMask(u32)` 能表达 `tp|ep`、`tp|dp`、`ep|dp` 与全掩码；`ParallelLayout { dims, partial }` 让同一张量上两条互不相干的分片成为可能；
+  **真实形状**：`ep=4, tp=2` 下 `experts.gate_up_proj` 的 gate 段（全局 `[256, 512, 2048]`）本地形状 = **`[64, 256, 2048]`**（`rustrain-parallel/tests/layout.rs`，数字取自 `qwen36-5d-example.md` §2/§3/§5）；
+  **不整除是编译期错误**：16 heads 切 `tp=3` → `NotDivisible { dim: 0, global: 16, divisor: 3 }`，消息点名 dim / 全局尺寸 / 除数与 "compile-time"；
+  **旧算术等价**：D3 之前的 `stride_extent` 闭式被原样抄进测试，对 11 组 mesh（含 `4,3,2,5,2` 与 degree 1）逐 rank 比对 `group_index` / `group_id` / 成组顺序 —— 0 处不同；审查者另写独立暴力 oracle 扫 654 组 mesh / 436,762 次检查，同样 0 处不符；
+  `GroupUnavailable` 从"声明了从不构造"变成活的：`propagate` 拿 plan 自己的 mesh 指纹校验每个 layout，越界即报错并点名节点 / 算子 / 掩码；
+  门禁：`cargo test -p rustrain-parallel -p rustrain-plan` 全绿；工作区 **345 passed** / clippy 0 warning / `ops check` exit 0；
+  独立审查两条（不同视角）：**行为保持** = `APPROVED_WITH_NOTES` —— `check` 报告与 `ops check` 输出**逐字节不变**，三处差异全在设计内（digest、新的 `mesh` 字段、collective 组名 `Tp`→`tp`），42 处测试改动逐一核对**无一处被削弱**（多处被加强），findings 全是文档账，随 `a11d6c0` 修掉；**算术与转换表** = `CHANGES_REQUIRED` —— 审查者用**数据级模拟器**（把 layout 实例化成每 rank 的具体张量、逐元素执行发出的集合通信）复现 5 条：相交组的 `shard+partial` 被回答而非拒绝（只发一次集合通信，编译器会放行）、`reduce_scatter` 与 gather 的次序、同组双维分片不可能重建、未兑现的目标分片被接受、`ATTR_GROUP` 的 `i64→u32` 静默截断。随 `ce5bbca` 全部改为**拒绝**，并用审查者自己的 oracle 复跑验证：`attack3_table` 从 FAIL（8053 findings）变为 **PASS（9612 次模拟一致 / 0 findings / 0 panic）**，组算术与形状算术两次攻击保持 PASS。三条新规则写进 `model-description.md` §2.3。
 - [ ] D4 — instantiate 与 L1 全绿
 - [ ] D5 — 前向数值对齐 HuggingFace
 

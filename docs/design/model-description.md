@@ -91,12 +91,16 @@ local[d] = global[d] / Π { degree(轴) : 轴 ∈ spec.group, spec ∈ dims, nor
 - 不整除 → **编译期硬错误**（方案 B：不是运行期 fallback）。
 - 这就是 `architecture.md` §1.5 说的"兑现义务"：描述声明了切分，框架算出本地形状。
 
-### 2.3 转换保持**单步**
+### 2.3 转换保持**单步**（D3 落地稿，含对抗审查后的三条不变量）
 
-- partial 的兑现：`all_reduce` over `partial.group`；若目标在该 dim 上有同组分片，则 `reduce_scatter`。
-- 同 dim 换组、或 shard ↔ replicate：单轴单步。
-- 需要多轴或多步才能完成的转换 → **拒绝**（沿用 `shard.rs:399-411` 的纪律），要求描述显式写出中间 layout。
-- 跨组不再一律 `GroupMismatch`（`collective.rs:283-286`）：先绕 `Replicate`（官方路线），或单步同轴。
+- partial 的兑现：`all_reduce` over `partial.group`；若目标在该 dim 上正好按 **partial 自己的组** 分片，则 `reduce_scatter` 一步完成（只有 `Sum`：Max/Min 没有可加的切片语义，报错而不是猜）。
+- shard ↔ replicate 单轴单步；跨组：先绕 `Replicate` 是官方路线，`Shard(d, g1) → Shard(d, g2)`（`g1 ≠ g2`，含子集/超集）**报错**，要求描述写出中间 layout。
+- 需要多轴或多步才能完成的转换 → **拒绝**，要求描述显式写出中间 layout。转换函数会把它能发出的集合通信**全部**返回（多分片 → `Replicate` 就是每片一次 all_gather），>1 步的拒绝在调用方（`shard.rs`）。
+- **一个 layout 里用到的组必须两两不相交**（各 shard 组 + partial 组）。相交时秩的分解本身就是歧义的：同一批 rank 既在索引切片、又在携带这些切片的部分和，**没有任何单元集合通信能表达**，报 `OverlappingGroups` 并点名两个掩码。**同一个组切两条 dim 也一样**：每个 rank 只持对角块 `(t, t)`，plain all-gather 无论按哪个次序都补不回来。这条规则的正当场景是 MoE 的 `ep × tp`（不相交），不是"任意组合都行"。
+- **partial 的兑现不许在同一步里丢掉源分片**：那需要两次集合通信，且次序不可交换（先 gather 再 reduce_scatter 才对），报 `PartialCompletionDropsShard` 并要求写出中间 layout。
+- **目标的每条分片都必须被兑现**：要么源已有，要么由这一步唯一的一次集合通信产出；否则编译期报错。这是"本地视图没人实现"那条拒绝的推广 —— 否则 plan 会宣称一个生产者从没写出来的 layout。
+
+> 后三条来自 D3 的对抗审查：审查者把 layout 实例化成每 rank 的具体张量、逐元素执行发出的集合通信，复现出"表回答了它证不出来的问题"——其中一条（相交组的 `shard + partial`）只发一次集合通信，因此会被编译器的单步检查放行。**"表是全的"不等于"答案是对的"**：证不出来就拒绝，是这一层唯一的正确方向。
 
 ### 2.4 与今天的关系
 
