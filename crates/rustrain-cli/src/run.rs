@@ -202,6 +202,10 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
         ids_le.extend_from_slice(&id.to_le_bytes());
     }
 
+    let mut hidden_le = Vec::with_capacity(result.hidden_values.len() * 4);
+    for v in &result.hidden_values {
+        hidden_le.extend_from_slice(&v.to_le_bytes());
+    }
     npz::write_npz(
         &args.out,
         &[
@@ -222,6 +226,16 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
                 descr: npz::F4,
                 shape: &[result.summaries.len(), 3],
                 data: &summary_le,
+            },
+            Npy {
+                name: "hidden_values",
+                descr: npz::F4,
+                shape: &[
+                    result.summaries.len(),
+                    result.hidden_rows,
+                    result.hidden_cols,
+                ],
+                data: &hidden_le,
             },
         ],
     )
@@ -371,6 +385,11 @@ struct MeshResult {
     logits: Vec<f32>,
     summaries: Vec<[f32; 3]>,
     hidden_names: Vec<String>,
+    /// The probe rows of every kept hidden state, row-major
+    /// `[hidden states, probe rows, hidden_cols]`.
+    hidden_values: Vec<f32>,
+    hidden_rows: usize,
+    hidden_cols: usize,
     digest: String,
     peak_bytes: u64,
     wall: Duration,
@@ -588,7 +607,7 @@ fn run_rank(
     let wall = started.elapsed();
 
     // ---- the outputs, from rank 0 only -----------------------------------
-    let (logits, vocab, summaries, hidden_names) = if rank == 0 {
+    let (logits, vocab, summaries, hidden_names, hidden_values, hidden_cols) = if rank == 0 {
         let logits_bytes = executor.read_raw(logits_slot).with_context(|| {
             format!(
                 "reading the logits slot `{}`",
@@ -612,6 +631,8 @@ fn run_rank(
 
         let mut summaries: Vec<[f32; 3]> = Vec::new();
         let mut hidden_names: Vec<String> = Vec::new();
+        let mut probe_rows: Vec<f32> = Vec::new();
+        let mut probe_cols: usize = 0;
         for (id, name) in &hidden_ids {
             let name = name.clone();
             let bytes = executor
@@ -630,6 +651,11 @@ fn run_rank(
             // Only the probe rows: the pad rows are not part of the HF tensor.
             let probe: &[f32] = &values[..tokens.len().min(shape[0] as usize) * per_row];
             summaries.push(summarize(probe));
+            // The rows themselves, so a comparison can be made per element instead of
+            // three statistics per layer — the summaries say a layer differs, these
+            // say where.
+            probe_rows.extend_from_slice(probe);
+            probe_cols = per_row;
             hidden_names.push(name);
         }
         if summaries.is_empty() {
@@ -638,9 +664,16 @@ fn run_rank(
                  hidden state"
             );
         }
-        (probe_logits.to_vec(), vocab, summaries, hidden_names)
+        (
+            probe_logits.to_vec(),
+            vocab,
+            summaries,
+            hidden_names,
+            probe_rows,
+            probe_cols,
+        )
     } else {
-        (Vec::new(), 0, Vec::new(), Vec::new())
+        (Vec::new(), 0, Vec::new(), Vec::new(), Vec::new(), 0)
     };
 
     // ---- the per-rank metrics --------------------------------------------
@@ -667,6 +700,11 @@ fn run_rank(
         },
         "hidden_summaries": summaries,
         "hidden_names": hidden_names,
+        // Row-major, `[hidden states, probe rows, per-row width]`; the name of each
+        // hidden state is `hidden_names[i]` in the same order.
+        "hidden_values": hidden_values,
+        "hidden_rows": tokens.len(),
+        "hidden_cols": hidden_cols,
         "digest": digest,
     }))
 }
@@ -841,6 +879,17 @@ fn execute_mesh(
         logits,
         summaries,
         hidden_names,
+        hidden_values: rank0["hidden_values"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        hidden_rows: rank0["hidden_rows"].as_u64().unwrap_or(0) as usize,
+        hidden_cols: rank0["hidden_cols"].as_u64().unwrap_or(0) as usize,
         digest: rank0["digest"].as_str().unwrap_or_default().to_string(),
         peak_bytes: rank0["peak_bytes"].as_u64().unwrap_or(0),
         wall: Duration::from_secs_f64(rank0["wall_seconds"].as_f64().unwrap_or(0.0)),

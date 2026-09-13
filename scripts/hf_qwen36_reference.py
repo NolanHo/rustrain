@@ -143,12 +143,20 @@ def dump(args: argparse.Namespace) -> int:
         ]
     )
 
+    # The probe rows of every hidden state, so the comparison can be made per
+    # element instead of three statistics per layer: the summaries say a layer
+    # differs, these say where and by how much.
+    hidden_values = np.stack(
+        [h[0, :SEQ, :].to(torch.float32).cpu().numpy() for h in hidden_states]
+    )
+
     out_path = Path(args.out)
     np.savez(
         out_path,
         input_ids=tokens,
         logits=logits,
         hidden_summaries=summaries,
+        hidden_values=hidden_values,
     )
     sidecar = out_path.with_suffix(out_path.suffix + ".json")
     sidecar.write_text(
@@ -163,6 +171,7 @@ def dump(args: argparse.Namespace) -> int:
                 "hidden_rows": "row 0 = embed.y, rows 1..L = layers.<i>.y, last row = norm.y",
                 "hidden_source": hidden_source,
                 "summary_convention": "f32 view, population std (correction=0), max = max|x|",
+                "hidden_values": "probe rows, [hidden states, seq, hidden] in f32",
                 "transformers": __import__("transformers").__version__,
                 "torch": torch.__version__,
             },
