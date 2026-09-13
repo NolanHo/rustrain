@@ -11,18 +11,25 @@
 //! * [`Allocator`] — where slot buffers come from. [`HostAllocator`] is the
 //!   in-process one; a CUDA allocator implements the same trait later.
 //! * [`CollectiveBackend`] — what a spliced collective actually does.
-//!   [`SingleRank`] is the identity, which is exactly right when the parallel
-//!   configuration is 1×1×1×1×1 and is what makes a TP plan testable on a laptop.
+//!   [`collective::SingleRank`] is the identity at world 1;
+//!   [`collective::ThreadBackend`] is the D6 reference transport (N threads,
+//!   shared buffers, rendezvous). Both sit behind the same trait so a
+//!   GPU/NCCL backend can replace them without the executor changing.
 
 // Same reasoning as `rustrain-plan`: the error carries structured diagnostics.
 #![allow(clippy::result_large_err)]
 
+pub mod collective;
 pub mod conformance;
+
+pub use collective::{
+    CollectiveBackend, CollectiveKind, CollectiveReport, CollectiveRequest, SingleRank,
+    ThreadBackend, ThreadShared,
+};
 
 use std::ffi::c_void;
 
-use rustrain_abi::ffi::{RsCollectiveKind, RsCtx, RsDeviceKind, RsDtype, RsServices, RsTensor};
-use rustrain_parallel::{GroupMask, ReduceOp};
+use rustrain_abi::ffi::{RsCtx, RsDeviceKind, RsDtype, RsServices, RsTensor};
 use rustrain_plan::{CompiledPlan, CompiledStep, SlotId, SlotKind};
 
 /// Anything that can go wrong while running a plan.
@@ -166,65 +173,6 @@ unsafe impl Allocator for HostAllocator {
     }
 }
 
-/// Performs the collective a spliced node represents.
-pub trait CollectiveBackend {
-    #[allow(clippy::too_many_arguments)]
-    fn execute(
-        &mut self,
-        kind: RsCollectiveKind,
-        group: GroupMask,
-        reduce: Option<ReduceOp>,
-        dim: Option<i64>,
-        // `all_to_all` only: the per-rank send sizes along `dim` (`None` =
-        // equal split). Compiled by `compile_intrinsic`; other collectives
-        // always pass `None`.
-        split: Option<&[i64]>,
-        tensor: &mut RsTensor,
-    ) -> Result<(), String>;
-}
-
-/// The identity backend.
-///
-/// Correct precisely when nothing is actually distributed, and the only thing
-/// that can back a TP plan inside one process. It refuses when the world size is
-/// larger than one rather than silently pretending: a plan whose sharding
-/// requires a real all-reduce cannot be executed correctly by doing nothing.
-#[derive(Debug, Default)]
-pub struct SingleRank {
-    world_size: usize,
-}
-
-impl SingleRank {
-    pub fn new(world_size: usize) -> Self {
-        Self { world_size }
-    }
-}
-
-impl CollectiveBackend for SingleRank {
-    fn execute(
-        &mut self,
-        kind: RsCollectiveKind,
-        group: GroupMask,
-        reduce: Option<ReduceOp>,
-        dim: Option<i64>,
-        split: Option<&[i64]>,
-        _tensor: &mut RsTensor,
-    ) -> Result<(), String> {
-        if self.world_size > 1 {
-            return Err(format!(
-                "collective {kind:?} on group {group:?} was requested with world_size={}, but no \
-                 distributed backend is installed",
-                self.world_size
-            ));
-        }
-        // World size 1: every collective is the identity, so the split (if
-        // declared) is trivially consistent — it has one entry, the whole
-        // tensor, validated at compile time against the input's size.
-        let _ = (reduce, dim, split);
-        Ok(())
-    }
-}
-
 /// One slot's backing storage.
 struct SlotBuffer {
     /// Where the slot's data currently lives.
@@ -257,6 +205,27 @@ pub struct RunStats {
     pub ops: usize,
     pub collectives: usize,
     pub resident_bytes: u64,
+    /// Bytes this rank handed to the collective exchanges, summed over the run.
+    pub collective_sent_bytes: u64,
+    /// Bytes this rank took out of the collective exchanges, summed over the run.
+    pub collective_recv_bytes: u64,
+    /// One entry per executed collective, in execution order — the per-step
+    /// evidence the D6 metrics report aggregates by kind and group.
+    pub collective_records: Vec<CollectiveRecord>,
+}
+
+/// One executed collective, as the metrics report reads it. The group travels
+/// as raw mask bits: a name needs the mesh, which a bare record does not carry.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CollectiveRecord {
+    /// Step index in the compiled plan.
+    pub step: usize,
+    /// The intrinsic op name (`intrinsic.all_reduce`, …).
+    pub kind: String,
+    /// The group's mask bits.
+    pub group: u32,
+    pub sent_bytes: u64,
+    pub recv_bytes: u64,
 }
 
 /// Walks a [`CompiledPlan`].
@@ -265,7 +234,10 @@ pub struct Executor {
     allocator: Box<dyn Allocator + Send>,
     collectives: Box<dyn CollectiveBackend + Send>,
     buffers: Vec<Option<SlotBuffer>>,
-    aliases: Vec<Option<SlotId>>,
+    /// Buffers handed to collective outputs that could not reuse their input's
+    /// storage (grown gathers, strided-view inputs); allocated through the
+    /// allocator outside the two planner regions and freed on drop.
+    loose: Vec<(*mut c_void, u64)>,
     /// The two allocations every slot lives inside. `persistent` holds weights,
     /// gradients and optimizer state for the whole run; `pool` holds activations
     /// whose offsets the planner already assigned so that non-overlapping
@@ -296,17 +268,6 @@ impl Executor {
                 op: op.clone(),
                 policy: format!("{policy:?}"),
             });
-        }
-
-        // A spliced collective reduces a tensor in place, so its output slot is
-        // the input slot's storage under another name. Resolving the chain up
-        // front keeps the walk below free of special cases.
-        let mut aliases: Vec<Option<SlotId>> = vec![None; n];
-        for step in &plan.steps {
-            if let CompiledStep::Intrinsic { input, output, .. } = step {
-                let root = aliases[input.0].unwrap_or(*input);
-                aliases[output.0] = Some(root);
-            }
         }
 
         let device = allocator.device();
@@ -340,25 +301,14 @@ impl Executor {
                 })
             };
 
+        // Buffers the executor hands to a collective output that cannot reuse
+        // its input's storage (a grown gather, or an input that is a strided
+        // view). The planner counted these under the alias; the extra region is
+        // freed on drop and reported as part of the peak in the metrics.
+        let mut loose: Vec<(*mut c_void, u64)> = Vec::new();
+
         let mut buffers: Vec<Option<SlotBuffer>> = Vec::with_capacity(n);
-        for (i, alias) in aliases.iter().enumerate().take(n) {
-            let slot = &plan.plan.slots[i];
-
-            if let Some(root) = *alias {
-                let src = buffers[root.0]
-                    .as_ref()
-                    .ok_or(RuntimeError::NullData { slot: root })?;
-                buffers.push(Some(SlotBuffer {
-                    ptr: src.ptr,
-                    shape: src.shape,
-                    strides: src.strides,
-                    rank: src.rank,
-                    elem_width: src.elem_width,
-                    bytes: src.bytes,
-                }));
-                continue;
-            }
-
+        for (i, slot) in plan.plan.slots.iter().enumerate() {
             let alloc =
                 plan.memory
                     .allocation(SlotId(i))
@@ -366,6 +316,49 @@ impl Executor {
                         slot: SlotId(i),
                         name: slot.name.clone(),
                     })?;
+
+            // A spliced collective whose output fits its input reuses the
+            // input's storage (in place); the planner marks that as
+            // `Placement::Aliased(root)`. Two conditions make reuse unsafe:
+            // the output is larger than the input (all_gather, an uneven
+            // all_to_all — the planner already refuses to alias those), or the
+            // input holds a strided view whose data is not a dense prefix of
+            // its region. Either way the output gets its own buffer at its
+            // planned size instead.
+            if let rustrain_plan::Placement::Aliased(root) = alloc.placement {
+                let src = buffers[root.0]
+                    .as_ref()
+                    .ok_or(RuntimeError::NullData { slot: root })?;
+                let (shape, strides, rank, elem_width) = slot_descriptor_shape(slot);
+                if is_dense(src) && alloc.bytes <= src.bytes {
+                    buffers.push(Some(SlotBuffer {
+                        ptr: src.ptr,
+                        shape,
+                        strides,
+                        rank,
+                        elem_width,
+                        bytes: alloc.bytes,
+                    }));
+                } else {
+                    let ptr = allocator.alloc(alloc.bytes, device).map_err(|reason| {
+                        RuntimeError::Alloc {
+                            slot: SlotId(i),
+                            bytes: alloc.bytes,
+                            reason: format!("collective output region: {reason}"),
+                        }
+                    })?;
+                    loose.push((ptr, alloc.bytes));
+                    buffers.push(Some(SlotBuffer {
+                        ptr,
+                        shape,
+                        strides,
+                        rank,
+                        elem_width,
+                        bytes: alloc.bytes,
+                    }));
+                }
+                continue;
+            }
 
             let ptr = match alloc.placement {
                 // SAFETY: the planner sized each region to cover every offset it
@@ -378,13 +371,7 @@ impl Executor {
                     (base(pool_region, "activation pool")? as *mut u8).add(offset as usize)
                         as *mut c_void
                 },
-                rustrain_plan::Placement::Aliased(root) => {
-                    buffers
-                        .get(root.0)
-                        .and_then(Option::as_ref)
-                        .ok_or(RuntimeError::NullData { slot: root })?
-                        .ptr
-                }
+                rustrain_plan::Placement::Aliased(_) => unreachable!("handled above"),
                 // The compiler records a policy the runtime cannot execute, and
                 // `new` refuses such a plan above; reaching here means a slot was
                 // planned as non-resident without being reported.
@@ -397,21 +384,13 @@ impl Executor {
                 }
             };
 
-            let mut shape = [0i64; rustrain_abi::ffi::MAX_RANK];
-            let mut strides = [0i64; rustrain_abi::ffi::MAX_RANK];
-            let rank = (slot.shape.len() as u32).min(rustrain_abi::ffi::MAX_RANK as u32);
-            let mut acc = 1i64;
-            for d in (0..rank as usize).rev() {
-                shape[d] = slot.shape[d];
-                strides[d] = acc;
-                acc *= slot.shape[d].max(1);
-            }
+            let (shape, strides, rank, elem_width) = slot_descriptor_shape(slot);
             buffers.push(Some(SlotBuffer {
                 ptr,
                 shape,
                 strides,
                 rank,
-                elem_width: slot.dtype.byte_width().unwrap_or(4),
+                elem_width,
                 bytes: alloc.bytes,
             }));
         }
@@ -425,7 +404,7 @@ impl Executor {
             allocator,
             collectives,
             buffers,
-            aliases,
+            loose,
             persistent_region,
             pool_region,
             services: Box::new(no_services()),
@@ -447,10 +426,9 @@ impl Executor {
     /// A descriptor for one slot, pointing at its storage.
     pub fn descriptor(&self, id: SlotId) -> Result<RsTensor, RuntimeError> {
         let slot = self.plan.plan.slot(id);
-        let root = self.aliases[id.0].unwrap_or(id);
         let buf = self
             .buffers
-            .get(root.0)
+            .get(id.0)
             .and_then(Option::as_ref)
             .ok_or_else(|| RuntimeError::SlotUnwritten {
                 slot: id,
@@ -533,10 +511,9 @@ impl Executor {
     /// Reads a slot back as a **contiguous** byte buffer, materialising a
     /// strided view if the slot holds one.
     pub fn read_raw(&self, id: SlotId) -> Result<Vec<u8>, RuntimeError> {
-        let root = self.aliases[id.0].unwrap_or(id);
         let buf = self
             .buffers
-            .get(root.0)
+            .get(id.0)
             .and_then(Option::as_ref)
             .ok_or(RuntimeError::NullData { slot: id })?;
         if buf.ptr.is_null() {
@@ -553,9 +530,8 @@ impl Executor {
 
     /// Byte size of a slot's buffer.
     pub fn slot_bytes(&self, id: SlotId) -> Result<u64, RuntimeError> {
-        let root = self.aliases[id.0].unwrap_or(id);
         self.buffers
-            .get(root.0)
+            .get(id.0)
             .and_then(Option::as_ref)
             .map(|b| b.bytes)
             .ok_or(RuntimeError::NullData { slot: id })
@@ -574,9 +550,8 @@ impl Executor {
     }
 
     fn data_ptr(&self, id: SlotId) -> Result<*mut c_void, RuntimeError> {
-        let root = self.aliases[id.0].unwrap_or(id);
         self.buffers
-            .get(root.0)
+            .get(id.0)
             .and_then(Option::as_ref)
             .map(|b| b.ptr)
             .ok_or(RuntimeError::NullData { slot: id })
@@ -618,15 +593,16 @@ impl Executor {
                     reduce,
                     dim,
                     split,
+                    src,
                     ..
                 } => {
                     let kind = match op.as_str() {
-                        rustrain_plan::intrinsic::ALL_REDUCE => RsCollectiveKind::ALL_REDUCE,
-                        rustrain_plan::intrinsic::ALL_GATHER => RsCollectiveKind::ALL_GATHER,
-                        rustrain_plan::intrinsic::REDUCE_SCATTER => {
-                            RsCollectiveKind::REDUCE_SCATTER
-                        }
-                        rustrain_plan::intrinsic::ALL_TO_ALL => RsCollectiveKind::ALL_TO_ALL,
+                        rustrain_plan::intrinsic::ALL_REDUCE => CollectiveKind::AllReduce,
+                        rustrain_plan::intrinsic::ALL_GATHER => CollectiveKind::AllGather,
+                        rustrain_plan::intrinsic::REDUCE_SCATTER => CollectiveKind::ReduceScatter,
+                        rustrain_plan::intrinsic::BROADCAST => CollectiveKind::Broadcast,
+                        rustrain_plan::intrinsic::ALL_TO_ALL => CollectiveKind::AllToAll,
+                        rustrain_plan::intrinsic::SYNC => CollectiveKind::Sync,
                         other => {
                             return Err(RuntimeError::Collective {
                                 index,
@@ -635,9 +611,19 @@ impl Executor {
                             });
                         }
                     };
-                    let mut t = out_tensors.remove(0);
-                    self.collectives
-                        .execute(kind, *group, *reduce, *dim, split.as_deref(), &mut t)
+                    let request = CollectiveRequest {
+                        kind,
+                        group: *group,
+                        reduce: *reduce,
+                        dim: *dim,
+                        split: split.clone(),
+                        src: *src,
+                    };
+                    let input = in_tensors[0];
+                    let mut output = out_tensors.remove(0);
+                    let report = self
+                        .collectives
+                        .execute(&request, &input, &mut output)
                         .map_err(|reason| RuntimeError::Collective {
                             index,
                             op: label.clone(),
@@ -645,6 +631,15 @@ impl Executor {
                         })?;
                     stats.collectives += 1;
                     stats.steps += 1;
+                    stats.collective_sent_bytes += report.sent_bytes;
+                    stats.collective_recv_bytes += report.recv_bytes;
+                    stats.collective_records.push(CollectiveRecord {
+                        step: index,
+                        kind: op.clone(),
+                        group: group.bits(),
+                        sent_bytes: report.sent_bytes,
+                        recv_bytes: report.recv_bytes,
+                    });
                 }
 
                 CompiledStep::Op { op, attrs, .. } => {
@@ -721,8 +716,7 @@ impl Executor {
             }
 
             for (slot, t) in adopted {
-                let root = self.aliases[slot.0].unwrap_or(slot);
-                if let Some(buf) = self.buffers.get_mut(root.0).and_then(Option::as_mut) {
+                if let Some(buf) = self.buffers.get_mut(slot.0).and_then(Option::as_mut) {
                     buf.ptr = t.data;
                     buf.shape = t.shape;
                     buf.strides = t.stride;
@@ -742,14 +736,51 @@ impl Executor {
 
 impl Drop for Executor {
     fn drop(&mut self) {
-        // Only owners free; aliases point into the same allocation.
+        // Only owners free; in-place collective outputs point into these
+        // regions, and `loose` holds the buffers that could not alias.
         for region in [self.persistent_region, self.pool_region]
             .into_iter()
             .flatten()
         {
             self.allocator.dealloc(region.0, region.1);
         }
+        for (ptr, bytes) in self.loose.drain(..) {
+            self.allocator.dealloc(ptr, bytes);
+        }
     }
+}
+
+/// The canonical contiguous descriptor a plan slot's buffer starts with:
+/// row-major strides over the slot's shape, `width` bytes per element.
+fn slot_descriptor_shape(slot: &rustrain_plan::Slot) -> ([i64; 8], [i64; 8], u32, u32) {
+    let mut shape = [0i64; rustrain_abi::ffi::MAX_RANK];
+    let mut strides = [0i64; rustrain_abi::ffi::MAX_RANK];
+    let rank = (slot.shape.len() as u32).min(rustrain_abi::ffi::MAX_RANK as u32);
+    let mut acc = 1i64;
+    for d in (0..rank as usize).rev() {
+        shape[d] = slot.shape[d];
+        strides[d] = acc;
+        acc *= slot.shape[d].max(1);
+    }
+    let elem_width = slot.dtype.byte_width().unwrap_or(4);
+    (shape, strides, rank, elem_width)
+}
+
+/// Whether a buffer holds a dense, contiguous region: canonical row-major
+/// strides and exactly its own bytes. A collective output may reuse such a
+/// buffer in place; a strided view (transpose, an inner-dim narrow) is handed
+/// its own buffer instead.
+fn is_dense(buf: &SlotBuffer) -> bool {
+    let rank = (buf.rank as usize).min(buf.shape.len());
+    let numel: i64 = buf.shape[..rank].iter().product::<i64>().max(0);
+    let mut acc = 1i64;
+    for d in (0..rank).rev() {
+        if buf.strides[d] != acc {
+            return false;
+        }
+        acc *= buf.shape[d].max(1);
+    }
+    buf.bytes == (numel.max(0) as u64) * (buf.elem_width.max(1) as u64)
 }
 
 /// Copies a strided view into a contiguous buffer.
@@ -826,4 +857,41 @@ pub fn required_inputs(plan: &CompiledPlan) -> Vec<(SlotId, SlotKind)> {
         .into_iter()
         .map(|id| (id, plan.plan.slot(id).kind))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn buf(shape: [i64; 8], strides: [i64; 8], rank: u32, width: u32, bytes: u64) -> SlotBuffer {
+        SlotBuffer {
+            ptr: std::ptr::null_mut(),
+            shape,
+            strides,
+            rank,
+            elem_width: width,
+            bytes,
+        }
+    }
+
+    /// A dense buffer (canonical strides, exactly its own bytes) may be reused
+    /// in place by a collective; a strided view (a transpose) may not — the
+    /// executor hands it a fresh buffer instead of writing a contiguous result
+    /// over scattered elements.
+    #[test]
+    fn density_gates_the_in_place_collective_reuse() {
+        // [2, 3] f32, contiguous.
+        let dense = buf([2, 3, 0, 0, 0, 0, 0, 0], [3, 1, 0, 0, 0, 0, 0, 0], 2, 4, 24);
+        assert!(is_dense(&dense));
+        // The same logical shape with transposed strides.
+        let transposed = buf([2, 3, 0, 0, 0, 0, 0, 0], [1, 2, 0, 0, 0, 0, 0, 0], 2, 4, 24);
+        assert!(!is_dense(&transposed));
+        // A narrow along dim 0 of a larger tensor keeps canonical strides and
+        // owns a contiguous region — dense, safe to write in place.
+        let narrow_rows = buf([2, 3, 0, 0, 0, 0, 0, 0], [3, 1, 0, 0, 0, 0, 0, 0], 2, 4, 24);
+        assert!(is_dense(&narrow_rows));
+        // A size-1 dim with stride 0 (broadcast) is not dense.
+        let broadcast = buf([1, 3, 0, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0, 0, 0], 2, 4, 12);
+        assert!(!is_dense(&broadcast));
+    }
 }

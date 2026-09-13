@@ -53,6 +53,9 @@ pub enum CompiledStep {
         /// per rank in the group, validated against the group's degree and
         /// the input's size along `dim`). `None` means equal split.
         split: Option<Vec<i64>>,
+        /// `broadcast` only: the source rank's index inside the group
+        /// (`intrinsic::ATTR_SRC`), defaulting to 0.
+        src: Option<usize>,
         input: SlotId,
         output: SlotId,
         stream: StreamId,
@@ -714,6 +717,44 @@ impl<'a> Compiler<'a> {
             });
         }
 
+        // `broadcast` names its source as the member's index inside the group,
+        // defaulting to 0 (the weight-sync convention; the transition rules
+        // never emit broadcasts). Validated against the group's degree — a
+        // source outside the group is a reported error, never a guess.
+        let mut src: Option<usize> = None;
+        if op == intrinsic::BROADCAST {
+            match node.attrs.i64(intrinsic::ATTR_SRC) {
+                Some(raw) => {
+                    let raw = usize::try_from(raw).map_err(|_| PlanError::IntrinsicBadAttr {
+                        op: op.clone(),
+                        attr: intrinsic::ATTR_SRC.to_string(),
+                        value: format!("{raw} is negative or too large for a rank index"),
+                    })?;
+                    let degree = group
+                        .degree(mesh)
+                        .map_err(|source| PlanError::Mesh { source })?;
+                    if raw >= degree {
+                        return Err(PlanError::IntrinsicBadAttr {
+                            op,
+                            attr: intrinsic::ATTR_SRC.to_string(),
+                            value: format!(
+                                "source index {raw} is out of range for a group of degree \
+                                 {degree}"
+                            ),
+                        });
+                    }
+                    src = Some(raw);
+                }
+                None => src = Some(0),
+            }
+        } else if node.attrs.get(intrinsic::ATTR_SRC).is_some() {
+            return Err(PlanError::IntrinsicBadAttr {
+                op: op.clone(),
+                attr: intrinsic::ATTR_SRC.to_string(),
+                value: "`src` is a broadcast attribute".to_string(),
+            });
+        }
+
         Ok(CompiledStep::Intrinsic {
             node: id,
             op,
@@ -721,6 +762,7 @@ impl<'a> Compiler<'a> {
             reduce,
             dim: node.attrs.i64(intrinsic::ATTR_DIM),
             split,
+            src,
             input,
             output,
             stream: stream_of(node.stream),
@@ -814,6 +856,7 @@ fn compute_digest(
                 reduce,
                 dim,
                 split,
+                src,
                 input,
                 output,
                 stream,
@@ -823,9 +866,10 @@ fn compute_digest(
                 op: op.clone(),
                 // The mask renders as its bits (`mask(0b1)`): deterministic,
                 // and distinct per group without needing the mesh's names.
-                // `split` is part of the preimage: two plans that redistribute
-                // differently along the same axis are different runs.
-                implementation: format!("intrinsic:{group}:{reduce:?}:{dim:?}:{split:?}"),
+                // `split` and `src` are part of the preimage: two plans that
+                // redistribute differently along the same axis, or broadcast
+                // from a different member, are different runs.
+                implementation: format!("intrinsic:{group}:{reduce:?}:{dim:?}:{split:?}:{src:?}"),
                 numerics: None,
                 stream: *stream,
                 inputs: vec![input.0],

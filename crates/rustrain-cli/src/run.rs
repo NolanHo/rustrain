@@ -1,24 +1,46 @@
-//! `rustrain run` — spec C4 and delivery D5: one forward in one process, executed by the real
-//! runtime against the reference registry, then the candidate dump the HF comparison reads.
+//! `rustrain run` — spec C4 and delivery D5: one forward, executed by the real runtime against
+//! the reference registry, then the candidate dump the HF comparison reads. D6 extends it to a
+//! **mesh**: `--tp/--cp/--ep/--dp` drive real multi-rank execution (world = their product), every
+//! rank loads its own weight slices and instantiates its own plan, and the collectives run through
+//! a real backend (N threads, one per rank, shared buffers).
 //!
 //! Precision (the frozen decision, stated here because a runner user has to know it): the
 //! reference provider is f32-only while the checkpoint and HF are bf16, so `run` widens the
 //! bf16 weights to f32 — exact, bf16 ⊂ f32 — and executes f32. The HF reference is dumped with
 //! `--dtype bf16`; the spec's 1% tolerance (`max_abs_diff / max_abs` on the logits and the
 //! per-layer summaries) absorbs HF's own bf16 rounding, not this widening.
+//!
+//! D6's numeric claim is a different one, against **our own** world-1 run: the collectives
+//! reorder f32 summation (an all-reduce adds partials instead of one sequential accumulation),
+//! so bit-identity is not claimed; the acceptance bound is a *relative* one —
+//! `max_abs_diff / max_abs(baseline) ≤ 1e-5` — comfortably above the reassociation noise
+//! (≲1e-7 for these magnitudes) and orders of magnitude below what a wrong shard slice or a
+//! dropped partial would produce.
 
-use std::path::PathBuf;
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use rustrain_abi::ffi::RsDtype;
-use rustrain_parallel::{Mesh, ParallelConfig};
+use rustrain_parallel::{GroupMask, Mesh, ParallelConfig, ParallelLayout};
 use rustrain_plan::{Plan, SlotId};
-use rustrain_runtime::{Executor, HostAllocator, SingleRank, required_inputs};
+use rustrain_runtime::{
+    CollectiveBackend, Executor, HostAllocator, SingleRank, ThreadBackend, ThreadShared,
+    required_inputs,
+};
 
 use crate::load::load_weights;
 use crate::npz::{self, Npy};
+
+/// The completion view's output slot name — where the runner reads the full
+/// (replicated) logits when the plan leaves them distributed.
+const LOGITS_COMPLETE: &str = "__run__.logits.complete";
+/// The D6 numeric acceptance bound, relative to the baseline's max magnitude.
+const AGREEMENT_BOUND_RELATIVE: f64 = 1e-5;
+const METRICS_FORMAT: &str = "rustrain.metrics.v1";
+const SWEEP_FORMAT: &str = "rustrain.sweep.v1";
 
 #[derive(Args)]
 pub(crate) struct RunArgs {
@@ -42,14 +64,15 @@ pub(crate) struct RunArgs {
     #[arg(long, value_name = "N")]
     pub seq: Option<usize>,
 
-    /// Where to write the candidate dump (a `.npz`); a `.json` sidecar lands next to it.
+    /// Where to write the candidate dump (a `.npz`); a `.json` sidecar lands next to it. In
+    /// `--sweep` mode this is the JSON report path instead.
     #[arg(long, value_name = "PATH")]
     pub out: PathBuf,
 
     /// The mesh degrees. `tp=cp=ep=dp=pp=1` runs the whole model on rank 0 — the first
-    /// comparison. A sharded run loads each rank's local slice but cannot execute the collectives
-    /// without a real backend (the executor refuses them); `pp > 1` is refused outright because
-    /// the cross-stage seam is D5's open decision.
+    /// comparison. Any other combination runs a real multi-rank forward (N threads in this
+    /// process, one per rank); `pp > 1` is refused outright because the cross-stage seam is
+    /// D5's open decision.
     #[arg(long, default_value_t = 1)]
     pub tp: usize,
     #[arg(long, default_value_t = 1)]
@@ -60,6 +83,18 @@ pub(crate) struct RunArgs {
     pub dp: usize,
     #[arg(long, default_value_t = 1)]
     pub pp: usize,
+
+    /// Write the standalone per-rank metrics report (JSON) here. Absent, the metrics live in the
+    /// run's `.json` sidecar.
+    #[arg(long, value_name = "PATH")]
+    pub metrics: Option<PathBuf>,
+
+    /// Run the same forward over several meshes and write ONE JSON report to `--out` (no `.npz`
+    /// dump). Configs are `;`-separated, each a `,`-separated list of `axis=degree`
+    /// (`tp`/`cp`/`ep`/`dp`/`pp`). A world-1 baseline always runs first, and every config's
+    /// rank-0 logits are compared against it with the D6 bound.
+    #[arg(long, value_name = "LIST")]
+    pub sweep: Option<String>,
 }
 
 /// One hidden state's summary row, in the comparison's `[mean, std, max]` order.
@@ -89,22 +124,253 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
     // ---- the probe tokens -----------------------------------------------
     let tokens = probe_tokens(args.tokens.as_deref(), args.seq)?;
 
-    // ---- description → global plan → rank 0's plan ----------------------
-    let model = rustrain_model::Model::load(&args.model)
-        .with_context(|| format!("loading the model description in {}", args.model.display()))?;
-    let expanded = model
-        .expand()
-        .context("the description did not expand into a runnable plan")?;
+    if let Some(list) = &args.sweep {
+        return run_sweep(&args, &tokens, list);
+    }
 
-    let mesh = Mesh::from_config(&ParallelConfig {
+    let config = ParallelConfig {
         tensor: args.tp,
         context: args.cp,
         expert: args.ep,
         data: args.dp,
         pipeline: args.pp,
+    };
+    let result =
+        execute_mesh(&args.model, &args.checkpoint, &tokens, &config).with_context(|| {
+            format!(
+                "executing the forward on the mesh degrees {}",
+                mesh_text(&config)
+            )
+        })?;
+
+    let window = result.window;
+    let vocab = result.vocab;
+
+    // ---- the dump ----------------------------------------------------------
+    let mut logits_le = Vec::with_capacity(result.logits.len() * 4);
+    for v in &result.logits {
+        logits_le.extend_from_slice(&v.to_le_bytes());
+    }
+    let mut summary_le = Vec::with_capacity(result.summaries.len() * 3 * 4);
+    for row in &result.summaries {
+        for v in row {
+            summary_le.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    let tokens_i64: Vec<i64> = tokens.clone();
+    let mut ids_le = Vec::with_capacity(tokens_i64.len() * 8);
+    for id in &tokens_i64 {
+        ids_le.extend_from_slice(&id.to_le_bytes());
+    }
+
+    npz::write_npz(
+        &args.out,
+        &[
+            Npy {
+                name: "input_ids",
+                descr: npz::I8,
+                shape: &[tokens.len()],
+                data: &ids_le,
+            },
+            Npy {
+                name: "logits",
+                descr: npz::F4,
+                shape: &[tokens.len(), vocab],
+                data: &logits_le,
+            },
+            Npy {
+                name: "hidden_summaries",
+                descr: npz::F4,
+                shape: &[result.summaries.len(), 3],
+                data: &summary_le,
+            },
+        ],
+    )
+    .context("writing the candidate dump")?;
+
+    // ---- the sidecar and the human report --------------------------------
+    let sidecar_path = args.out.with_extension(format!(
+        "{}json",
+        args.out
+            .extension()
+            .map(|e| format!("{}.", e.to_string_lossy()))
+            .unwrap_or_default()
+    ));
+    let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+    let degrees = serde_json::json!({
+        "tp": args.tp, "cp": args.cp, "ep": args.ep, "dp": args.dp, "pp": args.pp,
     });
-    let mut plan = rustrain_plan::instantiate(&expanded.plan, &expanded.declarations(), &mesh, 0)
-        .context("instantiating rank 0 of the mesh")?;
+    let mut sidecar = serde_json::json!({
+        "format": "rustrain.run.v1",
+        "model": args.model.display().to_string(),
+        "checkpoint": args.checkpoint.display().to_string(),
+        "digest": result.digest,
+        "world_size": result.world,
+        "degrees": degrees.clone(),
+        "window": window,
+        "probe_tokens": tokens,
+        "logits_shape": [tokens.len(), vocab],
+        "hidden_states": result.summaries.len(),
+        "hidden_slots": result.hidden_names,
+        "weights": result.loaded_count,
+        "checkpoint_bytes": result.checkpoint_bytes,
+        "steps": result.rank0_steps,
+        "ops": result.rank0_ops,
+        "collectives": result.rank0_collectives,
+        "peak_bytes": result.peak_bytes,
+        "wall_seconds": result.wall.as_secs_f64(),
+        "precision": "weights widened bf16 -> f32 (exact; bf16 is a subset of f32), forward in f32",
+    });
+    if result.world > 1 {
+        sidecar["metrics"] = serde_json::json!({
+            "format": METRICS_FORMAT,
+            "world_size": result.world,
+            "degrees": degrees,
+            "ranks": result.ranks,
+            "note": "the logits are the replicated tensor read from rank 0; the hidden \
+                     summaries are rank 0's local view of the hidden slots",
+        });
+        if let Some(path) = &args.metrics {
+            std::fs::write(
+                path,
+                serde_json::to_string_pretty(&sidecar["metrics"])? + "\n",
+            )
+            .with_context(|| format!("writing the metrics report {}", path.display()))?;
+        }
+    } else if let Some(path) = &args.metrics {
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "format": METRICS_FORMAT,
+                "world_size": result.world,
+                "degrees": degrees,
+                "ranks": result.ranks,
+            }))? + "\n",
+        )
+        .with_context(|| format!("writing the metrics report {}", path.display()))?;
+    }
+    std::fs::write(
+        &sidecar_path,
+        serde_json::to_string_pretty(&sidecar)? + "\n",
+    )
+    .with_context(|| format!("writing the sidecar {}", sidecar_path.display()))?;
+
+    println!(
+        "run {}  rank 0 of tp={} cp={} ep={} dp={} pp={} (world {})",
+        result.name, args.tp, args.cp, args.ep, args.dp, args.pp, result.world
+    );
+    println!("  digest {}", &result.digest[..result.digest.len().min(12)]);
+    println!(
+        "  weights {} slot(s)  {:.1} GiB checkpoint bytes -> f32 (bf16 ⊂ f32, widening exact)",
+        result.loaded_count,
+        gib(result.checkpoint_bytes)
+    );
+    println!(
+        "  forward {} step(s) ({} ops, {} collectives)  wall {:.3} s  peak {:.1} GiB",
+        result.rank0_steps,
+        result.rank0_ops,
+        result.rank0_collectives,
+        result.wall.as_secs_f64(),
+        gib(result.peak_bytes)
+    );
+    println!(
+        "  probe {} token(s) in the declared window of {window} (padded with 0; causal execution \
+         keeps rows 0..{} exact)",
+        tokens.len(),
+        tokens.len()
+    );
+    println!(
+        "  kept {} hidden state(s) alive: the plan was extended with one view node each, so the \
+         memory pool cannot reuse their bytes before the dump reads them",
+        result.hidden_names.len()
+    );
+    println!(
+        "  logits [{}, {}]  hidden summaries [{}, 3]",
+        tokens.len(),
+        vocab,
+        result.summaries.len()
+    );
+    if result.world > 1 {
+        println!("  per-rank metrics (weight bytes, plan steps, collective volume):");
+        print_rank_table(&result, &gib);
+        println!(
+            "    note: hidden summaries below are rank 0's local view; the logits are the \
+             replicated tensor"
+        );
+    }
+    println!("  wrote {}", args.out.display());
+    println!("  wrote {}", sidecar_path.display());
+    if result.world > 1 {
+        if let Some(path) = &args.metrics {
+            println!("  wrote {}", path.display());
+        }
+    }
+    println!(
+        "  per-layer summary (mean, std, max over the {} probe position(s)):",
+        tokens.len()
+    );
+    for (index, (name, row)) in result
+        .hidden_names
+        .iter()
+        .zip(&result.summaries)
+        .enumerate()
+    {
+        println!(
+            "    layer {index:3}  mean {:+.6e}  std {:.6e}  max {:.6e}  ({name})",
+            row[0], row[1], row[2]
+        );
+    }
+    Ok(())
+}
+
+/// Everything one mesh execution produced, from rank 0's point of view.
+struct MeshResult {
+    name: String,
+    window: i64,
+    vocab: usize,
+    world: usize,
+    logits: Vec<f32>,
+    summaries: Vec<[f32; 3]>,
+    hidden_names: Vec<String>,
+    digest: String,
+    peak_bytes: u64,
+    wall: Duration,
+    loaded_count: usize,
+    checkpoint_bytes: u64,
+    rank0_steps: usize,
+    rank0_ops: usize,
+    rank0_collectives: usize,
+    /// Per-rank metrics (JSON), rank order.
+    ranks: Vec<serde_json::Value>,
+}
+
+fn mesh_text(cfg: &ParallelConfig) -> String {
+    format!(
+        "tp={}, cp={}, ep={}, dp={}, pp={}",
+        cfg.tensor, cfg.context, cfg.expert, cfg.data, cfg.pipeline
+    )
+}
+
+/// One rank's forward, or why it failed. Everything the rank touches — model
+/// load, instantiate, weight load, compile, execute — happens inside, so a
+/// rank is a complete unit the multi-rank driver runs on its own thread.
+fn run_rank(
+    model_dir: &Path,
+    checkpoint: &Path,
+    tokens: &[i64],
+    mesh: &Mesh,
+    rank: usize,
+    shared: Option<&Arc<ThreadShared>>,
+) -> Result<serde_json::Value> {
+    // ---- description → global plan → this rank's plan --------------------
+    let model = rustrain_model::Model::load(model_dir)
+        .with_context(|| format!("loading the model description in {}", model_dir.display()))?;
+    let expanded = model
+        .expand()
+        .context("the description did not expand into a runnable plan")?;
+
+    let mut plan = rustrain_plan::instantiate(&expanded.plan, &expanded.declarations(), mesh, rank)
+        .with_context(|| format!("instantiating rank {rank} of the mesh"))?;
 
     // The input the runner feeds: the description declares exactly one external input — the token
     // stream. A description with more inputs cannot be fed by `run`, which understands tokens and
@@ -134,7 +400,13 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
             input_slot.shape.len()
         );
     }
-    let window = input_slot.shape[0];
+    // The window check runs against the *global* plan: a cp/dp-sharded rank
+    // holds a slice of the window, not the whole probe.
+    let global_id = expanded
+        .plan
+        .slot_id(input_name)
+        .ok_or_else(|| anyhow::anyhow!("input slot `{input_name}` is not in the global plan"))?;
+    let window = expanded.plan.slot(global_id).shape[0];
     if window < 1 {
         bail!("input slot `{input_name}` declares a window of {window} positions");
     }
@@ -154,8 +426,7 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
     // reuses once their last consumer ran — reading them after the forward would read the
     // *later* activation that reused the bytes. So the runner extends the plan: every slot a
     // hidden pattern names gets a `view` node at the end, which makes it a graph output whose
-    // storage survives the run (the same thing HF's `output_hidden_states=True` does). The
-    // logits slot needs none: it is already an unread output and dies with the plan.
+    // storage survives the run (the same thing HF's `output_hidden_states=True` does).
     let outputs = model.desc.outputs.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
             "the description declares no `outputs` section; `run` needs `outputs.logits` and \
@@ -165,8 +436,16 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
     })?;
     let hidden_ids = keep_hidden_states(&mut plan, &outputs.hidden)?;
 
+    // The logits the dump reads must be the *complete* tensor. When the plan
+    // leaves them distributed (a cp/dp-sharded output, or a partial awaiting
+    // its all-reduce), the runner extends the plan with one more view node
+    // whose output declares `replicate` — the compiler then inserts exactly
+    // the completing collective, the same mechanism `keep_hidden_states`
+    // already uses for partials.
+    let completed_logits = complete_logits(&mut plan, &outputs.logits)?;
+
     // ---- the weights, through the same pairing `check` verifies ---------
-    let loaded = load_weights(&expanded, &model.desc, &plan, &mesh, 0, &args.checkpoint)
+    let loaded = load_weights(&expanded, &model.desc, &plan, mesh, rank, checkpoint)
         .context("loading the checkpoint weights")?;
     let loaded_count = loaded.len();
 
@@ -180,15 +459,23 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
                 "compiling the plan (every node must resolve and its inferred shapes must agree)",
             )?;
 
-    // ---- feed, execute, read --------------------------------------------
+    let plan_steps = compiled.steps.len();
     let digest = compiled.digest.clone();
     let peak_bytes = compiled.memory.peak_bytes;
-    let mut executor = Executor::new(
-        compiled,
-        Box::new(HostAllocator::new()),
-        Box::new(SingleRank::new(mesh.world_size())),
-    )
-    .context("preparing the executor")?;
+
+    // The slot that holds the complete logits after compilation: the
+    // completion view's output when one was added, else the pattern's single
+    // match — which must then already be replicated.
+    let logits_slot =
+        resolve_completed_logits(&compiled.plan, completed_logits.is_some(), &outputs.logits)?;
+
+    // ---- feed, execute, read --------------------------------------------
+    let backend: Box<dyn CollectiveBackend + Send> = match shared {
+        None => Box::new(SingleRank::new(mesh.world_size())),
+        Some(shared) => Box::new(ThreadBackend::new(rank, mesh.clone(), shared.clone())),
+    };
+    let mut executor = Executor::new(compiled, Box::new(HostAllocator::new()), backend)
+        .context("preparing the executor")?;
 
     // Every slot no node produces must be fed: weights from the loader, the token stream from the
     // probe. Anything else is an input this runner cannot produce — named, not guessed.
@@ -205,11 +492,13 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
 
     // The probe padded to the declared window: causal execution means positions 0..n-1 never read
     // the pad, so rows 0..n-1 are exactly HF's n-token forward (the same right-padding HF itself
-    // uses); the dump then keeps only those rows.
+    // uses); the dump then keeps only those rows. A rank whose input slot is sharded along the
+    // sequence feeds only its own slice of the padded probe.
     let mut ids = vec![0i64; window as usize];
-    ids[..tokens.len()].copy_from_slice(&tokens);
-    let mut id_bytes = Vec::with_capacity(ids.len() * 8);
-    for id in &ids {
+    ids[..tokens.len()].copy_from_slice(tokens);
+    let rows = rank_input_rows(executor.plan(), input_id, mesh, rank, &ids)?;
+    let mut id_bytes = Vec::with_capacity(rows.len() * 8);
+    for id in rows {
         id_bytes.extend_from_slice(&id.to_le_bytes());
     }
     executor
@@ -219,8 +508,13 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
     // Each weight's widened f32 buffer is dropped as it is copied into the executor's persistent
     // region, so the peak is the executor's f32 weights, not the executor's plus the loader's.
     let mut checkpoint_bytes: u64 = 0;
+    // The rank-local slice: the loader reads the whole tensor and extracts
+    // this rank's slab, so the *metric* that must fall as the mesh widens is
+    // the widened f32 bytes the rank actually holds — not the raw read.
+    let mut rank_weight_bytes: u64 = 0;
     for weight in loaded {
         checkpoint_bytes += weight.checkpoint_bytes;
+        rank_weight_bytes += (weight.values.len() * 4) as u64;
         executor
             .write_f32(weight.slot, &weight.values)
             .with_context(|| format!("writing the weight slot `{}`", weight.name))?;
@@ -230,31 +524,33 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
     let stats = executor.run().context("executing the forward")?;
     let wall = started.elapsed();
 
-    // ---- the outputs the description declares ---------------------------
-    let logits_id = single_match(&plan, &outputs.logits, "outputs.logits")?;
-    let logits_bytes = executor
-        .read_raw(logits_id)
-        .with_context(|| format!("reading the logits slot `{}`", plan.slot(logits_id).name))?;
-    let logits: Vec<f32> = logits_bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    let logits_shape = plan.slot(logits_id).shape.clone();
-    if logits_shape.len() != 2 || logits_shape[0] != window {
-        bail!(
-            "the logits slot `{}` is {:?}; the dump needs [window, vocab] = [{window}, …]",
-            plan.slot(logits_id).name,
-            logits_shape
-        );
-    }
-    let vocab = logits_shape[1] as usize;
-    let probe_logits = &logits[..tokens.len() * vocab];
+    // ---- the outputs, from rank 0 only -----------------------------------
+    let (logits, vocab, summaries, hidden_names) = if rank == 0 {
+        let logits_bytes = executor.read_raw(logits_slot).with_context(|| {
+            format!(
+                "reading the logits slot `{}`",
+                executor.plan().plan.slot(logits_slot).name
+            )
+        })?;
+        let logits: Vec<f32> = logits_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let logits_shape = executor.plan().plan.slot(logits_slot).shape.clone();
+        if logits_shape.len() != 2 || logits_shape[0] != window {
+            bail!(
+                "the logits slot `{}` is {:?}; the dump needs [window, vocab] = [{window}, …]",
+                executor.plan().plan.slot(logits_slot).name,
+                logits_shape
+            );
+        }
+        let vocab = logits_shape[1] as usize;
+        let probe_logits = &logits[..tokens.len() * vocab];
 
-    let mut summaries: Vec<[f32; 3]> = Vec::new();
-    let mut hidden_names: Vec<String> = Vec::new();
-    for id in &hidden_ids {
-        {
-            let name = plan.slot(*id).name.clone();
+        let mut summaries: Vec<[f32; 3]> = Vec::new();
+        let mut hidden_names: Vec<String> = Vec::new();
+        for id in &hidden_ids {
+            let name = executor.plan().plan.slot(*id).name.clone();
             let bytes = executor
                 .read_raw(*id)
                 .with_context(|| format!("reading the hidden state slot `{name}`"))?;
@@ -262,157 +558,283 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
-            let shape = plan.slot(*id).shape.clone();
+            let shape = executor.plan().plan.slot(*id).shape.clone();
             let per_row: usize = shape[1..]
                 .iter()
                 .map(|d| *d as usize)
                 .product::<usize>()
                 .max(1);
             // Only the probe rows: the pad rows are not part of the HF tensor.
-            let probe: &[f32] = &values[..tokens.len() * per_row];
+            let probe: &[f32] = &values[..tokens.len().min(shape[0] as usize) * per_row];
             summaries.push(summarize(probe));
             hidden_names.push(name);
         }
-    }
-    if summaries.is_empty() {
-        bail!(
-            "`outputs.hidden` matched no slot of the rank-0 plan; the dump needs at least one \
-             hidden state"
-        );
-    }
-
-    // ---- the dump ----------------------------------------------------------
-    let mut logits_le = Vec::with_capacity(probe_logits.len() * 4);
-    for v in probe_logits {
-        logits_le.extend_from_slice(&v.to_le_bytes());
-    }
-    let mut summary_le = Vec::with_capacity(summaries.len() * 3 * 4);
-    for row in &summaries {
-        for v in row {
-            summary_le.extend_from_slice(&v.to_le_bytes());
+        if summaries.is_empty() {
+            bail!(
+                "`outputs.hidden` matched no slot of the rank-0 plan; the dump needs at least one \
+                 hidden state"
+            );
         }
-    }
-    let tokens_i64: Vec<i64> = tokens.clone();
-    let mut ids_le = Vec::with_capacity(tokens_i64.len() * 8);
-    for id in &tokens_i64 {
-        ids_le.extend_from_slice(&id.to_le_bytes());
-    }
+        (probe_logits.to_vec(), vocab, summaries, hidden_names)
+    } else {
+        (Vec::new(), 0, Vec::new(), Vec::new())
+    };
 
-    npz::write_npz(
-        &args.out,
-        &[
-            Npy {
-                name: "input_ids",
-                descr: npz::I8,
-                shape: &[tokens.len()],
-                data: &ids_le,
-            },
-            Npy {
-                name: "logits",
-                descr: npz::F4,
-                shape: &[tokens.len(), vocab],
-                data: &logits_le,
-            },
-            Npy {
-                name: "hidden_summaries",
-                descr: npz::F4,
-                shape: &[summaries.len(), 3],
-                data: &summary_le,
-            },
-        ],
-    )
-    .context("writing the candidate dump")?;
-
-    // ---- the sidecar and the human report --------------------------------
-    let sidecar_path = args.out.with_extension(format!(
-        "{}json",
-        args.out
-            .extension()
-            .map(|e| format!("{}.", e.to_string_lossy()))
-            .unwrap_or_default()
-    ));
-    let sidecar = serde_json::json!({
-        "format": "rustrain.run.v1",
-        "model": args.model.display().to_string(),
-        "checkpoint": args.checkpoint.display().to_string(),
-        "digest": digest,
-        "world_size": mesh.world_size(),
-        "degrees": {"tp": args.tp, "cp": args.cp, "ep": args.ep, "dp": args.dp, "pp": args.pp},
-        "window": window,
-        "probe_tokens": tokens,
-        "logits_shape": [tokens.len(), vocab],
-        "hidden_states": summaries.len(),
-        "hidden_slots": hidden_names,
-        "weights": loaded_count,
-        "checkpoint_bytes": checkpoint_bytes,
-        "steps": stats.steps,
+    // ---- the per-rank metrics --------------------------------------------
+    let collectives_by_kind = collective_breakdown(mesh, &stats);
+    Ok(serde_json::json!({
+        "rank": rank,
+        "weight_slots": loaded_count,
+        "weight_bytes": rank_weight_bytes,
+        "checkpoint_bytes_read": checkpoint_bytes,
+        "plan_steps": plan_steps,
         "ops": stats.ops,
         "collectives": stats.collectives,
+        "collective_sent_bytes": stats.collective_sent_bytes,
+        "collective_recv_bytes": stats.collective_recv_bytes,
+        "collectives_by_kind": collectives_by_kind,
         "peak_bytes": peak_bytes,
         "wall_seconds": wall.as_secs_f64(),
-        "precision": "weights widened bf16 -> f32 (exact; bf16 is a subset of f32), forward in f32",
-    });
-    std::fs::write(
-        &sidecar_path,
-        serde_json::to_string_pretty(&sidecar)? + "\n",
-    )
-    .with_context(|| format!("writing the sidecar {}", sidecar_path.display()))?;
+        "window": window,
+        // Rank 0 only; the other ranks carry the same structure with nothing.
+        "logits": if rank == 0 {
+            serde_json::json!({ "rows": tokens.len(), "vocab": vocab, "values": logits })
+        } else {
+            serde_json::Value::Null
+        },
+        "hidden_summaries": summaries,
+        "hidden_names": hidden_names,
+        "digest": digest,
+    }))
+}
 
-    let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
-    println!(
-        "run {}  rank 0 of tp={} cp={} ep={} dp={} pp={} (world {})",
-        expanded.plan.meta.name,
-        args.tp,
-        args.cp,
-        args.ep,
-        args.dp,
-        args.pp,
-        mesh.world_size()
-    );
-    println!("  digest {}", &digest[..digest.len().min(12)]);
-    println!(
-        "  weights {} slot(s)  {:.1} GiB checkpoint bytes -> f32 (bf16 ⊂ f32, widening exact)",
-        loaded_count,
-        gib(checkpoint_bytes)
-    );
-    println!(
-        "  forward {} step(s) ({} ops, {} collectives)  wall {:.3} s  peak {:.1} GiB",
-        stats.steps,
-        stats.ops,
-        stats.collectives,
-        wall.as_secs_f64(),
-        gib(peak_bytes)
-    );
-    println!(
-        "  probe {} token(s) in the declared window of {window} (padded with 0; causal execution \
-         keeps rows 0..{} exact)",
-        tokens.len(),
-        tokens.len()
-    );
-    println!(
-        "  kept {} hidden state(s) alive: the plan was extended with one view node each, so the \
-         memory pool cannot reuse their bytes before the dump reads them",
-        hidden_ids.len()
-    );
-    println!(
-        "  logits [{}, {}]  hidden summaries [{}, 3]",
-        tokens.len(),
-        vocab,
-        summaries.len()
-    );
-    println!("  wrote {}", args.out.display());
-    println!("  wrote {}", sidecar_path.display());
-    println!(
-        "  per-layer summary (mean, std, max over the {} probe position(s)):",
-        tokens.len()
-    );
-    for (index, (name, row)) in hidden_names.iter().zip(&summaries).enumerate() {
-        println!(
-            "    layer {index:3}  mean {:+.6e}  std {:.6e}  max {:.6e}  ({name})",
-            row[0], row[1], row[2]
-        );
+/// Executes one forward over the mesh `cfg` describes, N threads in this
+/// process, and returns rank 0's view of the run plus every rank's metrics.
+fn execute_mesh(
+    model_dir: &Path,
+    checkpoint: &Path,
+    tokens: &[i64],
+    cfg: &ParallelConfig,
+) -> Result<MeshResult> {
+    let mesh = Mesh::from_config(cfg);
+    let world = mesh.world_size();
+
+    let name = rustrain_model::Model::load(model_dir)
+        .with_context(|| format!("loading the model description in {}", model_dir.display()))?
+        .desc
+        .name
+        .clone();
+
+    let rank_results: Vec<Result<serde_json::Value>> = if world == 1 {
+        vec![run_rank(model_dir, checkpoint, tokens, &mesh, 0, None)]
+    } else {
+        let shared = ThreadShared::new(world);
+        let (tx, rx) = mpsc::channel::<(usize, Result<serde_json::Value>)>();
+        let mut handles = Vec::with_capacity(world - 1);
+        for rank in 1..world {
+            let tx = tx.clone();
+            let shared = shared.clone();
+            let mesh = mesh.clone();
+            let model_dir = model_dir.to_path_buf();
+            let checkpoint = checkpoint.to_path_buf();
+            let tokens = tokens.to_vec();
+            handles.push(std::thread::spawn(move || {
+                let result = run_rank(&model_dir, &checkpoint, &tokens, &mesh, rank, Some(&shared));
+                // Any failure must wake every rank blocked at a rendezvous —
+                // a silently hung world is worse than a reported one.
+                if let Err(error) = &result {
+                    shared.poison(&format!("rank {rank} failed: {error:#}"));
+                }
+                tx.send((rank, result)).expect("the result channel is open");
+            }));
+        }
+        drop(tx);
+
+        let rank0 = {
+            let result = run_rank(model_dir, checkpoint, tokens, &mesh, 0, Some(&shared));
+            if let Err(error) = &result {
+                shared.poison(&format!("rank 0 failed: {error:#}"));
+            }
+            result
+        };
+
+        for handle in handles {
+            // The rendezvous cannot hang: a failing rank poisons the world and
+            // every waiter finishes with that error.
+            let _ = handle.join();
+        }
+        let mut workers: Vec<Result<serde_json::Value>> =
+            rx.iter().map(|(_, result)| result).collect();
+        workers.sort_by_key(|r| match r {
+            Ok(value) => value["rank"].as_u64().unwrap_or(0) as usize,
+            Err(_) => usize::MAX,
+        });
+
+        let mut results = Vec::with_capacity(world);
+        results.push(rank0);
+        results.extend(workers);
+        results
+    };
+
+    // Collect: every rank must have produced metrics and rank 0 the logits;
+    // any rank error fails the whole run, with the worker errors named.
+    let mut errors: Vec<String> = Vec::new();
+    let mut ranks = Vec::with_capacity(world);
+    for result in rank_results {
+        match result {
+            Ok(value) => ranks.push(value),
+            Err(error) => errors.push(format!("{error:#}")),
+        }
     }
-    Ok(())
+    if !errors.is_empty() {
+        bail!("the multi-rank forward failed: {}", errors.join("; "));
+    }
+    ranks.sort_by_key(|value| value["rank"].as_u64().unwrap_or(0) as usize);
+    if ranks.len() != world {
+        bail!("expected {world} rank result(s), got {}", ranks.len());
+    }
+
+    let rank0 = &ranks[0];
+    let logits: Vec<f32> = rank0["logits"]["values"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("rank 0's metrics carry no logits"))?
+        .iter()
+        .map(|v| v.as_f64().map(|f| f as f32).unwrap_or(f32::NAN))
+        .collect();
+    let summaries: Vec<[f32; 3]> = rank0["hidden_summaries"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    let r: Vec<f32> = row
+                        .as_array()
+                        .map(|vals| {
+                            vals.iter()
+                                .map(|v| v.as_f64().map(|f| f as f32).unwrap_or(f32::NAN))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    [r[0], r[1], r[2]]
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let hidden_names: Vec<String> = rank0["hidden_names"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // The window comes from rank 0's metrics: every rank validated the probe
+    // against the global window before running.
+    let window = rank0["window"].as_i64().unwrap_or(0);
+    if window < 1 {
+        bail!("rank 0's metrics carry no window; the forward cannot be reported");
+    }
+
+    Ok(MeshResult {
+        name,
+        window,
+        vocab: rank0["logits"]["vocab"].as_u64().unwrap_or(0) as usize,
+        world,
+        logits,
+        summaries,
+        hidden_names,
+        digest: rank0["digest"].as_str().unwrap_or_default().to_string(),
+        peak_bytes: rank0["peak_bytes"].as_u64().unwrap_or(0),
+        wall: Duration::from_secs_f64(rank0["wall_seconds"].as_f64().unwrap_or(0.0)),
+        loaded_count: rank0["weight_slots"].as_u64().unwrap_or(0) as usize,
+        checkpoint_bytes: rank0["checkpoint_bytes_read"].as_u64().unwrap_or(0),
+        rank0_steps: rank0["plan_steps"].as_u64().unwrap_or(0) as usize,
+        rank0_ops: rank0["ops"].as_u64().unwrap_or(0) as usize,
+        rank0_collectives: rank0["collectives"].as_u64().unwrap_or(0) as usize,
+        ranks,
+    })
+}
+
+/// Aggregates the executor's per-step collective records by (kind, group name).
+fn collective_breakdown(mesh: &Mesh, stats: &rustrain_runtime::RunStats) -> Vec<serde_json::Value> {
+    let mut by_key: std::collections::BTreeMap<(String, String), (usize, u64, u64)> =
+        std::collections::BTreeMap::new();
+    for record in &stats.collective_records {
+        let kind = record
+            .kind
+            .strip_prefix(rustrain_plan::intrinsic::PREFIX)
+            .unwrap_or(&record.kind)
+            .to_string();
+        let group = GroupMask::from_bits(record.group);
+        let group_name = mesh.group_name(group).unwrap_or_else(|_| group.to_string());
+        let entry = by_key.entry((kind, group_name)).or_default();
+        entry.0 += 1;
+        entry.1 += record.sent_bytes;
+        entry.2 += record.recv_bytes;
+    }
+    by_key
+        .into_iter()
+        .map(|((kind, group), (calls, sent, recv))| {
+            serde_json::json!({
+                "kind": kind,
+                "group": group,
+                "calls": calls,
+                "sent_bytes": sent,
+                "recv_bytes": recv,
+            })
+        })
+        .collect()
+}
+
+/// The rows of the padded probe this rank feeds: the whole probe for a
+/// replicated input slot, the rank's slice for one sharded along dim 0.
+/// Anything else is a distribution `run` cannot feed — reported, not guessed.
+fn rank_input_rows(
+    compiled: &rustrain_plan::CompiledPlan,
+    input_id: SlotId,
+    mesh: &Mesh,
+    rank: usize,
+    padded: &[i64],
+) -> Result<Vec<i64>> {
+    let slot = compiled.plan.slot(input_id);
+    let layout = &slot.layout;
+    if layout.is_replicated() {
+        return Ok(padded.to_vec());
+    }
+    match layout.dims.as_slice() {
+        [spec] if spec.dim == 0 => {
+            let local = slot.shape[0];
+            if local <= 0 || padded.len() as i64 % local != 0 {
+                bail!(
+                    "input slot `{}` is sharded into {} row(s) per rank along dim 0, which does \
+                     not tile the {} padded position(s)",
+                    slot.name,
+                    local,
+                    padded.len()
+                );
+            }
+            let index = mesh
+                .group_index(spec.group, rank)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let start = index * local as usize;
+            let end = start + local as usize;
+            if end > padded.len() {
+                bail!(
+                    "input slot `{}`: rank {rank} would feed rows {start}..{end} of a {} row \
+                     probe",
+                    slot.name,
+                    padded.len()
+                );
+            }
+            Ok(padded[start..end].to_vec())
+        }
+        _ => bail!(
+            "input slot `{}` holds layout {}, which `run` cannot feed: it understands a \
+             replicated token stream or one sharded along dim 0",
+            slot.name,
+            layout
+        ),
+    }
 }
 
 /// The probe tokens: `--tokens` verbatim, `--seq` as `0..n-1`, and the two must agree when both
@@ -533,7 +955,7 @@ fn keep_hidden_states(plan: &mut Plan, patterns: &[String]) -> Result<Vec<SlotId
         // output is what the dump reads — the complete tensor — so it declares the completed
         // layout: replicate where the input is partial, the input's own layout otherwise.
         if slot.layout.partial.is_some() {
-            out.layout = rustrain_parallel::ParallelLayout::replicate();
+            out.layout = ParallelLayout::replicate();
         }
         if plan.slot_id(&out.name).is_some() {
             bail!(
@@ -557,6 +979,286 @@ fn keep_hidden_states(plan: &mut Plan, patterns: &[String]) -> Result<Vec<SlotId
         });
     }
     Ok(ids)
+}
+
+/// When the logits slot is not replicated, appends one `view` node whose
+/// output **declares** `replicate` (the same shape as the input — the view
+/// itself cannot grow a tensor). The compiler then inserts the completing
+/// collective after the view: shard-propagation sees the declared-replicate
+/// output disagree with the shard the view actually produces, splices the
+/// collective, and gives the *converted* twin the gathered global shape (D6's
+/// shape math in `rustrain_plan::shard::propagate`). The dump reads the twin,
+/// resolved by name below. Returns the view's output slot id when one was
+/// added.
+fn complete_logits(plan: &mut Plan, pattern: &str) -> Result<Option<SlotId>> {
+    let id = single_match(plan, pattern, "outputs.logits")?;
+    if plan.slot(id).layout.is_replicated() {
+        return Ok(None);
+    }
+    let slot = plan.slot(id);
+    let mut out = slot.clone();
+    out.name = LOGITS_COMPLETE.to_string();
+    out.layout = ParallelLayout::replicate();
+    out.kind = rustrain_plan::SlotKind::Output;
+    if plan.slot_id(&out.name).is_some() {
+        bail!("the logits completion view collides with existing slot `{LOGITS_COMPLETE}`");
+    }
+    let out_id = SlotId(plan.slots.len());
+    plan.slots.push(out);
+    plan.nodes.push(rustrain_plan::PlanNode {
+        op: rustrain_plan::OpRef::new("view"),
+        inputs: vec![id],
+        outputs: vec![out_id],
+        attrs: rustrain_plan::Attrs::new(),
+        phase: plan.meta.phase,
+        precision: rustrain_plan::PrecisionOverride::default(),
+        checkpoint: rustrain_plan::CheckpointPolicy::None,
+        stream: rustrain_plan::StreamPolicy::Default,
+        source: rustrain_plan::Trace::new("run.logits.complete"),
+    });
+    Ok(Some(out_id))
+}
+
+/// The slot holding the complete logits after compilation. For a plain
+/// (already-replicated) plan: the pattern's single match. When the runner
+/// added a completion view: the converted twin of its output — the slot named
+/// `<LOGITS_COMPLETE>__<intrinsic>...` whose layout is replicate and whose
+/// shape is the global one. Exactly one such slot must exist; two would mean
+/// two different completions, and none means the compiler did not insert the
+/// completing collective.
+fn resolve_completed_logits(plan: &Plan, completed: bool, pattern: &str) -> Result<SlotId> {
+    if !completed {
+        let id = single_match(plan, pattern, "outputs.logits")?;
+        if !plan.slot(id).layout.is_replicated() {
+            bail!(
+                "the logits slot `{}` compiled to {}, not replicate; the runner cannot dump \
+                 a distributed tensor",
+                plan.slot(id).name,
+                plan.slot(id).layout
+            );
+        }
+        return Ok(id);
+    }
+    let prefix = format!("{LOGITS_COMPLETE}__");
+    let twins: Vec<SlotId> = plan
+        .slots
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| slot.name.starts_with(&prefix) && slot.layout.is_replicated())
+        .map(|(index, _)| SlotId(index))
+        .collect();
+    match twins.as_slice() {
+        [id] => Ok(*id),
+        [] => bail!(
+            "the logits completion view compiled to no replicate twin; the completing \
+             collective was not inserted"
+        ),
+        many => bail!(
+            "the logits completion view compiled to {} replicate twin(s): {}",
+            many.len(),
+            many.iter()
+                .map(|id| plan.slot(*id).name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+// ---- the configuration sweep -----------------------------------------------
+
+/// `--sweep "tp=2;tp=4;tp=2,ep=2"` → one `ParallelConfig` per `;`-separated entry.
+fn parse_sweep(list: &str) -> Result<Vec<ParallelConfig>> {
+    let mut configs = Vec::new();
+    for (index, entry) in list.split(';').enumerate() {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            bail!("`--sweep` entry {} is empty", index + 1);
+        }
+        let mut cfg = ParallelConfig::default();
+        let mut seen = std::collections::BTreeSet::new();
+        for pair in entry.split(',') {
+            let pair = pair.trim();
+            let Some((axis, degree)) = pair.split_once('=') else {
+                bail!("`--sweep` entry `{entry}`: `{pair}` is not `axis=degree`");
+            };
+            let degree: usize = degree.trim().parse().with_context(|| {
+                format!("`--sweep` entry `{entry}`: `{degree}` is not an integer")
+            })?;
+            if degree == 0 {
+                bail!("`--sweep` entry `{entry}`: `{axis}` degree must be at least 1");
+            }
+            if !seen.insert(axis.trim().to_string()) {
+                bail!("`--sweep` entry `{entry}` declares axis `{axis}` twice");
+            }
+            match axis.trim() {
+                "tp" => cfg.tensor = degree,
+                "cp" => cfg.context = degree,
+                "ep" => cfg.expert = degree,
+                "dp" => cfg.data = degree,
+                "pp" => cfg.pipeline = degree,
+                other => bail!("`--sweep` entry `{entry}`: `{other}` is not one of tp/cp/ep/dp/pp"),
+            }
+        }
+        configs.push(cfg);
+    }
+    if configs.is_empty() {
+        bail!("`--sweep` lists no configurations");
+    }
+    Ok(configs)
+}
+
+fn max_abs(values: &[f32]) -> f64 {
+    values
+        .iter()
+        .fold(0.0f64, |acc, v| acc.max((*v as f64).abs()))
+}
+
+fn max_abs_diff(a: &[f32], b: &[f32]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| ((*x as f64) - (*y as f64)).abs())
+        .fold(0.0f64, f64::max)
+}
+
+/// Runs the same forward over every listed mesh and writes ONE JSON report to
+/// `--out`. A world-1 baseline always runs first; every configuration's rank-0
+/// logits are compared against it with the D6 relative bound.
+fn run_sweep(args: &RunArgs, tokens: &[i64], list: &str) -> Result<()> {
+    let configs = parse_sweep(list)?;
+
+    let baseline_cfg = ParallelConfig::default();
+    let baseline = execute_mesh(&args.model, &args.checkpoint, tokens, &baseline_cfg)
+        .context("running the world-1 baseline")?;
+    let baseline_max = max_abs(&baseline.logits);
+    if baseline.logits.is_empty() {
+        bail!("the world-1 baseline produced no logits");
+    }
+
+    let mut entries = Vec::with_capacity(configs.len());
+    for cfg in &configs {
+        let result = execute_mesh(&args.model, &args.checkpoint, tokens, cfg)
+            .with_context(|| format!("executing the sweep config {}", mesh_text(cfg)))?;
+        if result.logits.len() != baseline.logits.len() {
+            bail!(
+                "the {} config produced {} logits, the baseline {}: the meshes are not the same \
+                 forward",
+                mesh_text(cfg),
+                result.logits.len(),
+                baseline.logits.len()
+            );
+        }
+        let diff = max_abs_diff(&baseline.logits, &result.logits);
+        let bound = AGREEMENT_BOUND_RELATIVE * baseline_max;
+        entries.push(serde_json::json!({
+            "degrees": {
+                "tp": cfg.tensor, "cp": cfg.context, "ep": cfg.expert,
+                "dp": cfg.data, "pp": cfg.pipeline,
+            },
+            "world_size": result.world,
+            "digest": result.digest,
+            "wall_seconds": result.wall.as_secs_f64(),
+            "max_abs_diff": diff,
+            "bound": bound,
+            "pass": diff <= bound,
+            "ranks": result.ranks,
+        }));
+    }
+
+    let report = serde_json::json!({
+        "format": SWEEP_FORMAT,
+        "model": args.model.display().to_string(),
+        "checkpoint": args.checkpoint.display().to_string(),
+        "probe_tokens": tokens,
+        "bound_relative": AGREEMENT_BOUND_RELATIVE,
+        "baseline": {
+            "degrees": {
+                "tp": baseline_cfg.tensor, "cp": baseline_cfg.context, "ep": baseline_cfg.expert,
+                "dp": baseline_cfg.data, "pp": baseline_cfg.pipeline,
+            },
+            "world_size": baseline.world,
+            "digest": baseline.digest,
+            "wall_seconds": baseline.wall.as_secs_f64(),
+            "max_abs": baseline_max,
+            "ranks": baseline.ranks,
+        },
+        "configs": entries,
+    });
+    std::fs::write(&args.out, serde_json::to_string_pretty(&report)? + "\n")
+        .with_context(|| format!("writing the sweep report {}", args.out.display()))?;
+
+    let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+    println!(
+        "sweep {} over {} config(s)  baseline world 1 (max |logits| {:.3e})",
+        args.model.display(),
+        configs.len(),
+        baseline_max
+    );
+    for (cfg, entry) in configs.iter().zip(&entries) {
+        let diff = entry["max_abs_diff"].as_f64().unwrap_or(f64::NAN);
+        let bound = entry["bound"].as_f64().unwrap_or(f64::NAN);
+        let pass = entry["pass"].as_bool().unwrap_or(false);
+        let weight_bytes: u64 = entry["ranks"]
+            .as_array()
+            .map(|ranks| {
+                ranks
+                    .iter()
+                    .map(|r| r["weight_bytes"].as_u64().unwrap_or(0))
+                    .sum()
+            })
+            .unwrap_or(0);
+        println!(
+            "  {}  world {:>2}  wall {:>8.3} s  weights {:>7.2} GiB  logits vs world-1: \
+             max|diff| {:.3e} / bound {:.3e} {}",
+            mesh_text(cfg),
+            entry["world_size"],
+            entry["wall_seconds"].as_f64().unwrap_or(0.0),
+            gib(weight_bytes),
+            diff,
+            bound,
+            if pass { "PASS" } else { "FAIL" }
+        );
+    }
+    println!("  wrote {}", args.out.display());
+    Ok(())
+}
+
+/// The compact human per-rank table for a multi-rank run.
+fn print_rank_table(result: &MeshResult, gib: &impl Fn(u64) -> f64) {
+    println!(
+        "    {:<5} {:>12} {:>8} {:>6} {:>6} {:>10} {:>12}",
+        "rank", "weights", "steps", "ops", "colls", "coll bytes", "wall s"
+    );
+    for rank in &result.ranks {
+        println!(
+            "    {:<5} {:>9.2} GiB {:>8} {:>6} {:>6} {:>10} {:>12.3}",
+            rank["rank"].as_u64().unwrap_or(0),
+            gib(rank["weight_bytes"].as_u64().unwrap_or(0)),
+            rank["plan_steps"].as_u64().unwrap_or(0),
+            rank["ops"].as_u64().unwrap_or(0),
+            rank["collectives"].as_u64().unwrap_or(0),
+            rank["collective_sent_bytes"].as_u64().unwrap_or(0)
+                + rank["collective_recv_bytes"].as_u64().unwrap_or(0),
+            rank["wall_seconds"].as_f64().unwrap_or(0.0),
+        );
+    }
+    let mut printed = false;
+    for rank in &result.ranks {
+        for entry in rank["collectives_by_kind"].as_array().into_iter().flatten() {
+            printed = true;
+            println!(
+                "      rank {}  {:<12} group {:<6} {} call(s)  sent {}  recv {}",
+                rank["rank"].as_u64().unwrap_or(0),
+                entry["kind"].as_str().unwrap_or("?"),
+                entry["group"].as_str().unwrap_or("?"),
+                entry["calls"].as_u64().unwrap_or(0),
+                entry["sent_bytes"].as_u64().unwrap_or(0),
+                entry["recv_bytes"].as_u64().unwrap_or(0),
+            );
+        }
+    }
+    if !printed {
+        println!("      (no collectives)");
+    }
 }
 
 #[cfg(test)]
@@ -712,5 +1414,22 @@ mod tests {
         assert_eq!(plan.slot(plan.slot_id("x").unwrap()).dtype, RsDtype::I64);
         assert_eq!(plan.slot(plan.slot_id("w").unwrap()).dtype, RsDtype::F32);
         assert_eq!(plan.slot(plan.slot_id("y").unwrap()).dtype, RsDtype::F32);
+    }
+
+    /// The sweep list parser: strict `axis=degree` pairs, unknown axes and
+    /// duplicates refused, empty entries rejected.
+    #[test]
+    fn sweep_list_parses_strictly() {
+        let configs = parse_sweep("tp=2;tp=4,ep=2;dp=2").unwrap();
+        assert_eq!(configs.len(), 3);
+        assert_eq!(configs[0].tensor, 2);
+        assert_eq!(configs[1].tensor, 4);
+        assert_eq!(configs[1].expert, 2);
+        assert_eq!(configs[2].data, 2);
+        assert_eq!(configs[2].tensor, 1);
+        for bad in ["", "tp=0", "tp=x", "tp", "foo=2", "tp=2,tp=4", ";tp=2"] {
+            let error = parse_sweep(bad).unwrap_err();
+            assert!(!error.to_string().is_empty(), "`{bad}` must be an error");
+        }
     }
 }

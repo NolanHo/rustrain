@@ -67,6 +67,12 @@ pub struct PortSpec {
     pub kind: String,
     #[serde(default)]
     pub dtype: Option<String>,
+    /// slot dimension → symbolic axis names, for a top-level *input* that is
+    /// itself distributed (cp / dp shard the token stream). Same vocabulary as
+    /// `binding.axes`; resolved by `instantiate` against the mesh like every
+    /// other declaration (D6).
+    #[serde(default)]
+    pub axes: BTreeMap<String, Vec<String>>,
 }
 
 /// One `params` value: read from `config.json`, a parameter expression, or a literal list (§3.1).

@@ -1,0 +1,230 @@
+{
+  "format": "rustrain.model.v1",
+  "name": "run-tiny-dp",
+  "dtype": "bf16",
+  "inputs": {
+    "input_ids": {
+      "shape": [
+        "seq"
+      ],
+      "kind": "input",
+      "dtype": "i64",
+      "axes": {
+        "0": [
+          "dp"
+        ]
+      }
+    }
+  },
+  "params": {
+    "seq": {
+      "from": "text_config.max_position_embeddings"
+    },
+    "hidden": {
+      "from": "text_config.hidden_size"
+    },
+    "inter": {
+      "from": "text_config.intermediate_size"
+    },
+    "vocab": {
+      "from": "text_config.vocab_size"
+    }
+  },
+  "templates": {
+    "embed": {
+      "inputs": {
+        "ids": {
+          "shape": [
+            "seq"
+          ],
+          "kind": "input",
+          "dtype": "i64"
+        }
+      },
+      "outputs": {
+        "y": {
+          "shape": [
+            "seq",
+            "hidden"
+          ],
+          "kind": "activation"
+        }
+      },
+      "slots": [
+        {
+          "name": "w",
+          "kind": "weight",
+          "shape": [
+            "vocab",
+            "hidden"
+          ]
+        }
+      ],
+      "nodes": [
+        {
+          "op": "embedding",
+          "in": [
+            "w",
+            "ids"
+          ],
+          "out": [
+            "y"
+          ]
+        }
+      ]
+    },
+    "tower": {
+      "inputs": {
+        "x": {
+          "shape": [
+            "seq",
+            "hidden"
+          ],
+          "kind": "activation"
+        }
+      },
+      "outputs": {
+        "yc": {
+          "shape": [
+            "seq",
+            "hidden"
+          ],
+          "kind": "activation"
+        }
+      },
+      "slots": [
+        {
+          "name": "w_up",
+          "kind": "weight",
+          "shape": [
+            "hidden",
+            "inter"
+          ]
+        },
+        {
+          "name": "w_down",
+          "kind": "weight",
+          "shape": [
+            "inter",
+            "hidden"
+          ]
+        },
+        {
+          "name": "h",
+          "kind": "activation",
+          "shape": [
+            "seq",
+            "inter"
+          ]
+        },
+        {
+          "name": "y",
+          "kind": "activation",
+          "shape": [
+            "seq",
+            "hidden"
+          ]
+        }
+      ],
+      "nodes": [
+        {
+          "op": "linear",
+          "in": [
+            "x",
+            "w_up"
+          ],
+          "out": [
+            "h"
+          ]
+        },
+        {
+          "op": "linear",
+          "in": [
+            "h",
+            "w_down"
+          ],
+          "out": [
+            "y"
+          ]
+        },
+        {
+          "op": "elementwise_unary",
+          "in": [
+            "y"
+          ],
+          "out": [
+            "yc"
+          ],
+          "attrs": {
+            "kind": "silu"
+          }
+        }
+      ]
+    }
+  },
+  "stack": [
+    {
+      "template": "embed",
+      "prefix": "embed",
+      "inputs": {
+        "ids": "input_ids"
+      }
+    },
+    {
+      "template": "tower",
+      "prefix": "t0",
+      "inputs": {
+        "x": "embed.y"
+      }
+    },
+    {
+      "template": "tower",
+      "prefix": "t1",
+      "inputs": {
+        "x": "t0.yc"
+      }
+    }
+  ],
+  "binding": [
+    {
+      "slot": "embed.w",
+      "source": "model.embed.weight"
+    },
+    {
+      "slot": "t0.w_up",
+      "source": "model.t0.up.weight",
+      "transform": [
+        "transpose(0,1)"
+      ]
+    },
+    {
+      "slot": "t0.w_down",
+      "source": "model.t0.down.weight",
+      "transform": [
+        "transpose(0,1)"
+      ]
+    },
+    {
+      "slot": "t1.w_up",
+      "source": "model.t1.up.weight",
+      "transform": [
+        "transpose(0,1)"
+      ]
+    },
+    {
+      "slot": "t1.w_down",
+      "source": "model.t1.down.weight",
+      "transform": [
+        "transpose(0,1)"
+      ]
+    }
+  ],
+  "outputs": {
+    "logits": "t1.yc",
+    "hidden": [
+      "embed.y",
+      "t0.yc",
+      "t1.yc"
+    ]
+  }
+}

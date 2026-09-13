@@ -50,6 +50,10 @@ pub struct Expanded {
     /// Every expanded stack instance in stack order: `(prefix, declared stage)`, `None` for an
     /// entry without `stage`. Read by [`Expanded::declarations`]; not read anywhere else.
     stages: Vec<(String, Option<i64>)>,
+    /// The `axes` declared on the top-level `inputs` (D6): an input slot can
+    /// itself be distributed — cp / dp shard the token stream. Merged into
+    /// [`Expanded::declarations`] next to the binding axes.
+    input_axes: BTreeMap<String, BTreeMap<String, Vec<String>>>,
 }
 
 impl Expanded {
@@ -68,6 +72,15 @@ impl Expanded {
                     continue;
                 }
                 slots.insert(hit.slot.clone(), hit.axes.clone());
+            }
+        }
+        // Input axes (D6): a top-level input declares its own distribution. A
+        // name cannot collide with a binding target (bindings hit weight slots
+        // only, `expand` enforces it), so a second insert would be a
+        // description error that cannot occur — the bindings' entry is kept.
+        for (name, axes) in &self.input_axes {
+            if !axes.is_empty() {
+                slots.entry(name.clone()).or_insert_with(|| axes.clone());
             }
         }
         rustrain_plan::DeclaredAxes {
@@ -166,6 +179,7 @@ pub fn expand_lenient(
     let plan = builder.build()?;
     let (bindings, unbound_slots) = expander.bind()?;
     let stages = expander.stages;
+    let input_axes = expander.input_axes;
     check_outputs(desc, &plan)?;
 
     Ok(Expanded {
@@ -173,6 +187,7 @@ pub fn expand_lenient(
         bindings,
         unbound_slots,
         stages,
+        input_axes,
     })
 }
 
@@ -396,6 +411,8 @@ struct Expander<'a> {
     last_index: Option<i64>,
     /// Every expanded instance in stack order: `(prefix, declared stage)`.
     stages: Vec<(String, Option<i64>)>,
+    /// The `axes` declared on the top-level `inputs` (D6), keyed by slot name.
+    input_axes: BTreeMap<String, BTreeMap<String, Vec<String>>>,
 }
 
 impl<'a> Expander<'a> {
@@ -413,6 +430,7 @@ impl<'a> Expander<'a> {
             prev_outputs: Vec::new(),
             last_index: None,
             stages: Vec::new(),
+            input_axes: BTreeMap::new(),
         }
     }
 
@@ -426,6 +444,12 @@ impl<'a> Expander<'a> {
             let shape = self.shape_of(&port.shape)?;
             let origin = format!("the description's `inputs` section (`{name}`)");
             self.add_slot(name, dtype, shape, kind, &origin)?;
+            // The input's own distribution (D6): recorded here and handed to
+            // `instantiate` through `declarations()`, exactly like the binding
+            // axes. Absent axes = replicated = absent from the map.
+            if !port.axes.is_empty() {
+                self.input_axes.insert(name.clone(), port.axes.clone());
+            }
         }
         Ok(())
     }
@@ -588,6 +612,16 @@ impl<'a> Expander<'a> {
                      template `{template_name}` unwired"
                 ))
             })?;
+            // `axes` is a top-level-input declaration (D6); on a template
+            // port it would be silently unread, which I-5 forbids — reject it
+            // by name instead.
+            if !port.axes.is_empty() {
+                return Err(ModelError::Invalid(format!(
+                    "stack entry {entry_index} (prefix `{prefix}`) declares `axes` on input \
+                     `{local_name}` of template `{template_name}`; sharding declarations belong \
+                     on the top-level `inputs` section or on `binding` entries"
+                )));
+            }
             let declared = self.shape_of(&port.shape)?;
             let (_, held) = self.info(id)?;
             if declared != held {
@@ -639,7 +673,14 @@ impl<'a> Expander<'a> {
         // 3. A declared output must actually be produced, otherwise downstream wiring connects to
         // thin air.
         let mut outputs = Vec::with_capacity(template.outputs.len());
-        for name in template.outputs.keys() {
+        for (name, port) in &template.outputs {
+            if !port.axes.is_empty() {
+                return Err(ModelError::Invalid(format!(
+                    "instance `{prefix}`: template `{template_name}` declares `axes` on output \
+                     `{name}`; sharding declarations belong on the top-level `inputs` section \
+                     or on `binding` entries"
+                )));
+            }
             let id = local.get(name).ok_or_else(|| {
                 ModelError::Invalid(format!(
                     "instance `{prefix}`: template declares output `{name}`, but no node in this \
@@ -1241,5 +1282,71 @@ mod tests {
             Some(("layer_types".to_string(), "l".to_string()))
         );
         assert_eq!(parse_indexed("layer_types"), None);
+    }
+}
+
+#[cfg(test)]
+mod axes_declaration_tests {
+    use super::*;
+
+    fn desc_with(json: &str) -> serde_json::Value {
+        serde_json::from_str(json).expect("fixture json parses")
+    }
+
+    fn minimal(template_inputs: &str, inputs: &str) -> String {
+        format!(
+            r#"{{
+                "format": "rustrain.model.v1",
+                "name": "axes-ports",
+                "dtype": "f32",
+                "inputs": {inputs},
+                "params": {{ "n": {{ "from": "text_config.n" }} }},
+                "templates": {{
+                    "t": {{
+                        "inputs": {template_inputs},
+                        "outputs": {{ "y": {{ "shape": ["n"], "kind": "activation" }} }},
+                        "nodes": [{{ "op": "scale", "in": ["x"], "out": ["y"] }}]
+                    }}
+                }},
+                "stack": [{{ "template": "t", "prefix": "t", "inputs": {{ "x": "tok" }} }}],
+                "outputs": {{ "logits": "t.y", "hidden": ["t.y"] }}
+            }}"#
+        )
+    }
+
+    /// `axes` on a template port is rejected by name — it would be silently
+    /// unread otherwise (I-5: a wrong description is a hard error).
+    #[test]
+    fn axes_on_a_template_input_port_are_rejected() {
+        let desc: ModelDesc = serde_json::from_str(&minimal(
+            r#"{ "x": { "shape": ["n"], "kind": "activation", "axes": { "0": ["tp"] } } }"#,
+            r#"{ "tok": { "shape": ["n"], "kind": "input", "dtype": "i64" } }"#,
+        ))
+        .unwrap();
+        let config = desc_with(r#"{"text_config": {"n": 4}}"#);
+        let error = expand(&desc, &config).unwrap_err();
+        assert!(
+            error.to_string().contains("sharding declarations belong"),
+            "the rejection must say where axes belong: {error}"
+        );
+    }
+
+    /// A top-level input **may** declare its own distribution (D6): it flows
+    /// into `declarations()` and the plan instantiates with it.
+    #[test]
+    fn axes_on_a_top_level_input_flow_into_the_declarations() {
+        let desc: ModelDesc = serde_json::from_str(&minimal(
+            r#"{ "x": { "shape": ["n"], "kind": "activation" } }"#,
+            r#"{ "tok": { "shape": ["n"], "kind": "input", "dtype": "i64", "axes": { "0": ["dp"] } } }"#,
+        ))
+        .unwrap();
+        let config = desc_with(r#"{"text_config": {"n": 4}}"#);
+        let expanded = expand(&desc, &config).unwrap();
+        let declarations = expanded.declarations();
+        assert_eq!(
+            declarations.slots.get("tok").and_then(|d| d.get("0")),
+            Some(&vec!["dp".to_string()]),
+            "the input's dp shard must reach instantiate"
+        );
     }
 }

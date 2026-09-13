@@ -961,6 +961,47 @@ pub fn propagate(plan: &Plan) -> Result<ShardPropagation, PlanError> {
 
         let mut converted = plan.slot(c.slot).clone();
         converted.name = format!("{}__{}", converted.name, op);
+        // A shape-changing collective must carry its new **local** shape: the
+        // plan's slots are already local, so the converted slot starts from the
+        // source's local shape, inflates it along every shard dim the source
+        // holds (an all-gather produces the global extent there) and deflates
+        // it along every shard dim the target declares (a reduce-scatter keeps
+        // one slice). All-reduce completes a partial, whose shape was already
+        // the full local one, so its dims are untouched. The divisibility is
+        // guaranteed by instantiate's local-shape checks; an inflated extent
+        // that does not divide is reported rather than truncated.
+        for spec in &c.from.dims {
+            let degree = spec
+                .group
+                .degree(&mesh)
+                .map_err(|source| PlanError::Mesh { source })?;
+            converted.shape[spec.dim as usize] = converted.shape[spec.dim as usize]
+                .checked_mul(degree as i64)
+                .ok_or_else(|| {
+                    PlanError::Digest(format!(
+                        "the converted slot `{}` overflows along dim {} when gathered",
+                        plan.slot(c.slot).name,
+                        spec.dim
+                    ))
+                })?;
+        }
+        for spec in &c.to.dims {
+            let degree = spec
+                .group
+                .degree(&mesh)
+                .map_err(|source| PlanError::Mesh { source })?;
+            if converted.shape[spec.dim as usize] % degree as i64 != 0 {
+                return Err(PlanError::Shard {
+                    node: c.producer,
+                    source: ShardError::NotDivisible {
+                        dim: spec.dim,
+                        global: converted.shape[spec.dim as usize],
+                        divisor: degree as i64,
+                    },
+                });
+            }
+            converted.shape[spec.dim as usize] /= degree as i64;
+        }
         converted.layout = c.to;
 
         // The group travels as the mask's integer bits (decision 2): a mask

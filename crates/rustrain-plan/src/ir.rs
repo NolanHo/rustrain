@@ -511,6 +511,12 @@ pub mod intrinsic {
     /// group). Absent means equal split: every rank sends and receives the
     /// same number of elements along `dim`.
     pub const ATTR_SPLIT: &str = "split";
+    /// Attribute key carrying the source rank of `broadcast`, as its index
+    /// inside the group (0-based). Absent means group index 0 — the convention
+    /// for weight sync, which the transition rules never emit (their
+    /// conversions are all-reduce / all-gather / reduce-scatter); an explicit
+    /// plan node can name any member.
+    pub const ATTR_SRC: &str = "src";
 }
 
 #[cfg(test)]

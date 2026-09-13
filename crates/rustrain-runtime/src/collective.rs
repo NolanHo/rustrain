@@ -1,0 +1,892 @@
+//! Collective backends: what a spliced collective actually does.
+//!
+//! The plan compiler decides *where* communication happens; this module decides
+//! *how*. Two backends exist, both behind [`CollectiveBackend`] so an NCCL
+//! backend can replace them without the executor knowing:
+//!
+//! * [`SingleRank`] — the identity with a copy, correct precisely when the
+//!   world size is 1. It refuses anything else rather than pretending.
+//! * [`ThreadBackend`] — the D6 reference transport: N threads in one process,
+//!   one per rank, exchanging bytes through shared scratch buffers behind a
+//!   two-phase rendezvous.
+//!
+//! # Why threads and shared buffers
+//!
+//! D6 measures the *machinery*, not the transport: the reference provider is
+//! pure scalar Rust (invariant I-1), so no transport can make eight CPU ranks
+//! faster than one. The transport therefore has exactly one job — be obviously
+//! correct — and shared-memory threads are the least machinery that does it:
+//! no sockets, no wire protocol, no per-collective framing to desynchronise.
+//! Every collective is *meet → write my contribution → meet → read the group's
+//! contributions*, which is visibly right by construction, while an optimised
+//! ring or tree hides its correctness behind index arithmetic that is very easy
+//! to get subtly wrong.
+//!
+//! # Correctness argument
+//!
+//! **Lockstep.** All ranks execute the same compiled plan, which has the same
+//! node set on every rank (tp/cp/ep/dp change shapes and groups, never nodes;
+//! `pp > 1` is refused by the runner), so every rank walks the same sequence of
+//! collective calls. The rendezvous is keyed by that shared ordinal: it admits
+//! a rank only when all of them have reached the same call, and no rank can run
+//! ahead of the slowest. The two meets inside one call separate the write phase
+//! from the read phase, so no rank reads a contribution that has not been
+//! written.
+//!
+//! **Groups.** Every rank belongs to exactly one instance of every [`GroupMask`]
+//! (`Mesh::group_ranks`), so a collective over a subset of the world runs its
+//! exchange among that instance's members while the other instances exchange
+//! among themselves in the same shared slot table (one slot per *world rank*,
+//! so instances never alias).
+//!
+//! **Failure.** A poisoned rendezvous wakes every waiter with the recorded
+//! error instead of deadlocking: if any rank fails — at an operator, which
+//! `poison` is called for from the driver, or at a collective — the others
+//! finish their current call with that error and the driver joins cleanly.
+//!
+//! **`all_to_all` split ordering.** The plan's `split` (one positive entry per
+//! rank in the group, summing to the input's extent along `dim` — validated at
+//! compile time) partitions the *input* of every rank into per-destination
+//! chunks: chunk `i` goes to the member with group index `i`. Rank `r` receives
+//! `split[r]` elements from every member, concatenated in ascending group-index
+//! order, so its output extent along `dim` is `degree × split[r]`. Both facts
+//! are re-validated here against the real tensor shapes before any byte moves —
+//! a plan whose `split` does not match the local extents is a reported error,
+//! never a silent mis-redistribution.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Condvar, Mutex};
+
+use rustrain_abi::ffi::RsTensor;
+use rustrain_parallel::{GroupMask, Mesh, ReduceOp};
+
+/// The collectives a runtime backend must perform. The plugin ABI's
+/// `RsCollectiveKind` does not carry `broadcast` or `sync`, so the runtime
+/// vocabulary is its own enum; the executor maps the plan's intrinsic names
+/// onto it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CollectiveKind {
+    AllReduce,
+    AllGather,
+    ReduceScatter,
+    Broadcast,
+    AllToAll,
+    Sync,
+}
+
+impl CollectiveKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CollectiveKind::AllReduce => "all_reduce",
+            CollectiveKind::AllGather => "all_gather",
+            CollectiveKind::ReduceScatter => "reduce_scatter",
+            CollectiveKind::Broadcast => "broadcast",
+            CollectiveKind::AllToAll => "all_to_all",
+            CollectiveKind::Sync => "sync",
+        }
+    }
+}
+
+/// Everything a spliced collective step carries, in one request.
+pub struct CollectiveRequest {
+    pub kind: CollectiveKind,
+    pub group: GroupMask,
+    /// `all_reduce` only.
+    pub reduce: Option<ReduceOp>,
+    /// `all_gather` / `reduce_scatter` / `all_to_all` only.
+    pub dim: Option<i64>,
+    /// `all_to_all` only: the per-rank send sizes along `dim` (one entry per
+    /// rank in the group). `None` = equal split.
+    pub split: Option<Vec<i64>>,
+    /// `broadcast` only: the source rank's index inside the group.
+    pub src: Option<usize>,
+}
+
+/// What one collective call moved, seen from this rank.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CollectiveReport {
+    /// Bytes this rank handed to the exchange.
+    pub sent_bytes: u64,
+    /// Bytes this rank took out of it.
+    pub recv_bytes: u64,
+}
+
+/// Performs the collective a spliced node represents.
+///
+/// `input` is the collective's operand (possibly a strided view); `output` is
+/// where the result lands — either the input's storage (in-place, when the
+/// executor aliased it) or a dedicated buffer. The backend must read all of
+/// `input` before writing `output` (the two may be one buffer) and must honour
+/// both descriptors' shapes and strides.
+pub trait CollectiveBackend {
+    fn execute(
+        &mut self,
+        req: &CollectiveRequest,
+        input: &RsTensor,
+        output: &mut RsTensor,
+    ) -> Result<CollectiveReport, String>;
+}
+
+/// The identity backend.
+///
+/// Correct precisely when nothing is actually distributed, and the only thing
+/// that can back a sharded plan inside one process. It refuses when the world
+/// size is larger than one rather than silently pretending: a plan whose
+/// sharding requires a real all-reduce cannot be executed correctly by doing
+/// nothing.
+#[derive(Debug, Default)]
+pub struct SingleRank {
+    world_size: usize,
+}
+
+impl SingleRank {
+    pub fn new(world_size: usize) -> Self {
+        Self { world_size }
+    }
+}
+
+impl CollectiveBackend for SingleRank {
+    fn execute(
+        &mut self,
+        req: &CollectiveRequest,
+        input: &RsTensor,
+        output: &mut RsTensor,
+    ) -> Result<CollectiveReport, String> {
+        if self.world_size > 1 {
+            return Err(format!(
+                "collective {} on group {} was requested with world_size={}, but no \
+                 distributed backend is installed",
+                req.kind.as_str(),
+                req.group,
+                self.world_size
+            ));
+        }
+        // World size 1: every collective is the identity, and a degree-1 group
+        // makes the declared shapes agree by construction (the gather is over
+        // one slice, the split has one entry — the whole tensor, validated at
+        // compile time).
+        let bytes = copy_tensor(input, output)?;
+        Ok(CollectiveReport {
+            sent_bytes: 0,
+            recv_bytes: bytes,
+        })
+    }
+}
+
+// ── the shared-memory multi-rank backend ─────────────────────────────────────
+
+/// State shared by every rank of one [`ThreadBackend`] world.
+pub struct ThreadShared {
+    world: usize,
+    state: Mutex<RendezvousState>,
+    cv: Condvar,
+    /// Collective ordinal → one contiguous byte slot per world rank. Keyed by
+    /// ordinal because the ranks visit collectives in lockstep: the same key is
+    /// current on every rank at the same time, and consecutive calls never
+    /// alias.
+    scratch: Mutex<HashMap<u64, Vec<Vec<u8>>>>,
+}
+
+#[derive(Default)]
+struct RendezvousState {
+    /// The ordinal the rendezvous currently admits.
+    generation: u64,
+    /// Arrivals at the current `gen`.
+    arrived: usize,
+    /// Set when any rank fails; every waiter is then woken with this error.
+    failed: Option<String>,
+}
+
+impl ThreadShared {
+    pub fn new(world: usize) -> Arc<Self> {
+        Arc::new(Self {
+            world,
+            state: Mutex::new(RendezvousState::default()),
+            cv: Condvar::new(),
+            scratch: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Records a failure and wakes every blocked rank. Idempotent.
+    pub fn poison(&self, message: &str) {
+        let mut state = self.state.lock().expect("rendezvous state poisoned");
+        state.failed.get_or_insert_with(|| message.to_string());
+        self.cv.notify_all();
+    }
+
+    /// Blocks until every rank has arrived at `generation`, or the world has failed.
+    fn meet(&self, generation: u64) -> Result<(), String> {
+        let mut state = self.state.lock().expect("rendezvous state poisoned");
+        loop {
+            if let Some(error) = &state.failed {
+                return Err(error.clone());
+            }
+            if state.generation == generation {
+                break;
+            }
+            // Cannot happen while the walk is in lockstep (a rank only admits
+            // the generation it has not reached yet), but do not block on a
+            // generation that already passed either.
+            if state.generation > generation {
+                return Ok(());
+            }
+            state = self.cv.wait(state).expect("rendezvous state poisoned");
+        }
+        state.arrived += 1;
+        if state.arrived == self.world {
+            state.generation += 1;
+            state.arrived = 0;
+            self.cv.notify_all();
+            return Ok(());
+        }
+        loop {
+            if let Some(error) = &state.failed {
+                return Err(error.clone());
+            }
+            if state.generation > generation {
+                return Ok(());
+            }
+            state = self.cv.wait(state).expect("rendezvous state poisoned");
+        }
+    }
+}
+
+/// The D6 reference transport: N threads in one process, one per rank.
+pub struct ThreadBackend {
+    rank: usize,
+    mesh: Mesh,
+    shared: Arc<ThreadShared>,
+    /// The number of collective calls this rank has executed; the rendezvous
+    /// ordinal (×2, for the two meets of one call).
+    ordinal: u64,
+}
+
+impl ThreadBackend {
+    pub fn new(rank: usize, mesh: Mesh, shared: Arc<ThreadShared>) -> Self {
+        Self {
+            rank,
+            mesh,
+            shared,
+            ordinal: 0,
+        }
+    }
+
+    /// Tells the rest of the world this rank cannot continue.
+    pub fn poison(&self, message: &str) {
+        self.shared.poison(message);
+    }
+
+    /// This rank's members of `group`, and its own index among them.
+    fn members(&self, group: GroupMask) -> Result<(Vec<usize>, usize), String> {
+        let members = self
+            .mesh
+            .group_ranks(group, self.rank)
+            .map_err(|e| e.to_string())?;
+        let index = self
+            .mesh
+            .group_index(group, self.rank)
+            .map_err(|e| e.to_string())?;
+        Ok((members, index))
+    }
+
+    /// Writes this rank's contribution into its scratch slot.
+    fn contribute(&self, ordinal: u64, bytes: &[u8]) {
+        let mut scratch = self.shared.scratch.lock().expect("scratch state poisoned");
+        let slots = scratch.entry(ordinal).or_default();
+        if slots.len() < self.shared.world {
+            slots.resize_with(self.shared.world, Vec::new);
+        }
+        slots[self.rank].clear();
+        slots[self.rank].extend_from_slice(bytes);
+    }
+
+    /// Reads one rank's contribution for this ordinal.
+    fn take(&self, ordinal: u64, from: usize) -> Vec<u8> {
+        let scratch = self.shared.scratch.lock().expect("scratch state poisoned");
+        scratch
+            .get(&ordinal)
+            .and_then(|slots| slots.get(from))
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+impl CollectiveBackend for ThreadBackend {
+    fn execute(
+        &mut self,
+        req: &CollectiveRequest,
+        input: &RsTensor,
+        output: &mut RsTensor,
+    ) -> Result<CollectiveReport, String> {
+        let ordinal = self.ordinal;
+        self.ordinal += 1;
+        let write_gen = ordinal * 2;
+        let read_gen = ordinal * 2 + 1;
+
+        // A failed rank must never block the world: report the recorded error
+        // before touching the rendezvous.
+        self.shared.meet(write_gen)?;
+
+        let width = element_width(input, output)?;
+
+        // `sync` exchanges no data; both meets still run so the ranks stay in
+        // lockstep.
+        if req.kind == CollectiveKind::Sync {
+            self.shared.meet(read_gen)?;
+            let bytes = copy_tensor(input, output)?;
+            return Ok(CollectiveReport {
+                sent_bytes: 0,
+                recv_bytes: bytes,
+            });
+        }
+
+        let (members, my_index) = self.members(req.group)?;
+        let degree = members.len();
+
+        // Validate the semantics against the real local shapes *before* any
+        // byte moves, then produce this rank's contribution.
+        let in_shape = logical_shape(input);
+        let out_shape = logical_shape(output);
+        let contribution: Vec<u8> = match req.kind {
+            CollectiveKind::AllReduce => {
+                if in_shape != out_shape {
+                    return Err(shape_error(req, &in_shape, &out_shape));
+                }
+                if req.reduce.is_none() {
+                    return Err(format!(
+                        "collective {} on group {} carries no reduction",
+                        req.kind.as_str(),
+                        req.group
+                    ));
+                }
+                materialise(input, width)
+            }
+            CollectiveKind::AllGather => {
+                let dim = resolve_dim(req, &in_shape)?;
+                let along = in_shape[dim];
+                let mut expected = in_shape.clone();
+                let gathered = along
+                    .checked_mul(degree as i64)
+                    .ok_or_else(|| "the gathered extent overflows".to_string())?;
+                expected[dim] = gathered;
+                if expected != out_shape {
+                    return Err(shape_error(req, &expected, &out_shape));
+                }
+                materialise(input, width)
+            }
+            CollectiveKind::ReduceScatter => {
+                let dim = resolve_dim(req, &in_shape)?;
+                let along = in_shape[dim];
+                if along % degree as i64 != 0 {
+                    return Err(format!(
+                        "reduce_scatter on group {}: the input holds {along} element(s) along \
+                         dim {dim}, which does not divide into {degree} rank(s)",
+                        req.group
+                    ));
+                }
+                let mut expected = in_shape.clone();
+                expected[dim] = along / degree as i64;
+                if expected != out_shape {
+                    return Err(shape_error(req, &expected, &out_shape));
+                }
+                materialise(input, width)
+            }
+            CollectiveKind::Broadcast => {
+                let src = req.src.unwrap_or(0);
+                if src >= degree {
+                    return Err(format!(
+                        "broadcast on group {}: source index {src} is out of range for a group \
+                         of {degree} rank(s)",
+                        req.group
+                    ));
+                }
+                if in_shape != out_shape {
+                    return Err(shape_error(req, &in_shape, &out_shape));
+                }
+                if my_index == src {
+                    materialise(input, width)
+                } else {
+                    Vec::new()
+                }
+            }
+            CollectiveKind::AllToAll => {
+                let dim = resolve_dim(req, &in_shape)?;
+                let along = in_shape[dim];
+                let sizes: Vec<i64> = match &req.split {
+                    Some(sizes) => {
+                        if sizes.len() != degree {
+                            return Err(format!(
+                                "all_to_all on group {}: the split holds {} entr(ies) for a \
+                                 group of {degree} rank(s)",
+                                req.group,
+                                sizes.len()
+                            ));
+                        }
+                        let sum: i64 = sizes.iter().sum();
+                        if sum != along {
+                            return Err(format!(
+                                "all_to_all on group {}: the split sums to {sum}, but the input \
+                                 holds {along} element(s) along dim {dim}",
+                                req.group
+                            ));
+                        }
+                        sizes.clone()
+                    }
+                    None => {
+                        if along % degree as i64 != 0 {
+                            return Err(format!(
+                                "all_to_all on group {}: the input holds {along} element(s) \
+                                 along dim {dim}, which does not split equally into {degree} \
+                                 rank(s)",
+                                req.group
+                            ));
+                        }
+                        vec![along / degree as i64; degree]
+                    }
+                };
+                // Split entry `i` = the input chunk destined for group index
+                // `i` (compiled that way, re-derived here). What I receive is
+                // `split[my_index]` from each of the `degree` senders.
+                let receive = sizes[my_index]
+                    .checked_mul(degree as i64)
+                    .ok_or_else(|| "the all_to_all output extent overflows".to_string())?;
+                let mut expected = in_shape.clone();
+                expected[dim] = receive;
+                if expected != out_shape {
+                    return Err(shape_error(req, &expected, &out_shape));
+                }
+                materialise(input, width)
+            }
+            CollectiveKind::Sync => unreachable!("handled above"),
+        };
+
+        let sent = contribution.len() as u64;
+        self.contribute(ordinal, &contribution);
+        self.shared.meet(read_gen)?;
+
+        // The result, built from the group's contributions. Every member's slot
+        // must hold exactly the bytes its rank contributed; anything else is a
+        // desynchronised world, reported before arithmetic on it.
+        let input_bytes = in_shape.iter().product::<i64>().max(0) as usize * width;
+        let result: Vec<u8> = match req.kind {
+            CollectiveKind::AllReduce => {
+                let op = req.reduce.expect("validated above");
+                let elements = contribution.len() / width;
+                let mut parts = Vec::with_capacity(degree);
+                for member in &members {
+                    let part = self.take(ordinal, *member);
+                    if part.len() != contribution.len() {
+                        return Err(mismatched_contribution(req, *member, &members));
+                    }
+                    parts.push(part);
+                }
+                reduce_parts(&parts, elements, op, width)?
+            }
+            CollectiveKind::AllGather => {
+                let dim = resolve_dim(req, &in_shape)?;
+                // Each member contributes its whole local slice. The gathered
+                // tensor places member `j`'s slab at `[j*along, (j+1)*along)`
+                // along `dim`; a per-element assembly over the output's
+                // row-major order is correct for any dim (plain concatenation
+                // would only be right when `dim` is the outermost axis).
+                let mut parts = Vec::with_capacity(degree);
+                for member in &members {
+                    let part = self.take(ordinal, *member);
+                    if part.len() != input_bytes {
+                        return Err(mismatched_contribution(req, *member, &members));
+                    }
+                    parts.push(part);
+                }
+                let along = in_shape[dim];
+                assemble(&parts, &in_shape, &out_shape, dim, width, |c| {
+                    ((c / along) as usize, c % along)
+                })
+            }
+            CollectiveKind::ReduceScatter => {
+                let dim = resolve_dim(req, &in_shape)?;
+                let elements = contribution.len() / width;
+                let mut parts = Vec::with_capacity(degree);
+                for member in &members {
+                    let part = self.take(ordinal, *member);
+                    if part.len() != contribution.len() {
+                        return Err(mismatched_contribution(req, *member, &members));
+                    }
+                    parts.push(part);
+                }
+                let full = reduce_parts(&parts, elements, ReduceOp::Sum, width)?;
+                let chunk = in_shape[dim] as usize / degree;
+                slice_axis(&full, &in_shape, dim, my_index * chunk, chunk, width)
+            }
+            CollectiveKind::Broadcast => {
+                let src_rank = members[req.src.unwrap_or(0)];
+                let part = self.take(ordinal, src_rank);
+                if part.len() != input_bytes {
+                    return Err(format!(
+                        "broadcast on group {}: source rank {src_rank} contributed {} byte(s) \
+                         but the tensor holds {input_bytes}",
+                        req.group,
+                        part.len()
+                    ));
+                }
+                part
+            }
+            CollectiveKind::AllToAll => {
+                let dim = resolve_dim(req, &in_shape)?;
+                let sizes: Vec<i64> = match &req.split {
+                    Some(sizes) => sizes.clone(),
+                    None => vec![in_shape[dim] / degree as i64; degree],
+                };
+                let mut starts = vec![0i64; degree];
+                for i in 1..degree {
+                    starts[i] = starts[i - 1] + sizes[i - 1];
+                }
+                // I receive `sizes[my_index]` elements along `dim` from every
+                // member; sender `j`'s slab is its input chunk
+                // `[starts[my_index], +sizes[my_index])`. Same per-element
+                // assembly as all_gather, keyed by the sender.
+                let mut parts = Vec::with_capacity(degree);
+                for member in &members {
+                    let part = self.take(ordinal, *member);
+                    if part.len() != input_bytes {
+                        return Err(mismatched_contribution(req, *member, &members));
+                    }
+                    parts.push(part);
+                }
+                let receive = sizes[my_index];
+                assemble(&parts, &in_shape, &out_shape, dim, width, |c| {
+                    ((c / receive) as usize, starts[my_index] + c % receive)
+                })
+            }
+            CollectiveKind::Sync => unreachable!("handled above"),
+        };
+
+        let recv = result.len() as u64;
+        scatter(output, &result, width)?;
+        Ok(CollectiveReport {
+            sent_bytes: sent,
+            recv_bytes: recv,
+        })
+    }
+}
+
+fn element_width(input: &RsTensor, output: &mut RsTensor) -> Result<usize, String> {
+    let in_width = input.dtype.byte_width().map(|w| w as usize);
+    let out_width = output.dtype.byte_width().map(|w| w as usize);
+    match (in_width, out_width) {
+        (Some(a), Some(b)) if a == b => Ok(a.max(1)),
+        _ => Err(format!(
+            "the collective's operands have unmappable dtypes ({} vs {})",
+            input.dtype, output.dtype
+        )),
+    }
+}
+
+/// The logical shape a descriptor presents (dims only; strides are the view's
+/// business and `materialise`/`scatter` handle them).
+fn logical_shape(t: &RsTensor) -> Vec<i64> {
+    t.dims().to_vec()
+}
+
+fn resolve_dim(req: &CollectiveRequest, shape: &[i64]) -> Result<usize, String> {
+    let rank = shape.len() as i64;
+    let dim = req.dim.unwrap_or(0);
+    let dim = if dim < 0 { dim + rank } else { dim };
+    if dim < 0 || dim >= rank {
+        return Err(format!(
+            "collective {} on group {}: dim {dim} is out of range for a rank-{rank} tensor",
+            req.kind.as_str(),
+            req.group
+        ));
+    }
+    Ok(dim as usize)
+}
+
+fn shape_error(req: &CollectiveRequest, expected: &[i64], actual: &[i64]) -> String {
+    format!(
+        "collective {} on group {}: the exchange produces shape {expected:?}, but the output \
+         slot holds {actual:?}",
+        req.kind.as_str(),
+        req.group
+    )
+}
+
+fn mismatched_contribution(req: &CollectiveRequest, rank: usize, members: &[usize]) -> String {
+    format!(
+        "collective {} on group {}: rank {rank} (member of {members:?}) contributed a \
+         different number of bytes than the rest; the ranks are no longer in lockstep",
+        req.kind.as_str(),
+        req.group
+    )
+}
+
+/// Copies a strided view into a contiguous buffer, in row-major logical order.
+fn materialise(t: &RsTensor, width: usize) -> Vec<u8> {
+    let shape = logical_shape(t);
+    let rank = (t.rank as usize).min(shape.len());
+    let strides = &t.stride[..rank];
+    let total: usize = shape[..rank].iter().product::<i64>().max(0) as usize;
+    let mut out = vec![0u8; total * width];
+    if total == 0 || t.data.is_null() {
+        return out;
+    }
+    let mut index = vec![0i64; rank];
+    for linear in 0..total {
+        let mut offset = 0i64;
+        for d in 0..rank {
+            offset += index[d] * strides[d];
+        }
+        // SAFETY: the descriptor was produced over a buffer holding exactly
+        // `total` reachable elements with these strides.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (t.data as *const u8).add(offset as usize * width),
+                out.as_mut_ptr().add(linear * width),
+                width,
+            );
+        }
+        for d in (0..rank).rev() {
+            index[d] += 1;
+            if index[d] < shape[d] {
+                break;
+            }
+            index[d] = 0;
+        }
+    }
+    out
+}
+
+/// Writes a contiguous row-major result into a (possibly strided) descriptor.
+fn scatter(t: &mut RsTensor, data: &[u8], width: usize) -> Result<(), String> {
+    let shape = logical_shape(t);
+    let rank = (t.rank as usize).min(shape.len());
+    let strides = &t.stride[..rank];
+    let total: usize = shape[..rank].iter().product::<i64>().max(0) as usize;
+    if data.len() != total * width {
+        return Err(format!(
+            "the collective produced {} byte(s) but the output holds {total} element(s) of \
+             {width} byte(s)",
+            data.len()
+        ));
+    }
+    if t.data.is_null() {
+        return Err("the collective's output slot has no data pointer".to_string());
+    }
+    let mut index = vec![0i64; rank];
+    for linear in 0..total {
+        let mut offset = 0i64;
+        for d in 0..rank {
+            offset += index[d] * strides[d];
+        }
+        // SAFETY: as in `materialise`, mirrored for the write side.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr().add(linear * width),
+                (t.data as *mut u8).add(offset as usize * width),
+                width,
+            );
+        }
+        for d in (0..rank).rev() {
+            index[d] += 1;
+            if index[d] < shape[d] {
+                break;
+            }
+            index[d] = 0;
+        }
+    }
+    Ok(())
+}
+
+/// Copies one tensor into another, honouring both descriptors' shapes and
+/// strides. The shapes must agree; the data layouts need not.
+fn copy_tensor(input: &RsTensor, output: &mut RsTensor) -> Result<u64, String> {
+    let width = {
+        let in_width = input.dtype.byte_width().map(|w| w as usize);
+        let out_width = output.dtype.byte_width().map(|w| w as usize);
+        match (in_width, out_width) {
+            (Some(a), Some(b)) if a == b => a.max(1),
+            _ => {
+                return Err(format!(
+                    "the collective's operands have unmappable dtypes ({} vs {})",
+                    input.dtype, output.dtype
+                ));
+            }
+        }
+    };
+    if logical_shape(input) != logical_shape(output) {
+        return Err(format!(
+            "the collective's operands have different logical shapes ({:?} vs {:?})",
+            logical_shape(input),
+            logical_shape(output)
+        ));
+    }
+    let data = materialise(input, width);
+    scatter(output, &data, width)?;
+    Ok(data.len() as u64)
+}
+
+/// Elementwise reduction over equal-length byte buffers, `width` bytes per
+/// element. Only the widths the reference provider executes (f32/f64) are
+/// reduced; the plan is widened to f32 before any run, and anything else is a
+/// reported error rather than a guessed reduction.
+fn reduce_parts(
+    parts: &[Vec<u8>],
+    elements: usize,
+    op: ReduceOp,
+    width: usize,
+) -> Result<Vec<u8>, String> {
+    let mut out = vec![0u8; elements * width];
+    match width {
+        4 => {
+            let mut acc: Vec<f32> = vec![0.0; elements];
+            let mut first = true;
+            for part in parts {
+                if part.len() != elements * width {
+                    return Err(format!(
+                        "a rank contributed {} byte(s) for a {}-element reduction",
+                        part.len(),
+                        elements
+                    ));
+                }
+                let values: Vec<f32> = part
+                    .chunks_exact(4)
+                    .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                if first {
+                    acc.copy_from_slice(&values);
+                    first = false;
+                } else {
+                    for (a, v) in acc.iter_mut().zip(&values) {
+                        *a = match op {
+                            ReduceOp::Sum => *a + *v,
+                            ReduceOp::Max => a.max(*v),
+                            ReduceOp::Min => a.min(*v),
+                        };
+                    }
+                }
+            }
+            for (a, bytes) in acc.iter().zip(out.chunks_exact_mut(4)) {
+                bytes.copy_from_slice(&a.to_ne_bytes());
+            }
+        }
+        8 => {
+            let mut acc: Vec<f64> = vec![0.0; elements];
+            let mut first = true;
+            for part in parts {
+                if part.len() != elements * width {
+                    return Err(format!(
+                        "a rank contributed {} byte(s) for a {}-element reduction",
+                        part.len(),
+                        elements
+                    ));
+                }
+                let values: Vec<f64> = part
+                    .chunks_exact(8)
+                    .map(|c| f64::from_ne_bytes(c.try_into().expect("8-byte chunks")))
+                    .collect();
+                if first {
+                    acc.copy_from_slice(&values);
+                    first = false;
+                } else {
+                    for (a, v) in acc.iter_mut().zip(&values) {
+                        *a = match op {
+                            ReduceOp::Sum => *a + *v,
+                            ReduceOp::Max => a.max(*v),
+                            ReduceOp::Min => a.min(*v),
+                        };
+                    }
+                }
+            }
+            for (a, bytes) in acc.iter().zip(out.chunks_exact_mut(8)) {
+                bytes.copy_from_slice(&a.to_ne_bytes());
+            }
+        }
+        other => {
+            return Err(format!(
+                "the reference collective backend reduces 4- and 8-byte elements, not \
+                 {other}-byte ones; run the plan at f32"
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Copies the `[start, start + len)` sub-tensor along `dim` out of a row-major
+/// buffer (element-wise gather over the output's order).
+fn slice_axis(
+    values: &[u8],
+    shape: &[i64],
+    dim: usize,
+    start: usize,
+    len: usize,
+    width: usize,
+) -> Vec<u8> {
+    let strides = row_major_strides(shape);
+    let mut out_shape: Vec<usize> = shape.iter().map(|d| *d as usize).collect();
+    out_shape[dim] = len;
+    let total: usize = out_shape.iter().product();
+    let mut out = vec![0u8; total * width];
+    let mut index = vec![0usize; out_shape.len()];
+    for dst in out.chunks_exact_mut(width) {
+        let mut offset = start * strides[dim];
+        for (i, count) in index.iter().enumerate() {
+            offset += *count * strides[i];
+        }
+        dst.copy_from_slice(&values[offset * width..offset * width + width]);
+        for d in (0..out_shape.len()).rev() {
+            index[d] += 1;
+            if index[d] < out_shape[d] {
+                break;
+            }
+            index[d] = 0;
+        }
+    }
+    out
+}
+
+/// Assembles an exchange result element by element: for every output coordinate
+/// along `dim`, `map` says which member's local buffer holds the element and at
+/// which local coordinate along `dim`. Correct for any dim, because the walk
+/// follows the output's row-major order explicitly instead of assuming a
+/// contiguous concatenation.
+fn assemble(
+    parts: &[Vec<u8>],
+    in_shape: &[i64],
+    out_shape: &[i64],
+    dim: usize,
+    width: usize,
+    map: impl Fn(i64) -> (usize, i64),
+) -> Vec<u8> {
+    let total: usize = out_shape.iter().product::<i64>().max(0) as usize;
+    let mut out = vec![0u8; total * width];
+    let local_strides = row_major_strides(in_shape);
+    let mut index = vec![0i64; out_shape.len()];
+    for linear in 0..total {
+        let (member, local) = map(index[dim]);
+        let mut offset: i64 = local * local_strides[dim] as i64;
+        for (d, count) in index.iter().enumerate() {
+            if d == dim {
+                continue;
+            }
+            offset += *count * local_strides[d] as i64;
+        }
+        let src = &parts[member][offset as usize * width..offset as usize * width + width];
+        out[linear * width..linear * width + width].copy_from_slice(src);
+        for d in (0..out_shape.len()).rev() {
+            index[d] += 1;
+            if index[d] < out_shape[d] {
+                break;
+            }
+            index[d] = 0;
+        }
+    }
+    out
+}
+
+/// Row-major strides (in elements).
+fn row_major_strides(shape: &[i64]) -> Vec<usize> {
+    let mut strides = vec![1usize; shape.len()];
+    for d in (0..shape.len().saturating_sub(1)).rev() {
+        strides[d] = strides[d + 1] * shape[d + 1].max(0) as usize;
+    }
+    strides
+}

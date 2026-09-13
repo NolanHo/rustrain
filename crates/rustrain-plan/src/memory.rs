@@ -222,8 +222,8 @@ pub fn plan(
     }
 
     let lifetimes = compute_lifetimes(plan);
-    let aliases = compute_aliases(plan);
     let sizes = slot_bytes(plan);
+    let aliases = compute_aliases(plan, &sizes);
 
     // The requested policy per node. Intrinsics and plan inputs keep everything.
     let mut policy: Vec<ActivationPolicy> = plan
@@ -598,6 +598,22 @@ fn compute_lifetimes(plan: &Plan) -> Vec<Lifetime> {
         }
     }
 
+    // A `view` output aliases its input's storage — the operator hands back
+    // the input's own descriptor and the executor adopts it, no copy — so the
+    // input must stay live exactly as long as the output. Without this
+    // extension a view whose output is kept to the end of the plan (the
+    // runner's hidden-state keeper) would "keep alive" a buffer the pool has
+    // already handed to a later activation, and reading the input afterwards
+    // reads that later activation instead.
+    for node in &plan.nodes {
+        if node.op.name == "view" && node.inputs.len() == 1 && node.outputs.len() == 1 {
+            let input = node.inputs[0];
+            let output = node.outputs[0];
+            let out_dies = dies[output.0].unwrap_or(n_steps);
+            dies[input.0] = Some(dies[input.0].map_or(out_dies, |d: usize| d.max(out_dies)));
+        }
+    }
+
     (0..plan.slots.len())
         .map(|i| Lifetime {
             slot: SlotId(i),
@@ -611,7 +627,13 @@ fn compute_lifetimes(plan: &Plan) -> Vec<Lifetime> {
 
 /// Spliced collectives reduce in place, so their output shares the input's
 /// storage. Resolved here so peak accounting counts it once.
-fn compute_aliases(plan: &Plan) -> Vec<Option<SlotId>> {
+/// A spliced collective's output shares its input's storage — but only while
+/// the output fits: an `all_gather` (or an uneven `all_to_all`) produces more
+/// bytes than it consumes, so aliasing it onto the input would hand the runtime
+/// a buffer the result cannot fit in. Such outputs get a real pool placement
+/// instead; the runtime then hands the backend two descriptors and it copies
+/// input → output. A `reduce_scatter` (smaller output) still aliases.
+fn compute_aliases(plan: &Plan, sizes: &[u64]) -> Vec<Option<SlotId>> {
     let mut aliases: Vec<Option<SlotId>> = vec![None; plan.slots.len()];
     for node in &plan.nodes {
         if !intrinsic::is_intrinsic(&node.op.name) {
@@ -621,7 +643,9 @@ fn compute_aliases(plan: &Plan) -> Vec<Option<SlotId>> {
             continue;
         };
         let root = aliases[input.0].unwrap_or(*input);
-        aliases[output.0] = Some(root);
+        if sizes[output.0] <= sizes[root.0] {
+            aliases[output.0] = Some(root);
+        }
     }
     aliases
 }
