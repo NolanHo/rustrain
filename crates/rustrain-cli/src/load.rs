@@ -78,14 +78,29 @@ struct Sink {
     bytes: u64,
 }
 
-/// One weight slot's data, ready to write into the executor.
+/// One weight slot's data — or a slice of it — ready to write into the executor.
+///
+/// A weight is streamed in chunks of `CHUNK_BYTES` rather than materialised whole: the host copies
+/// it once instead of three times, and the device copy starts before the last chunk is prepared.
+/// `element_offset` is where this chunk starts in the slot's row-major element order.
 pub(crate) struct LoadedWeight {
     /// The slot in the **instantiated** (local) plan.
     pub slot: SlotId,
     pub name: String,
-    /// Widened to f32, laid out contiguously in row-major order of the slot's local shape.
+    /// Where this chunk starts, in elements of the slot's local shape.
+    pub element_offset: usize,
+    /// Widened to f32, laid out contiguously in row-major order of the chunk's own shape.
     pub values: Vec<f32>,
 }
+
+/// How large a chunk a member is streamed in.
+///
+/// One member used to be materialised as a single `Vec<f32>`: a 40 MB weight became 40 MB of host
+/// allocation touched three times (fill writes it, the copy reads it, the device reads it), and the
+/// fresh allocation faulted its pages in every time. Eight megabytes keeps a chunk inside L2/L3
+/// across the fill→copy handoff while still being large enough that the per-chunk overhead (one
+/// channel message, one driver call) is nothing.
+const CHUNK_BYTES: usize = 8 << 20;
 
 /// How many tensors are read and prepared at once.
 ///
@@ -332,6 +347,13 @@ pub(crate) fn load_weights(
     // hand back all of it whenever the fill runs faster than the copies do (it does: ~9 s of fill
     // against ~19 s of copies). One slot in flight per worker is the bound.
     let (tx, rx) = std::sync::mpsc::sync_channel::<LoadedWeight>(workers);
+    // Warm chunk buffers: a streamed member is filled into one of these and the writer hands it
+    // back after the device copy. Without the pool every 8 MiB chunk is a fresh allocation whose
+    // pages must be faulted in before the copy can read them — and the copy is the load's
+    // bottleneck (spec.md §D6.10), so the faults were being paid on the critical path. Bounded:
+    // the workers and the channel can hold a few chunks each, and nothing else wants one.
+    let pool: std::sync::Arc<std::sync::Mutex<Vec<Vec<f32>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(2 * workers + 4)));
     let mut sink = Sink {
         seen: vec![false; plan.slots.len()],
         ..Sink::default()
@@ -350,6 +372,7 @@ pub(crate) fn load_weights(
         let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
             let tx = tx.clone();
+            let pool = std::sync::Arc::clone(&pool);
             // Only the sender moves; the pool's shared state stays borrowed, so the calling
             // thread still owns `outcomes` and the sink after the scope.
             let (abort, next, groups, outcomes) = (&abort, &next, &groups, &outcomes);
@@ -362,7 +385,7 @@ pub(crate) fn load_weights(
                     let Some(group) = groups.get(index) else {
                         break;
                     };
-                    let outcome = load_group(group, rank, &tx, abort);
+                    let outcome = load_group(group, rank, &pool, &tx, abort);
                     outcomes
                         .lock()
                         .expect("the loader's result lock")
@@ -391,7 +414,7 @@ pub(crate) fn load_weights(
             write_wait += waited.elapsed();
             let started = Instant::now();
             let copied = executor
-                .write_f32(weight.slot, &weight.values)
+                .write_f32_at(weight.slot, weight.element_offset, &weight.values)
                 .with_context(|| format!("writing the weight slot `{}`", weight.name));
             write_busy += started.elapsed();
             let () = match copied {
@@ -402,8 +425,17 @@ pub(crate) fn load_weights(
                 }
             };
             sink.bytes += (weight.values.len() * 4) as u64;
-            sink.slots += 1;
-            sink.seen[weight.slot.0] = true;
+            // A streamed weight arrives as several chunks; the slot is counted once, when its
+            // first chunk lands, and `seen` is simply idempotent.
+            if !sink.seen[weight.slot.0] {
+                sink.slots += 1;
+                sink.seen[weight.slot.0] = true;
+            }
+            // Hand the buffer back for the next chunk: it is warm, which is the whole point.
+            let mut pool = pool.lock().expect("the chunk pool");
+            if pool.len() < 2 * workers + 4 {
+                pool.push(weight.values);
+            }
         }
 
         // Reaching here means `rx` yielded everything it ever will: either every worker finished
@@ -635,7 +667,49 @@ impl Cuts {
     /// `window` is the checkpoint element the buffer's first byte holds: the read is narrowed to
     /// the group's span, so every offset is relative to it.
     fn fill(&self, bytes: &[u8], dtype: &str, strides: &[i64], window: i64) -> Result<Vec<f32>> {
-        let shape: Vec<usize> = self.axes.iter().map(|(_, _, len)| *len as usize).collect();
+        let rows = self.axes.first().map(|(_, _, len)| *len).unwrap_or(1);
+        self.fill_chunk(bytes, dtype, strides, window, 0, rows as usize)
+    }
+
+    /// The member's outer axis slice `[start, start + rows)`, as [`Cuts::fill`] would produce it.
+    ///
+    /// The walk is linear in the outermost axis — its checkpoint step is one constant — so a slice
+    /// is the same walk with one fewer axis and the base moved by `start * step[0]`. Nothing is
+    /// recomputed and nothing is duplicated: the member is exactly the concatenation of its slices,
+    /// which is what lets the loader stream a weight to the device in pieces instead of
+    /// materialising all of it first.
+    fn fill_chunk(
+        &self,
+        bytes: &[u8],
+        dtype: &str,
+        strides: &[i64],
+        window: i64,
+        start: i64,
+        rows: usize,
+    ) -> Result<Vec<f32>> {
+        let mut out = Vec::new();
+        self.fill_chunk_into(&mut out, bytes, dtype, strides, window, start, rows)?;
+        Ok(out)
+    }
+
+    /// [`Cuts::fill_chunk`] into a caller-owned buffer, so a streamed member can reuse one warm
+    /// allocation per worker instead of faulting a fresh one in for every chunk.
+    ///
+    /// Eight arguments is deliberate: the buffer, the bytes, the dtype, the checkpoint strides, the
+    /// read window, the slice and its length are all facts the caller already holds, and bundling
+    /// them into a struct would exist only to satisfy this lint.
+    #[allow(clippy::too_many_arguments)]
+    fn fill_chunk_into(
+        &self,
+        out: &mut Vec<f32>,
+        bytes: &[u8],
+        dtype: &str,
+        strides: &[i64],
+        window: i64,
+        start: i64,
+        rows: usize,
+    ) -> Result<()> {
+        let mut shape: Vec<usize> = self.axes.iter().map(|(_, _, len)| *len as usize).collect();
         let step: Vec<i64> = self
             .axes
             .iter()
@@ -647,26 +721,47 @@ impl Cuts {
             .map(|(axis, start, _)| start * strides[*axis])
             .sum::<i64>()
             - window;
+        // The slice: the outer axis contributes `start` of its own steps, and the walk then covers
+        // `rows` of them instead of the whole axis.
+        let base = if let Some(step) = step.first().copied() {
+            base + start * step
+        } else {
+            base
+        };
+        if let Some(first) = shape.first_mut() {
+            *first = rows;
+        }
         match dtype {
-            "bf16" => Ok(walk(&shape, &step, base, |offset| {
-                let byte = offset as usize * 2;
-                f32::from_bits((u16::from_le_bytes([bytes[byte], bytes[byte + 1]]) as u32) << 16)
-            })),
-            "f16" => Ok(walk(&shape, &step, base, |offset| {
-                f16_to_f32(u16::from_le_bytes([
-                    bytes[(offset as usize) * 2],
-                    bytes[(offset as usize) * 2 + 1],
-                ]))
-            })),
-            "f32" => Ok(walk(&shape, &step, base, |offset| {
-                let byte = offset as usize * 4;
-                f32::from_le_bytes([
-                    bytes[byte],
-                    bytes[byte + 1],
-                    bytes[byte + 2],
-                    bytes[byte + 3],
-                ])
-            })),
+            "bf16" => {
+                walk_into(out, &shape, &step, base, |offset| {
+                    let byte = offset as usize * 2;
+                    f32::from_bits(
+                        (u16::from_le_bytes([bytes[byte], bytes[byte + 1]]) as u32) << 16,
+                    )
+                });
+                Ok(())
+            }
+            "f16" => {
+                walk_into(out, &shape, &step, base, |offset| {
+                    f16_to_f32(u16::from_le_bytes([
+                        bytes[(offset as usize) * 2],
+                        bytes[(offset as usize) * 2 + 1],
+                    ]))
+                });
+                Ok(())
+            }
+            "f32" => {
+                walk_into(out, &shape, &step, base, |offset| {
+                    let byte = offset as usize * 4;
+                    f32::from_le_bytes([
+                        bytes[byte],
+                        bytes[byte + 1],
+                        bytes[byte + 2],
+                        bytes[byte + 3],
+                    ])
+                });
+                Ok(())
+            }
             // `dtype_width` is the loader's one gate on loadable dtypes and runs before any
             // bytes are read, so an unknown one is a bug here rather than a user error.
             other => unreachable!("dtype_width admitted `{other}` but `fill` cannot read it"),
@@ -676,23 +771,30 @@ impl Cuts {
 
 /// Walks `shape` in row-major order, reading `read(offset)` and stepping the source offset by
 /// `step[axis]` as each axis advances.
-fn walk<F: Fn(i64) -> f32>(shape: &[usize], step: &[i64], base: i64, read: F) -> Vec<f32> {
+fn walk_into<F: Fn(i64) -> f32>(
+    out: &mut Vec<f32>,
+    shape: &[usize],
+    step: &[i64],
+    base: i64,
+    read: F,
+) {
     let total: usize = shape.iter().product();
-    let mut out: Vec<f32> = Vec::with_capacity(total);
+    out.clear();
+    out.reserve(total);
     if total == 0 {
-        return out;
+        return;
     }
     // A scalar tensor has no axes to walk: it is one element, and it is legal in a safetensors
     // header and in a description.
     if shape.is_empty() {
         out.push(read(base));
-        return out;
+        return;
     }
     if shape.len() == 1 {
         for i in 0..shape[0] {
             out.push(read(base + i as i64 * step[0]));
         }
-        return out;
+        return;
     }
     let mut index = vec![0usize; shape.len()];
     let mut offset = base;
@@ -708,7 +810,7 @@ fn walk<F: Fn(i64) -> f32>(shape: &[usize], step: &[i64], base: i64, read: F) ->
             index[axis] = 0;
             offset -= (shape[axis] as i64 - 1) * step[axis];
             if axis == 0 {
-                return out;
+                return;
             }
             axis -= 1;
         }
@@ -728,6 +830,7 @@ fn strides_of(shape: &[i64]) -> Vec<i64> {
 fn load_group(
     group: &Group,
     rank: usize,
+    pool: &std::sync::Mutex<Vec<Vec<f32>>>,
     sink: &std::sync::mpsc::SyncSender<LoadedWeight>,
     abort: &std::sync::atomic::AtomicBool,
 ) -> Result<LoadStats> {
@@ -790,6 +893,7 @@ fn load_group(
                 .send(LoadedWeight {
                     slot: member.slot,
                     name: member.slot_name.clone(),
+                    element_offset: 0,
                     values,
                 })
                 .is_err()
@@ -869,20 +973,51 @@ fn load_group(
             break;
         }
         let member = &group.members[index];
-        let fill_started = Instant::now();
-        let values = cuts.fill(&bytes, &group.dtype, &strides, first)?;
-        stats.fill += fill_started.elapsed();
-        // A closed channel means the writer already failed; it reports its own error, so the
-        // workers just stop handing it tensors.
-        if sink
-            .send(LoadedWeight {
-                slot: member.slot,
-                name: member.slot_name.clone(),
-                values,
-            })
-            .is_err()
-        {
-            break;
+        // Stream the member's outer axis in chunks: the whole-member buffer the loader used to
+        // build cost three passes over it (fill, copy, device read) and a fresh page-faulting
+        // allocation each time (spec.md §D6.10 measured the load as copy-pipeline bound, 96% of the
+        // wall in the writer's span).
+        let rows = cuts.axes.first().map(|(_, _, len)| *len).unwrap_or(1);
+        let row_elements: usize = cuts
+            .axes
+            .iter()
+            .skip(1)
+            .map(|(_, _, len)| *len as usize)
+            .product();
+        let rows_per_chunk = (CHUNK_BYTES / 4 / row_elements.max(1)).max(1);
+        let mut row = 0i64;
+        while row < rows {
+            let take = (rows - row).min(rows_per_chunk as i64) as usize;
+            let fill_started = Instant::now();
+            let mut values = pool
+                .lock()
+                .expect("the chunk pool")
+                .pop()
+                .unwrap_or_default();
+            cuts.fill_chunk_into(
+                &mut values,
+                &bytes,
+                &group.dtype,
+                &strides,
+                first,
+                row,
+                take,
+            )?;
+            stats.fill += fill_started.elapsed();
+            // A closed channel means the writer already failed; it reports its own error, so the
+            // workers just stop handing it tensors.
+            if sink
+                .send(LoadedWeight {
+                    slot: member.slot,
+                    name: member.slot_name.clone(),
+                    element_offset: row as usize * row_elements,
+                    values,
+                })
+                .is_err()
+            {
+                return Ok(stats);
+            }
+            row += take as i64;
         }
     }
     Ok(stats)
@@ -1433,14 +1568,16 @@ mod tests {
             }],
         };
         let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        let pool = std::sync::Mutex::new(Vec::new());
 
         let aborted = std::sync::atomic::AtomicBool::new(true);
-        let stats = load_group(&group, 0, &tx, &aborted).expect("an aborted group reads nothing");
+        let stats =
+            load_group(&group, 0, &pool, &tx, &aborted).expect("an aborted group reads nothing");
         assert_eq!(stats.bytes_read, 0);
         assert_eq!(stats.tensors_read, 0);
 
         let running = std::sync::atomic::AtomicBool::new(false);
-        let error = load_group(&group, 0, &tx, &running)
+        let error = load_group(&group, 0, &pool, &tx, &running)
             .expect_err("without the flag the missing shard is a real error");
         assert!(
             format!("{error:#}").contains("shard"),
@@ -1503,8 +1640,10 @@ mod tests {
             }],
         };
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let pool = std::sync::Mutex::new(Vec::new());
         let running = std::sync::atomic::AtomicBool::new(false);
-        let stats = load_group(&group, 0, &tx, &running).expect("an empty tensor is not an error");
+        let stats =
+            load_group(&group, 0, &pool, &tx, &running).expect("an empty tensor is not an error");
         assert_eq!(stats.bytes_read, 0, "and it reads nothing");
         let delivered = rx.try_recv().expect("the member still arrives");
         assert_eq!(delivered.slot, SlotId(0));

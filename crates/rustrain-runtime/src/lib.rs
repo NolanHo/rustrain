@@ -564,6 +564,47 @@ impl Executor {
             })
     }
 
+    /// Writes part of a slot: `data` lands at `element_offset`, and the rest of the slot is left
+    /// alone.
+    ///
+    /// This is what lets a loader stream a weight in pieces instead of materialising all of it in
+    /// host memory first — the caller writes every range exactly once, and the slot is complete
+    /// when the last chunk lands. The range is bounds-checked here so a chunked writer cannot
+    /// scribble past its slot.
+    pub fn write_f32_at(
+        &mut self,
+        id: SlotId,
+        element_offset: usize,
+        data: &[f32],
+    ) -> Result<(), RuntimeError> {
+        self.check_f32(id)?;
+        let len = self.slot_len(id);
+        let end = element_offset.saturating_add(data.len());
+        if end > len {
+            return Err(RuntimeError::LengthMismatch {
+                slot: id,
+                name: self.plan.plan.slot(id).name.clone(),
+                expected: len,
+                actual: end,
+            });
+        }
+        let ptr = self.data_ptr(id)?;
+        let bytes = std::mem::size_of_val(data) as u64;
+        // SAFETY: `data` holds `data.len()` f32, so the byte view covers exactly `bytes`; the
+        // destination is `element_offset` f32 past the slot's start, and the check above proves the
+        // whole range is inside the allocation.
+        let raw = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, bytes as usize) };
+        // SAFETY: pointer arithmetic on the slot's own allocation, inside the bounds just checked.
+        let dst = unsafe { (ptr as *mut u8).add(element_offset * std::mem::size_of::<f32>()) };
+        self.allocator
+            .copy_in(dst as *mut c_void, bytes, raw)
+            .map_err(|reason| RuntimeError::Copy {
+                slot: id,
+                bytes,
+                reason,
+            })
+    }
+
     /// Reads a slot back as host f32 data.
     pub fn read_f32(&self, id: SlotId) -> Result<Vec<f32>, RuntimeError> {
         self.check_f32(id)?;
