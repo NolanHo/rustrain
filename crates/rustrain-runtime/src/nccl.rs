@@ -452,11 +452,13 @@ impl NcclBackend {
         (self.staged_calls, self.direct_calls)
     }
 
-    /// The communicator for `mask`, created on first use.
+    /// The communicator for `mask`, created on first use — and already there when `warm` ran.
     ///
-    /// Every member creates it at the same point of the same lockstep walk, and
-    /// `ncclCommInitRank` blocks until the whole group arrives — that blocking
-    /// handshake *is* the proof the world is in step.
+    /// Every member creates it, and `ncclCommInitRank` blocks until the whole group arrives — that
+    /// blocking handshake *is* the proof the world is in step. Where the handshake happens is the
+    /// caller's choice: `warm` runs it in the runner's load window, and a run that never calls
+    /// `warm` pays it here, inside the first collective that needs the group. Both are the same
+    /// rendezvous; only the clock it lands on differs.
     fn comm(&mut self, mask: GroupMask) -> Result<&mut Comm, String> {
         let key = mask.bits();
         if !self.comms.contains_key(&key) {
@@ -525,6 +527,10 @@ impl NcclBackend {
     }
 
     fn barrier(&mut self, mask: GroupMask, host: &mut dyn Allocator) -> Result<(), String> {
+        // An entry point owns making the retained context current on *its* thread: a warmed
+        // communicator returns from `comm()` without running the creation path that used to be the
+        // only place this happened.
+        self.context.set_current()?;
         let comm = self.comm(mask)?;
         let handle = comm.handle;
         if comm.barrier.is_none() {

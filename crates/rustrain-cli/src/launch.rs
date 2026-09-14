@@ -226,6 +226,11 @@ impl LaunchArgs {
     }
 }
 
+/// Whether the ranks were asked for a per-step trace (`RUSTRAIN_STEP_TRACE`).
+fn trace_requested() -> bool {
+    std::env::var_os("RUSTRAIN_STEP_TRACE").is_some()
+}
+
 fn mesh_text(cfg: &ParallelConfig) -> String {
     format!(
         "tp={}, cp={}, ep={}, dp={}, pp={}",
@@ -334,7 +339,12 @@ fn run_world(
     // them.
     let mut failures: Vec<String> = Vec::new();
     let mut results: Vec<Result<serde_json::Value>> = Vec::with_capacity(world);
-    for (rank, metrics, child) in children {
+    // A failed rank leaves the rest of the world parked in a collective it will never answer, and
+    // the collective backends block by design (that blocking handshake is how they prove the world
+    // is in step). So the first failure terminates the survivors: the run ends with the reason
+    // instead of hanging, which is the difference between a diagnosable bug and a stuck terminal.
+    let mut children = children.into_iter();
+    while let Some((rank, metrics, child)) = children.next() {
         let output = child
             .wait_with_output()
             .with_context(|| format!("waiting for rank {rank}"))?;
@@ -345,7 +355,27 @@ fn run_world(
                 tail(&String::from_utf8_lossy(&output.stderr), 12)
             ));
             results.push(Err(anyhow::anyhow!("rank {rank} exited unsuccessfully")));
-            continue;
+            for (other_rank, _, mut other) in children {
+                let killed = other.kill().is_ok();
+                let _ = other.wait();
+                failures.push(format!(
+                    "rank {other_rank} was {} because rank {rank} failed",
+                    if killed { "terminated" } else { "already gone" }
+                ));
+                results.push(Err(anyhow::anyhow!("rank {rank} failed first")));
+            }
+            break;
+        }
+        // A rank's stderr is captured, so a *successful* rank's diagnostics would be swallowed —
+        // which is exactly wrong for the opt-in step trace: it exists to be read. Only the trace's
+        // own lines are forwarded (the rest of a successful rank's stderr is progress chatter, and
+        // with four ranks it would bury the table it belongs to).
+        if trace_requested() {
+            for line in String::from_utf8_lossy(&output.stderr).lines() {
+                if line.contains("step trace") || line.contains("call(s),") {
+                    eprintln!("rank {rank}: {line}");
+                }
+            }
         }
         let text = match std::fs::read_to_string(&metrics) {
             Ok(text) => text,

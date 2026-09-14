@@ -109,8 +109,9 @@ pub(crate) struct RunArgs {
 
     /// Where the slot buffers live: `cpu` (default), `cuda`, or `cuda:<index>` (`cuda` alone is
     /// device 0). A CUDA device with a mesh whose world size is > 1 is refused up front **in this
-    /// process**: one CUDA context can only be current on one thread. `rustrain launch` runs the
-    /// world as one process per rank instead.
+    /// process**: a rank's buffers, its collectives and its callbacks belong to one execution
+    /// thread, and a second rank in the same process would have to interleave with it.
+    /// `rustrain launch` runs the world as one process per rank instead.
     #[arg(long, value_name = "SPEC", default_value = "cpu")]
     pub device: String,
 
@@ -900,15 +901,21 @@ fn run_rank(
     let mut warm_seconds = 0.0;
     if let Some(thread) = warm_thread {
         let joined_at = Instant::now();
+        // A failed warm stops the rank. Continuing would be worse than a crash: `comm()` publishes
+        // the rendezvous id *before* it initialises, so a retry at the first collective
+        // regenerates the id and overwrites the file while the peers are parked inside
+        // `ncclCommInitRank` with the previous one — a world-wide deadlock that no rank exits and
+        // no metric reports. Failing here leaves the peers to be terminated by the launcher, which
+        // reports *this* rank's reason.
         match thread.join() {
             Ok(Ok(())) => {}
-            Ok(Err(reason)) => eprintln!(
-                "rank {rank}: warming the collective groups failed ({reason}); the first \
-                 collective of that group will report it again"
+            Ok(Err(reason)) => bail!(
+                "rank {rank}: warming the collective groups failed: {reason}; the rank stops \
+                 rather than enter a rendezvous its peers have already left"
             ),
-            Err(_) => eprintln!(
-                "rank {rank}: the collective warm-up thread panicked; the first collective of \
-                 that group will report it again"
+            Err(_) => bail!(
+                "rank {rank}: the collective warm-up thread panicked; the rank stops rather than \
+                 enter a rendezvous its peers have already left"
             ),
         }
         warm_seconds = joined_at.elapsed().as_secs_f64();

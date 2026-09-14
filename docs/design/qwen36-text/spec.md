@@ -847,6 +847,40 @@ tp=8 八个 rank 的 `rest` 是 0.698–0.710 s、`other` 是 +0.0017…+0.0032 
 逐 rank 相同到毫秒级；墙钟差恰好等于 `first` 的差**。这正是"不是算力/代码路径不对称，而是到达偏差"
 的判据——审查指出这是原论证缺的那条腿，现在补上了。
 
+### D6.8 — 前向的 6 秒里，5.1 秒是两个算子体（2026-09，本轮）
+
+**能力**：`RUSTRAIN_STEP_TRACE=<n>`（opt-in）让执行器按**算子标签**聚合并打印最重的 n 个步骤到
+stderr；`launch` 在请求了 trace 时把各 rank 的这几行转发出来（rank 的 stderr 平时被捕获，只在失败
+时打印，所以成功的 rank 必须显式转发，否则 trace 正好被吞掉）。它不改变任何指标。
+
+**实测（tp=4，`cuda.aten.f32`，同一段 token）**，`step trace` 的 top 行：
+
+| 算子 | 调用 | S=8 总耗时 / 每次 | S=512 总耗时 / 每次 |
+|---|---|---|---|
+| **`moe_layer`** | 41 | **4.03 s / 98.2 ms** | **5.54 s / 135.0 ms** |
+| **`gated_delta_rule`** | 30 | **1.08 s / 36.0 ms** | 1.21 s / 40.4 ms |
+| `intrinsic.all_reduce` | 82 | 0.42 s / 5.1 ms | 0.28–0.84 s |
+| `rope` | 22 | 0.063 s | 0.13 s |
+| `linear` | 298 | 0.063 s / 0.21 ms | 0.058 s |
+| `rmsnorm` | 108 | 0.055 s | 0.052 s |
+| 其余 8 类 | — | 各 <0.05 s | 各 <0.05 s |
+| **合计** | 1411 步 | **5.86–6.11 s** | **7.41–8.01 s** |
+
+**读数**：`moe_layer` + `gated_delta_rule` = 全部前向时间的 **87%**；其余 1400 步加起来 <0.6 s。
+
+**为什么**（不是算力，也不是带宽）：token 数从 8 涨到 512（**64×**），`moe_layer` 只从 98 ms 涨到
+135 ms（1.37×）——说明成本几乎是**每次调用的固定开销**：ATen 参考体对**每个专家**做一次
+`index_select` + 三次小 matmul + `index_add_`，256 个专家的循环就是 ~100 ms，与有多少 token 路由过去
+无关。按每 rank 每层 768 MB 的专家权重算，135 ms 对应约 5.7 GB/s，远低于 HBM 带宽，同样证明它不在
+搬数据。`gated_delta_rule` 的 36–40 ms 同源（分块递推的 Python/ATen 循环）。
+
+**这是调试速度下一个最大的杠杆，但它是"换实现体"，属于你已保留裁定的范畴**：`moe_layer` 的
+descriptor 文档自己写着"A grouped GEMM (`torch._grouped_mm`, or an upstream kernel) is the fast path
+this body deliberately leaves for later"。方案是**加一个实现变体**（例如 `cuda.aten.f32.grouped`），
+参考体原样保留当 oracle（`ops check` 一致性门禁继续用它对照），recipe 里选变体——
+预计每次前向省 4–5 s（8 s → 3 s 量级）。代价是数值重验：S=512、tp=4 的验收已经跑过
+（`max|diff| 3.815e-5` / 界 `2.041e-4` PASS），换实现体后要按同样的判据重跑。
+
 ## 待解决
 
 **③ EP 的 dispatch/combine 落地方式待用户裁定**（改契约面，不擅自决定）：

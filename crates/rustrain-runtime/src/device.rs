@@ -13,14 +13,18 @@
 //!
 //! # Threading limitation
 //!
-//! A CUDA context can only be **current** on one host thread at a time. This
-//! allocator sets the primary context current on the thread that constructs it
-//! and uses it from the same thread, so **one allocator (one context) serves
-//! one execution thread**. A multi-rank CUDA launch therefore needs one
-//! process per rank; `rustrain run --rank i --world n` is that process (the
-//! CLI's `launch` subcommand starts them), and it refuses `--device cuda`
-//! with a mesh whose world size is > 1 *inside one process* — that refusal is
-//! the real guard, this comment is only the explanation.
+//! A CUDA context can only be **current** on one host thread at a time, so a
+//! thread that touches this allocator's buffers must make the context current
+//! first — which is exactly what [`crate::CudaAllocator`]'s entry points do.
+//! The practical rule is therefore *one allocator serves one execution thread at
+//! a time*: two threads may share the context (the primary context is
+//! process-wide, and the NCCL backend's warm-up thread does exactly that), but
+//! not call into the same allocator concurrently. A multi-rank CUDA launch still
+//! needs one process per rank, because a rank's collectives and its buffers
+//! belong together; `rustrain run --rank i --world n` is that process (the CLI's
+//! `launch` subcommand starts them), and `--device cuda` with a mesh whose world
+//! size is > 1 *inside one process* is refused — that refusal is the real guard,
+//! this comment is only the explanation.
 
 use std::ffi::c_void;
 

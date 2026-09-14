@@ -679,8 +679,20 @@ impl Executor {
         // more than one rank? A degree-1 group is a local copy, and letting one capture
         // `first_collective_nanos` would report a wait that no other rank can be part of.
         let mesh = self.plan.plan.meta.mesh.to_mesh().ok();
+        // An opt-in per-step trace, because "the forward took 6 s" is not a debugging surface: with
+        // small tensors a step's cost is neither FLOPs nor bytes, and only a per-label breakdown
+        // says which one to look at. `RUSTRAIN_STEP_TRACE=<n>` prints the n heaviest labels (by
+        // total time) to stderr and leaves every metric alone.
+        let trace_top: Option<usize> = std::env::var("RUSTRAIN_STEP_TRACE")
+            .ok()
+            .and_then(|value| value.parse().ok());
+        let mut traced: Vec<(String, u64)> = Vec::new();
+        // An explicit flag rather than "the field is still zero": a first collective that measured
+        // zero nanoseconds would be indistinguishable from "not yet".
+        let mut first_distributing_seen = false;
 
         for index in 0..self.plan.steps.len() {
+            let step_started = std::time::Instant::now();
             let mut adopted: Vec<(SlotId, RsTensor)> = Vec::new();
             let (inputs, outputs, label) = {
                 let step = &self.plan.steps[index];
@@ -748,7 +760,8 @@ impl Executor {
                         .and_then(|mesh| group.degree(mesh).ok())
                         .map(|degree| degree > 1)
                         .unwrap_or(false);
-                    if distributes && stats.first_collective_nanos == 0 {
+                    if distributes && !first_distributing_seen {
+                        first_distributing_seen = true;
                         stats.first_collective_nanos = nanos;
                     }
                     stats.collective_nanos += nanos;
@@ -844,6 +857,11 @@ impl Executor {
                 }
             }
 
+            if trace_top.is_some() {
+                let label = self.plan.steps[index].label();
+                traced.push((label, step_started.elapsed().as_nanos() as u64));
+            }
+
             for (slot, t) in adopted {
                 if let Some(buf) = self.buffers.get_mut(slot.0).and_then(Option::as_mut) {
                     buf.ptr = t.data;
@@ -859,6 +877,34 @@ impl Executor {
         }
 
         self.stats = stats.clone();
+        if let Some(top) = trace_top {
+            let mut by_label: std::collections::BTreeMap<String, (usize, u64)> =
+                std::collections::BTreeMap::new();
+            for (label, nanos) in &traced {
+                let entry = by_label.entry(label.clone()).or_default();
+                entry.0 += 1;
+                entry.1 += nanos;
+            }
+            let mut rows: Vec<(String, usize, u64)> = by_label
+                .into_iter()
+                .map(|(label, (count, total))| (label, count, total))
+                .collect();
+            rows.sort_by_key(|(_, _, total)| std::cmp::Reverse(*total));
+            let traced_total: u64 = rows.iter().map(|(_, _, total)| *total).sum();
+            eprintln!(
+                "step trace: {} step(s), {:.3} s inside them; heaviest {} label(s):",
+                traced.len(),
+                traced_total as f64 / 1e9,
+                top
+            );
+            for (label, count, total) in rows.into_iter().take(top) {
+                eprintln!(
+                    "  {label}: {count} call(s), {:.3} s total, {:.3} ms each",
+                    total as f64 / 1e9,
+                    total as f64 / 1e6 / count.max(1) as f64
+                );
+            }
+        }
         Ok(stats)
     }
 
