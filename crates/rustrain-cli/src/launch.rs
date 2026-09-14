@@ -375,6 +375,7 @@ fn run_world(
                 if line.contains("step trace")
                     || line.contains("call(s),")
                     || line.contains("slowest single step")
+                    || line.contains("staging:")
                     || line.trim_end().ends_with(" ms")
                 {
                     eprintln!("rank {rank}: {line}");

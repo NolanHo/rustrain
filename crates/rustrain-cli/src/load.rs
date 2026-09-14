@@ -61,6 +61,9 @@ pub(crate) struct LoadOutcome {
     /// hand over the next tensor — the number that says what the copies cost, and the one that
     /// would change if the copies were done with pinned memory or a wider transfer.
     pub write: Duration,
+    /// Time the calling thread spent *waiting* for the pool rather than copying. `write + write_wait`
+    /// is the writer's whole span, so the pair says which stage the load is bound by.
+    pub write_wait: Duration,
     /// How many workers the pool ran (`LOAD_WORKERS` capped by the group count); the phase times
     /// below are sums over them.
     pub workers: usize,
@@ -256,44 +259,15 @@ pub(crate) fn load_weights(
         if let Some((d, _, len)) = segment {
             after_segment[d] = len as i64;
         }
-        let mut shards: Vec<(usize, usize, usize)> = Vec::new();
-        for spec in &slot.layout.dims {
-            let d = axis(spec.dim, rank_dims).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "slot `{}`: shard dim {} is out of range for {}",
-                    slot.name,
-                    spec.dim,
-                    shape_text(&slot.shape)
-                )
-            })?;
-            let group = spec.group;
-            let (degree, coord) = group_degree_and_coord(mesh, rank, group).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "slot `{}`: shard group {group} cannot be sliced for rank {rank}",
-                    slot.name
-                )
-            })?;
-            if degree <= 1 {
-                continue;
-            }
-            let global = after_segment[d];
-            // The slab comes from the spec being sliced, not from `coord * global / degree`: a
-            // declared replicating axis (`tp` with fewer key/value heads than ranks) hands two
-            // coordinates the same slice, and only the spec's own mode knows that.
-            let (offset, local) = spec
-                .mode
-                .slab(global, coord as i64, degree as i64)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "slot `{}`: rank {rank} cannot take a slab of axis {d} (global {global}, \
-                         degree {degree}, mode {})",
-                        slot.name,
-                        spec.mode
-                    )
-                })?;
-            shards.push((d, offset as usize, local as usize));
-        }
-
+        let mut after_segment_here = after_segment.clone();
+        let shards = shard_slabs(
+            &slot.name,
+            &slot.layout.dims,
+            &mut after_segment_here,
+            rank_dims,
+            mesh,
+            rank,
+        )?;
         let key = (pair.tensor.clone(), binding.transform.clone());
         let index = match group_of.get(&key) {
             Some(index) => *index,
@@ -363,6 +337,12 @@ pub(crate) fn load_weights(
         ..Sink::default()
     };
     let mut write_busy = Duration::ZERO;
+    // Time the writer spent *waiting* for the pool rather than copying. Together with `write_busy`
+    // this says which side of the pipeline the load is bound by: a small wait means the writer is
+    // the bottleneck (the fix is cheaper copies), a large one means the producers are (the fix is
+    // more, or better-shaped, workers) — and the two have opposite fixes, which is why the number
+    // has to exist rather than be inferred from `read_cpu_seconds`.
+    let mut write_wait = Duration::ZERO;
     // Set when a device copy fails: the workers check it before taking another tensor, so a
     // failure does not turn into "read the rest of the checkpoint first, then report".
     let abort = std::sync::atomic::AtomicBool::new(false);
@@ -394,7 +374,21 @@ pub(crate) fn load_weights(
         // The calling thread is the writer. `Executor` owns device pointers and is not `Send`, so
         // it cannot move to a thread of its own — and it does not need to: the workers only ever
         // touch the groups and the channel, and the copies happen here, overlapped with them.
-        for weight in rx {
+        // The device copy path is deliberately the plain synchronous one. A pinned-staging ring
+        // with asynchronous copies was built and measured (commit history: 2026-09 round 8): the
+        // primitives are fast in isolation (host memcpy into pinned 13.6 GB/s, async H2D 52 GB/s
+        // versus pageable `cuMemcpyHtoD` at ~6 GB/s), but the load's wall clock did not move —
+        // 9.0-10.6 s staged against 9.3-11.2 s plain, with the writer's own time still 6.8-8.4 s.
+        // The pipeline is bound by the host work the sixteen workers and the writer do against the
+        // same memory bandwidth (fill 54-58 CPU-seconds per rank, read 30-36), not by the
+        // transport, so the ring bought complexity instead of time and was removed.
+        loop {
+            let waited = Instant::now();
+            let Ok(weight) = rx.recv() else {
+                write_wait += waited.elapsed();
+                break;
+            };
+            write_wait += waited.elapsed();
             let started = Instant::now();
             let copied = executor
                 .write_f32(weight.slot, &weight.values)
@@ -411,6 +405,7 @@ pub(crate) fn load_weights(
             sink.slots += 1;
             sink.seen[weight.slot.0] = true;
         }
+
         // Reaching here means `rx` yielded everything it ever will: either every worker finished
         // and dropped its sender, or a failed copy returned early and dropped the receiver (which
         // unblocks any worker waiting in `send`). The joins are what is left of the pool.
@@ -476,6 +471,7 @@ pub(crate) fn load_weights(
         weight_bytes: sink.bytes,
         wall: load_started.elapsed(),
         write: write_busy,
+        write_wait,
         workers,
     })
 }
@@ -517,7 +513,18 @@ impl Cuts {
     /// segment and of a shard slab is the same cut on one axis.
     fn narrow(&mut self, dim: usize, start: i64, len: i64, what: &str) -> Result<()> {
         let (_, axis_start, axis_len) = self.axes[dim];
-        if start < 0 || len < 0 || start + len > axis_len {
+        // A zero-length window has no valid source span (`source_span` computes `start + len - 1`),
+        // and its runs would address a zero-byte slice at a position that can be past the end of
+        // the tensor. Nothing in the description language can ask for one (`transform` requires
+        // `len > 0`, a `split` size is positive, a shard slab is at least one element), so this is
+        // a guard against a panic with no message rather than a reachable case.
+        if len <= 0 {
+            bail!(
+                "{what}: a slice of length {len} is not a cut — axis {dim} holds {axis_len} \
+                 element(s) and a cut keeps at least one of them"
+            );
+        }
+        if start < 0 || start + len > axis_len {
             bail!(
                 "{what}: axis {dim} of this tensor holds {axis_len} element(s), and the cut asks \
                  for [{start}, {})",
@@ -742,7 +749,14 @@ fn load_group(
     // — and the one pass that turns those bytes into the slot.
     let strides = strides_of(&group.shape);
     let width = dtype_width(&group.dtype)?;
-    let numel: i64 = group.shape.iter().product();
+    let numel: i64 = group.shape.iter().try_fold(1i64, |acc, axis| {
+        acc.checked_mul(*axis).ok_or_else(|| {
+            anyhow::anyhow!(
+                "tensor `{}`: the shape's element count overflows",
+                group.tensor
+            )
+        })
+    })?;
     let declared_bytes = (group.data.1 - group.data.0) as i64;
     let expected_bytes = numel
         .checked_mul(width as i64)
@@ -755,15 +769,34 @@ fn load_group(
             shape_text(&group.shape)
         );
     }
-    if numel == 0 {
-        // A tensor with a zero-length axis holds nothing to read, whatever the members ask for.
-        return Ok(stats);
-    }
+    // A tensor with a zero-length axis holds nothing to read — but its members still exist and
+    // still have to be delivered, or the coverage walk below reports a weight slot that is simply
+    // empty as "loaded from no checkpoint tensor".
+    let empty = numel == 0;
     let mut planned: Vec<Cuts> = Vec::with_capacity(group.members.len());
     for member in &group.members {
         planned.push(member_cuts(group, member, rank)?);
     }
     if planned.is_empty() {
+        return Ok(stats);
+    }
+    if empty {
+        // Nothing to read, but every member has to arrive: its values are empty and its slot is
+        // zero-sized, which `Executor::write_f32` accepts and the coverage walk requires.
+        for (index, member) in group.members.iter().enumerate() {
+            let cuts = &planned[index];
+            let values = cuts.fill(&[], &group.dtype, &strides, 0)?;
+            if sink
+                .send(LoadedWeight {
+                    slot: member.slot,
+                    name: member.slot_name.clone(),
+                    values,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
         return Ok(stats);
     }
     let mut window = (i64::MAX, i64::MIN);
@@ -950,6 +983,62 @@ fn member_cuts(group: &Group, member: &Member, rank: usize) -> Result<Cuts> {
         );
     }
     Ok(cuts)
+}
+
+/// The slabs one rank takes out of `after_segment` — the axis lengths a `split` segment left —
+/// composed left to right, one entry per declared spec in declaration order.
+///
+/// `slot_name` is only there for the error messages: a slab a group cannot give this rank is
+/// reported against the slot it belongs to.
+fn shard_slabs(
+    slot_name: &str,
+    specs: &[rustrain_parallel::ShardSpec],
+    after_segment: &mut [i64],
+    rank_dims: usize,
+    mesh: &Mesh,
+    rank: usize,
+) -> Result<Vec<(usize, usize, usize)>> {
+    let mut shards: Vec<(usize, usize, usize)> = Vec::new();
+    for spec in specs {
+        let d = axis(spec.dim, rank_dims).ok_or_else(|| {
+            anyhow::anyhow!(
+                "slot `{slot_name}`: shard dim {} is out of range for a {rank_dims}-axis tensor",
+                spec.dim
+            )
+        })?;
+        let group = spec.group;
+        let (degree, coord) = group_degree_and_coord(mesh, rank, group).ok_or_else(|| {
+            anyhow::anyhow!(
+                "slot `{slot_name}`: shard group {group} cannot be sliced for rank {rank}"
+            )
+        })?;
+        if degree <= 1 {
+            continue;
+        }
+        let global = after_segment[d];
+        // The slab comes from the spec being sliced, not from `coord * global / degree`: a
+        // declared replicating axis (`tp` with fewer key/value heads than ranks) hands two
+        // coordinates the same slice, and only the spec's own mode knows that.
+        let (offset, local) = spec
+            .mode
+            .slab(global, coord as i64, degree as i64)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "slot `{slot_name}`: rank {rank} cannot take a slab of axis {d} (global \
+                     {global}, degree {degree}, mode {})",
+                    spec.mode
+                )
+            })?;
+        // The next spec on this dim composes on what this one left behind — `local_shape` divides
+        // by the product of the two degrees, so the slabs have to compose in the same order the
+        // shape algebra assumed. Reading `after_segment[d]` again without this update would slice
+        // the second spec against the *original* length and hand every rank a window the slot is
+        // not shaped for (the shape check catches it, loudly, but the declaration is legal and
+        // would be unloadable).
+        after_segment[d] = local;
+        shards.push((d, offset as usize, local as usize));
+    }
+    Ok(shards)
 }
 
 /// The pairing errors, with the same wording `check` reports — never weaker ones.
@@ -1356,6 +1445,83 @@ mod tests {
         assert!(
             format!("{error:#}").contains("shard"),
             "the error must be the read, not the flag: {error:#}"
+        );
+    }
+
+    /// Two shard specs on one dim: the second composes on what the first left behind, exactly as
+    /// `local_shape` divides by the product of the two degrees. Before this composed, the second
+    /// spec was computed against the *original* axis length, so a declaration `instantiate`
+    /// accepted became unloadable (every rank, loudly, at the shape check) — never a silent wrong
+    /// write, but a legal plan the loader refused to execute.
+    #[test]
+    fn a_second_spec_on_one_dim_composes_with_the_first() {
+        use rustrain_parallel::{GroupMask, ShardSpec};
+
+        let mesh = Mesh::new(vec![("tp".to_string(), 2), ("ep".to_string(), 2)]).unwrap();
+        let tp = GroupMask::single(mesh.index_of("tp").unwrap()).unwrap();
+        let ep = GroupMask::single(mesh.index_of("ep").unwrap()).unwrap();
+        // Rank 1 of both axes: tp takes [0,4) of an 8-element axis, ep then takes the second half
+        // of *that*, not of 8. The mesh's rank order is the mesh's business, so ask it.
+        let rank = (0..mesh.world_size())
+            .find(|candidate| {
+                mesh.group_index(tp, *candidate).ok() == Some(1)
+                    && mesh.group_index(ep, *candidate).ok() == Some(1)
+            })
+            .expect("the mesh has a rank with both coordinates 1");
+
+        let specs = vec![ShardSpec::shard(0, tp), ShardSpec::shard(0, ep)];
+        let mut after = vec![8i64, 3];
+        let slabs = shard_slabs("w", &specs, &mut after, 2, &mesh, rank).expect("the composed cut");
+        assert_eq!(
+            slabs,
+            vec![(0, 4, 4), (0, 2, 2)],
+            "tp halves the axis, ep halves what tp left"
+        );
+        assert_eq!(after[0], 2, "and the axis is left at the composed length");
+    }
+
+    /// A weight tensor with a zero-length axis holds nothing, but its member still has to reach
+    /// the executor: the coverage walk reports an undelivered weight slot as "loaded from no
+    /// checkpoint tensor", so returning early turned a valid empty tensor into a false failure.
+    #[test]
+    fn a_zero_element_tensor_still_delivers_its_members() {
+        let group = Group {
+            tensor: "empty.weight".to_string(),
+            shape: vec![0, 3],
+            dtype: "bf16".to_string(),
+            shard: std::path::PathBuf::from("/nonexistent/rustrain/shard.safetensors"),
+            data: (0, 0),
+            steps: Vec::new(),
+            members: vec![Member {
+                slot: SlotId(0),
+                slot_name: "empty.weight".to_string(),
+                source: "empty.weight".to_string(),
+                local_shape: vec![0, 3],
+                segment: None,
+                shards: Vec::new(),
+                expected: vec![0, 3],
+            }],
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let running = std::sync::atomic::AtomicBool::new(false);
+        let stats = load_group(&group, 0, &tx, &running).expect("an empty tensor is not an error");
+        assert_eq!(stats.bytes_read, 0, "and it reads nothing");
+        let delivered = rx.try_recv().expect("the member still arrives");
+        assert_eq!(delivered.slot, SlotId(0));
+        assert!(delivered.values.is_empty());
+    }
+
+    /// A zero-length cut has no source span (`start + len - 1`) and its runs would address an empty
+    /// slice at a position that may be past the tensor. Nothing can ask for one; the guard is what
+    /// keeps that from being a panic instead of a message.
+    #[test]
+    fn a_zero_length_slice_is_refused() {
+        let error = Cuts::identity(&[3, 4])
+            .narrow(1, 1, 0, "test")
+            .expect_err("a zero-length window is not a cut");
+        assert!(
+            format!("{error:#}").contains("length 0"),
+            "the refusal names the length: {error:#}"
         );
     }
 

@@ -924,10 +924,7 @@ impl Executor {
             singles.sort_by_key(|(_, _, nanos)| std::cmp::Reverse(*nanos));
             eprintln!("  slowest single step(s):");
             for (index, label, nanos) in singles.iter().take(top.min(5)) {
-                eprintln!(
-                    "    step {index} {label}: {:.3} ms",
-                    *nanos as f64 / 1e6
-                );
+                eprintln!("    step {index} {label}: {:.3} ms", *nanos as f64 / 1e6);
             }
         }
         Ok(stats)

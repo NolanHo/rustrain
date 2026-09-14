@@ -1026,6 +1026,10 @@ fn run_rank(
             "read_cpu_seconds": load.stats.read.as_secs_f64(),
             "fill_cpu_seconds": load.stats.fill.as_secs_f64(),
             "write_seconds": write_seconds,
+            // The writer's other half: how long it waited for the pool. `write_seconds +
+            // write_wait_seconds` spans the streaming phase, so a load that is slow on the copy
+            // side and one that is slow on the read side are told apart by these two numbers.
+            "write_wait_seconds": load.write_wait.as_secs_f64(),
         },
         "plan_steps": plan_steps,
         "ops": stats.ops,
