@@ -7,8 +7,9 @@
 //! sliced from the wrong offset, with a row stride taken from the wrong size, or aliasing its
 //! neighbour's buffer changes the logits *and* the hidden state.
 //!
-//! Nothing else covers this data path. The loader's own unit tests pin the helpers (`slice_axis`,
-//! `transpose_axes`), and every other `run` fixture binds one tensor to one slot, so the
+//! Nothing else covers this data path. The loader's own unit tests pin its composed index map
+//! (and keep the explicit `widen`/`transpose_axes`/`slice_axis` chain as the reference it is
+//! compared against), and every other `run` fixture binds one tensor to one slot, so the
 //! composition `transform → split → slot` had no end-to-end test at all: a bug in it would be
 //! silent.
 //!
@@ -321,7 +322,7 @@ fn a_transposed_tensor_splits_into_three_asymmetric_slots() {
     let report: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&metrics).unwrap()).unwrap();
     let load = &report["ranks"][0]["checkpoint_load"];
-    assert_eq!(load["pairs"], 5, "three targets plus embed and head");
+    assert_eq!(load["pairs_total"], 5, "three targets plus embed and head");
     assert_eq!(load["tensors_read"], 3, "one read per tensor, not per pair");
     assert_eq!(
         load["bytes_read"], load["bytes_distinct"],

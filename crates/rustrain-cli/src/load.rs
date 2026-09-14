@@ -33,11 +33,14 @@ use crate::{
 pub(crate) struct LoadStats {
     /// Bytes actually handed to `read` (this is what `checkpoint_bytes_read` means).
     pub bytes_read: u64,
-    /// Bytes of checkpoint that a *single* read per tensor would have needed: the difference to
-    /// `bytes_read` is pure duplication (`split` bindings share one tensor between segments).
+    /// Bytes a *single* read per tensor would have needed, counted over the pairing's tensor
+    /// names independently of how the loader groups them. It equals `bytes_read` today (the
+    /// pairing gives a tensor one transform, so grouping by `(tensor, transform)` cannot split
+    /// one), and the two would differ the moment a vocabulary allowed the same tensor in two
+    /// groups — which is exactly what makes this a measurement rather than a restatement.
     pub bytes_distinct: u64,
     pub tensors_read: usize,
-    pub pairs: usize,
+    pub pairs_total: usize,
     pub read: Duration,
     /// The composed walk: widening, layout and the rank's slab, done in one pass per member.
     pub fill: Duration,
@@ -51,7 +54,15 @@ pub(crate) struct LoadOutcome {
     pub slots: usize,
     /// Widened f32 bytes that reached the device — the number that must fall as a mesh widens.
     pub weight_bytes: u64,
+    /// Wall time of the whole load, workers and device writes included.
+    pub wall: Duration,
+    /// Time the calling thread spent *inside* the device copies, not waiting for the workers to
+    /// hand over the next tensor — the number that says what the copies cost, and the one that
+    /// would change if the copies were done with pinned memory or a wider transfer.
     pub write: Duration,
+    /// How many workers the pool ran (`LOAD_WORKERS` capped by the group count); the phase times
+    /// below are sums over them.
+    pub workers: usize,
 }
 
 /// What the writer thread keeps while the workers hand it tensors: which slots arrived, and what
@@ -79,7 +90,7 @@ pub(crate) struct LoadedWeight {
 /// slices 74 s, widening 71 s, reading 34 s — 92% of it host CPU, on one of 160 cores. The
 /// checkpoint mount is the mirror image: one stream reads at ~160 MB/s, eight streams at
 /// multiple GB/s. One worker per tensor fixes both sides at once, and the memory it costs is one
-/// tensor's transients (raw + widened + transformed) per worker.
+/// tensor's checkpoint bytes plus its slots per worker.
 const LOAD_WORKERS: usize = 16;
 
 /// One slot's share of a group: what to cut out of the prepared tensor, and what the two
@@ -107,9 +118,8 @@ type GroupOutcome = (usize, Result<LoadStats>);
 /// One checkpoint tensor plus every pair that reads it with the same transform.
 ///
 /// A `split` binding produces one pair per segment, and each pair used to read the whole tensor
-/// again: 873 pairs over 712 tensors, +64.8% bytes read, widened and transposed. Grouping by
-/// `(tensor, transform)` makes the shared work shared, and is why `bytes_read == bytes_distinct`
-/// is now an invariant rather than a hope.
+/// again: 873 pairs over 712 tensors, +64.8% bytes read. Grouping by `(tensor, transform)` makes
+/// the shared work shared, and is why `bytes_read == bytes_distinct` holds today.
 struct Group {
     tensor: String,
     shape: Vec<i64>,
@@ -167,6 +177,8 @@ pub(crate) fn load_weights(
     let mut groups: Vec<Group> = Vec::new();
     let mut group_of: std::collections::HashMap<(String, Vec<String>), usize> =
         std::collections::HashMap::new();
+    // One entry per checkpoint tensor this rank reads, whatever grouping does with it.
+    let mut distinct: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     for pair in &p.pairs {
         let binding = &expanded.bindings[pair.binding];
         let tensor = meta.tensors.get(&pair.tensor).ok_or_else(|| {
@@ -273,6 +285,7 @@ pub(crate) fn load_weights(
                         pair.tensor
                     ),
                 };
+                distinct.insert(pair.tensor.clone(), data.1 - data.0);
                 let steps: Vec<rustrain_model::Transform> = binding
                     .transform
                     .iter()
@@ -307,9 +320,10 @@ pub(crate) fn load_weights(
     }
 
     // ---- read and prepare the groups in parallel, writing each slot as it is ready ----------
-    // One worker per tensor, not one per core: the transposes are the bulk of the work and every
-    // worker also holds one tensor's bytes and one result, so the pool is sized by what the mount
-    // and the memory want, not by the CPU count.
+    // One worker per tensor, not one per core: the host-side fill is the bulk of the work and a
+    // worker holds one tensor's checkpoint bytes plus the slots cut out of it, so the pool is
+    // sized by what the mount and the memory want, not by the CPU count. Sixteen beats forty-eight
+    // on both sides (measured: 30.5 s vs 38.9 s for one run) — more workers only add contention.
     //
     // The tensors go straight into the executor from a writer thread rather than accumulating in
     // host memory: that hides the host-to-device copies behind the reads (they used to be a
@@ -324,7 +338,8 @@ pub(crate) fn load_weights(
         seen: vec![false; plan.slots.len()],
         ..Sink::default()
     };
-    let write_started = Instant::now();
+    let load_started = Instant::now();
+    let mut write_busy = Duration::ZERO;
     let written: Result<()> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
@@ -351,9 +366,11 @@ pub(crate) fn load_weights(
         // it cannot move to a thread of its own — and it does not need to: the workers only ever
         // touch the groups and the channel, and the copies happen here, overlapped with them.
         for weight in rx {
+            let started = Instant::now();
             executor
                 .write_f32(weight.slot, &weight.values)
                 .with_context(|| format!("writing the weight slot `{}`", weight.name))?;
+            write_busy += started.elapsed();
             sink.bytes += (weight.values.len() * 4) as u64;
             sink.slots += 1;
             sink.seen[weight.slot.0] = true;
@@ -365,7 +382,6 @@ pub(crate) fn load_weights(
         }
         Ok(())
     });
-    let write = write_started.elapsed();
     written?;
 
     // Deterministic error reporting: the lowest group index that failed is the one reported, no
@@ -374,13 +390,13 @@ pub(crate) fn load_weights(
     let mut outcomes = outcomes.into_inner().expect("the loader's result lock");
     outcomes.sort_by_key(|(index, _)| *index);
     let mut stats = LoadStats {
-        pairs: p.pairs.len(),
+        pairs_total: p.pairs.len(),
+        bytes_distinct: distinct.values().sum(),
         ..LoadStats::default()
     };
     for (_, outcome) in outcomes {
         let group_stats = outcome?;
         stats.bytes_read += group_stats.bytes_read;
-        stats.bytes_distinct += group_stats.bytes_distinct;
         stats.tensors_read += group_stats.tensors_read;
         stats.read += group_stats.read;
         stats.fill += group_stats.fill;
@@ -402,7 +418,9 @@ pub(crate) fn load_weights(
         stats,
         slots: sink.slots,
         weight_bytes: sink.bytes,
-        write,
+        wall: load_started.elapsed(),
+        write: write_busy,
+        workers,
     })
 }
 
@@ -496,10 +514,9 @@ impl Cuts {
                     bytes[byte + 3],
                 ])
             })),
-            other => bail!(
-                "the checkpoint declares dtype `{other}` for a weight; the loader widens bf16, \
-                 f16 and f32 only"
-            ),
+            // `dtype_width` is the loader's one gate on loadable dtypes and runs before any
+            // bytes are read, so an unknown one is a bug here rather than a user error.
+            other => unreachable!("dtype_width admitted `{other}` but `fill` cannot read it"),
         }
     }
 }
@@ -510,6 +527,12 @@ fn walk<F: Fn(i64) -> f32>(shape: &[usize], step: &[i64], base: i64, read: F) ->
     let total: usize = shape.iter().product();
     let mut out: Vec<f32> = Vec::with_capacity(total);
     if total == 0 {
+        return out;
+    }
+    // A scalar tensor has no axes to walk: it is one element, and it is legal in a safetensors
+    // header and in a description.
+    if shape.is_empty() {
+        out.push(read(base));
         return out;
     }
     if shape.len() == 1 {
@@ -563,9 +586,8 @@ fn load_group(
     let read_started = Instant::now();
     let len = (group.data.1 - group.data.0) as usize;
     let mut bytes = vec![0u8; len];
-    let mut file = std::fs::File::open(&group.shard).with_context(|| {
-        format!("opening the safetensors shard {}", group.shard.display())
-    })?;
+    let mut file = std::fs::File::open(&group.shard)
+        .with_context(|| format!("opening the safetensors shard {}", group.shard.display()))?;
     // `data_offsets` are relative to the *data section*: the shard is 8 bytes of header
     // length, the header, then the data. Reading the length again (8 bytes per shard) is the
     // only way to know where the data begins without re-parsing the header.
@@ -573,14 +595,15 @@ fn load_group(
     file.read_exact(&mut header_len)
         .with_context(|| format!("reading the header length of {}", group.shard.display()))?;
     let base = 8 + u64::from_le_bytes(header_len);
-    file.seek(SeekFrom::Start(base + group.data.0)).with_context(|| {
-        format!(
-            "seeking `{}` to data byte {} in {}",
-            group.tensor,
-            group.data.0,
-            group.shard.display()
-        )
-    })?;
+    file.seek(SeekFrom::Start(base + group.data.0))
+        .with_context(|| {
+            format!(
+                "seeking `{}` to data byte {} in {}",
+                group.tensor,
+                group.data.0,
+                group.shard.display()
+            )
+        })?;
     file.read_exact(&mut bytes).with_context(|| {
         format!(
             "reading `{}` ({len} bytes) from {}",
@@ -590,7 +613,6 @@ fn load_group(
     })?;
     stats.read += read_started.elapsed();
     stats.bytes_read += len as u64;
-    stats.bytes_distinct += len as u64;
 
     let numel: i64 = group.shape.iter().product();
     let width = dtype_width(&group.dtype)?;
@@ -647,7 +669,12 @@ fn load_group(
                             shape_text(&group.shape)
                         ),
                     )?;
-                    cuts.narrow(d, start, len, &format!("transform `slice({dim},{start},{len})`"))?;
+                    cuts.narrow(
+                        d,
+                        start,
+                        len,
+                        &format!("transform `slice({dim},{start},{len})`"),
+                    )?;
                 }
             }
         }
@@ -666,7 +693,8 @@ fn load_group(
         let member_shape = cuts.shape();
         if member_shape != member.expected {
             bail!(
-                "slot `{}` <- `{}` (binding `{}`): the data walk produced shape {:?} but the                  shape math says {:?}",
+                "slot `{}` <- `{}` (binding `{}`): the data walk produced shape {:?} but the shape \
+                 math says {:?}",
                 member.slot_name,
                 group.tensor,
                 member.source,
@@ -680,10 +708,7 @@ fn load_group(
                 d,
                 start as i64,
                 len as i64,
-                &format!(
-                    "slot `{}`: shard slab on axis {d}",
-                    member.slot_name
-                ),
+                &format!("slot `{}`: shard slab on axis {d}", member.slot_name),
             )?;
         }
 
@@ -998,6 +1023,95 @@ mod tests {
         assert_eq!(composed, explicit, "the composed walk must be exact");
     }
 
+    /// The dtypes the loader is allowed to widen, read out of the checkpoint's own bytes. bf16
+    /// and f16 are exact subsets of f32, so the comparison is equality, not a tolerance.
+    #[test]
+    fn fill_reads_every_loadable_dtype_exactly() {
+        let values = [1.0f32, -2.5, 3.25];
+        let bf16: Vec<u8> = bf16_bytes(&values);
+        assert_eq!(
+            Cuts::identity(&[3])
+                .fill(&bf16, "bf16", &strides_of(&[3]))
+                .unwrap(),
+            values
+        );
+        // f16: exact for these too, and a different bit pattern from bf16.
+        let mut f16 = Vec::new();
+        for value in values {
+            let bits = value.to_bits();
+            let sign = ((bits >> 16) & 0x8000) as u16;
+            let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+            let mant = ((bits >> 13) & 0x3ff) as u16;
+            f16.extend_from_slice(&(sign | ((exp as u16) << 10) | mant).to_le_bytes());
+        }
+        assert_eq!(
+            Cuts::identity(&[3])
+                .fill(&f16, "f16", &strides_of(&[3]))
+                .unwrap(),
+            values
+        );
+        let mut f32_bytes = Vec::new();
+        for value in values {
+            f32_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        assert_eq!(
+            Cuts::identity(&[3])
+                .fill(&f32_bytes, "f32", &strides_of(&[3]))
+                .unwrap(),
+            values
+        );
+    }
+
+    /// A scalar tensor is one element with no axes to walk, and an empty axis is zero elements:
+    /// neither may panic, and a scalar used to be loaded fine before the composed walk.
+    #[test]
+    fn fill_handles_scalars_and_empty_axes() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&7.5f32.to_le_bytes());
+        let scalar = Cuts::identity(&[]);
+        assert_eq!(
+            scalar.fill(&bytes, "f32", &strides_of(&[])).unwrap(),
+            vec![7.5]
+        );
+        assert_eq!(scalar.shape(), Vec::<i64>::new());
+
+        let empty = Cuts::identity(&[0, 3]);
+        assert!(
+            empty
+                .fill(&bytes, "f32", &strides_of(&[0, 3]))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Two transposes in a row, and a cut on an axis that a later transpose moves: the map has to
+    /// compose all of them, not just the single-swap case the fixture happens to use.
+    #[test]
+    fn the_map_composes_repeated_and_interleaved_operations() {
+        let source = [2i64, 3, 4];
+        let values: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let bytes = bf16_bytes(&values);
+
+        let mut explicit = widen(&bytes, "bf16").unwrap();
+        let mut shape = vec![2usize, 3, 4];
+        explicit = transpose_axes(&explicit, &shape, 0, 1);
+        shape.swap(0, 1);
+        explicit = slice_axis(&explicit, &shape, 2, 1, 2);
+        shape[2] = 2;
+        explicit = transpose_axes(&explicit, &shape, 1, 2);
+        shape.swap(1, 2);
+
+        let mut cuts = Cuts::identity(&source);
+        cuts.transpose(0, 1);
+        cuts.narrow(2, 1, 2, "test").unwrap();
+        cuts.transpose(1, 2);
+        assert_eq!(cuts.shape(), vec![3, 2, 2]);
+        assert_eq!(
+            cuts.fill(&bytes, "bf16", &strides_of(&source)).unwrap(),
+            explicit
+        );
+    }
+
     /// The map is only worth anything if a cut that is out of range is refused rather than read
     /// past the end of the tensor.
     #[test]
@@ -1121,8 +1235,16 @@ mod tests {
 
     #[test]
     fn strides_are_row_major() {
-        assert_eq!(row_major_strides(&[2, 3, 4]), vec![12, 4, 1]);
-        assert_eq!(row_major_strides(&[5]), vec![1]);
-        assert_eq!(row_major_strides(&[]), Vec::<usize>::new());
+        assert_eq!(strides_of(&[2, 3, 4]), vec![12, 4, 1]);
+        assert_eq!(strides_of(&[5]), vec![1]);
+        assert_eq!(strides_of(&[]), Vec::<i64>::new());
+        // The reference chain's own helper must agree with the one the loader uses.
+        assert_eq!(
+            row_major_strides(&[2, 3, 4])
+                .iter()
+                .map(|s| *s as i64)
+                .collect::<Vec<_>>(),
+            strides_of(&[2, 3, 4])
+        );
     }
 }

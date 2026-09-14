@@ -821,6 +821,7 @@ fn run_rank(
     let rank_weight_bytes = load.weight_bytes;
     let checkpoint_bytes = load.stats.bytes_read;
     let write_seconds = load.write.as_secs_f64();
+    let _ = write_seconds;
 
     let started = Instant::now();
     let stats = executor.run().context("executing the forward")?;
@@ -910,11 +911,14 @@ fn run_rank(
             "bytes_read": load.stats.bytes_read,
             "bytes_distinct": load.stats.bytes_distinct,
             "tensors_read": load.stats.tensors_read,
-            "pairs": load.stats.pairs,
-            // Wall time per phase; the reads and fills run in LOAD_WORKERS threads, so these do
-            // not add up to the load's wall time, and the device writes overlap both.
-            "read_seconds": load.stats.read.as_secs_f64(),
-            "fill_seconds": load.stats.fill.as_secs_f64(),
+            "pairs_total": load.stats.pairs_total,
+            "workers": load.workers,
+            // The load's own wall clock, and the two sums that run inside it: `read` and `fill`
+            // are added up over `workers` threads, so they must NOT be summed with each other or
+            // with the wall time; the device writes happen on the calling thread and overlap both.
+            "wall_seconds": load.wall.as_secs_f64(),
+            "read_cpu_seconds": load.stats.read.as_secs_f64(),
+            "fill_cpu_seconds": load.stats.fill.as_secs_f64(),
             "write_seconds": write_seconds,
         },
         "plan_steps": plan_steps,

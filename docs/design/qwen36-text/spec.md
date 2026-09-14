@@ -500,7 +500,9 @@ python3 /root/rustrain-gpu/check_load.py      # 与上一次的 dump 逐位比�
 **为什么单独做**：D6.2/D6.3 每次验收要跑两遍加载，一次 sweep 23 分钟里只有 14 秒是前向。
 Debug 速度卡在这里，所以先修它。
 
-**先量再改**（`checkpoint_load` 分相计时，宿主机，world=1，真实 67 GB checkpoint）：
+**先量再改**（宿主机，world=1，真实 67 GB checkpoint）。这张表的读数来自一次**临时插桩的构建**：
+先把分相计时加进加载器、测出下表的分解，再动优化；插桩本身随 `9d0d6eb` 一起提交，所以历史里没有单独的
+"只有计时"提交（重跑办法见本节末尾的 `load-bench.sh`）：
 
 | 相位 | 单线程读数 | 说明 |
 |---|---|---|
@@ -513,16 +515,19 @@ Debug 速度卡在这里，所以先修它。
 
 两个被数字纠正的判断：① `checkpoint_bytes_read` = 117,051,115,776 **不是**"整个 checkpoint" ——
 它 = 71,010,502,912 的**去重字节**（= `weight_bytes`/4 × 2，正好 66.1 GiB）+ 46,040,612,864 的**重复读**：
-873 个 pair 落在 712 个张量上，`split` 的每个段都把同一个张量整读一遍（`in_proj_qkv` ×3 段 ×30 层、
-`gate_up_proj` ×2 段 ×41 处）；② 磁盘不是瓶颈（热缓存 34 s / 66 GiB ≈ 3 GB/s），**CPU 是**。
+873 个 pair 落在 712 个张量上，`split` 的每个段都把同一个张量整读一遍 —— 多出来的 161 次读 =
+`in_proj_qkv` 3 段 ×30 层（+2 次/层）+ `conv1d` 3 段 ×30 层（+2 次/层）+ `gate_up_proj` 2 段 ×41 处
+（+1 次/处），与 `qwen36-text` 描述的 split 一一对应；② 磁盘不是瓶颈（热缓存 34 s / 66 GiB ≈ 3 GB/s），
+**CPU 是**。
 
 **三个改动（都在 `crates/rustrain-cli/src/load.rs`）**：
 
 1. **按 `(tensor, transform)` 合组**：一个张量只读一次、只 widen 一次，`split` 的各段从同一份数据上切。
    `bytes_read == bytes_distinct` 从此是**不变量**（`run_split.rs` 用 metrics 钉住：5 个 pair、3 个张量、
    读到的字节 = 三个张量之和）。
-2. **16 个 worker 并行**（`LOAD_WORKERS`）：文件读与 CPU 各自并行。实测 16 > 48（48 个 worker 反而更慢：
-   缓存压力与临时缓冲的页错误把 CPU-sum 从 407 s 抬到 565 s）。
+2. **16 个 worker 并行**（`LOAD_WORKERS`）：文件读与 CPU 各自并行。16 比 48 快，而且在**新旧两条路径上
+   都成立**（旧链：61.2 s vs 48.6 s 进程墙钟、CPU-sum 407 s vs 565 s；新链：30.5 s vs 38.9 s）——
+   更多 worker 只增加缓存压力与页错误。
 3. **`Cuts`：把 transform / split / 分片 slab 合成为一张下标映射，一次遍历填充**。
    每个 binding 操作只有两种形态 —— "交换两个轴"（transpose）或"取某一轴的子区间"（slice、split 段、
    分片 slab），所以整条链可以在**不搬一个字节**的情况下合成：结果轴的 `(checkpoint 轴, 起点, 长度)`。
@@ -537,12 +542,17 @@ Debug 速度卡在这里，所以先修它。
 
 | | 改前 | 改后（三个提交依次落地） |
 |---|---|---|
-| 一次 sweep（baseline + tp=2） | **22 m 43 s** | **58.0 s**（23.5×） |
-| world=1 单次运行 | 624.9 s | **30.5 s**（20.5×） |
+| 一次 sweep（baseline + tp=2） | **22 m 43 s** | **58–61 s**（23×） |
+| world=1 单次运行（进程） | 624.9 s | **30.5–32.9 s**（20×） |
+| world=1 的**加载**墙钟 | ~614 s | **20.5 s** |
 | 加载 CPU-sum（16 worker 相加） | 406.9 s | **188.8 s**（fill 145 + read 24 + write 20） |
 | 读到的字节 | 109.0 GiB | **66.1 GiB**（= 去重字节） |
 | `widen` / `transform` / `slice` 三个相位 | 71 / 420 / 74 s | **不存在了**（合并成一次 `fill`） |
-| 设备回写 | 串行，全部读完之后 | **与读/填充重叠**（写线程 = 调用线程，19.5 s 藏在 145 s 的 fill 里） |
+| 设备回写 | 串行，全部读完之后 15 s | **与读/填充重叠**，写者 = 调用线程；**但回写本身仍是 18.8 s** |
+
+`checkpoint_load` 的口径（读它的人必须先看这一句）：`wall_seconds` 是整段加载的墙钟；
+`read_cpu_seconds` / `fill_cpu_seconds` 是**对 `workers` 个线程求和**（不是墙钟，不能与前者相加）；
+`write_seconds` 是调用线程上设备回写的墙钟，与两者重叠。四个数字相加是无意义的。
 
 三个提交：`9d0d6eb`（去重 + 16 worker + `Cuts` 一次遍历）、`addc250`（把回写流式化：每个 slot 就绪即写，
 `Executor` 不是 `Send`，所以**调用线程**当写者）、以及文档提交。回写这一步同时还去掉了宿主里那份
@@ -553,11 +563,15 @@ hidden **与改动前逐位相同**（`np.array_equal` → True，`max|d| 0.0`�
 （`4290629e4ac02128…`），sweep 判据仍是 `max|diff| 2.670e-5 / bound 1.298e-4 PASS`。加载器只决定
 "同样的 f32 值怎么进 slot"，不决定值本身；这条判据把"只改了搬字节的方式"钉死。
 
-**本次没做的（诚实记录，下一步的素材）**：① **H2D 回写仍串行**（19–23 s，全部加载完之后逐个 slot 拷贝），
-把它流式化（`Executor::new` 提到加载之前、worker 通过通道交给写线程）能把它藏进 fill 的时间里；
-② **tp>1 仍读整份 66.1 GiB**：rank 只需要的 slab 已经是 `Cuts` 里现成的（`(轴, 起点, 长度)`），
-把组的读范围收窄到并集即可 —— tp=2 应降到 ~38 GiB，tp=8 更多；③ 冷缓存时单流读只有 ~160 MB/s
-（16 worker 已经并行，但 checkpoint 不在 page cache 时仍是主要成本之一）。
+**回写已经是最后的大头（改完才看见）**：加载墙钟 20.5 s 里，调用线程在 `write_f32` 里真正花掉
+**18.8 s**（142 GB pageable 源 → ~7.6 GB/s），worker 的 fill 是并行的、`read` 也在并行 —— 也就是说
+现在**瓶颈是那次内存拷贝**，不是布局运算。下一步很明确：`cudaHostAlloc` 的 pinned 暂存 + 分批
+`cudaMemcpyAsync`（pageable 拷贝要过一次内部暂存，pinned 能到 20+ GB/s），或按 slot 对齐后合并成大块。
+
+**本次没做的（诚实记录）**：① **tp>1 仍读整份 66.1 GiB**：rank 只需要的 slab 已经是 `Cuts` 里现成的
+（`(轴, 起点, 长度)`），把组的读范围收窄到并集即可 —— tp=2 应降到 ~38 GiB，tp=8 更多（顺带把回写也砍半）；
+② 上面那条 pinned 暂存；③ 冷缓存时单流读只有 ~160 MB/s（16 worker 已经并行，但 checkpoint 不在 page cache
+时仍是主要成本之一）。
 
 ### D5 — 前向数值对齐 HuggingFace
 
