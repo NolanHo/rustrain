@@ -1156,13 +1156,99 @@ NUMA 亲和（探针两节点都快；把 loader 绑到 node 0 反而更慢，�
 是 8.81e-2）。当时 `ops check` 抓不到它——门禁只生成 f32 case（`H=I=2`）且它落在对齐回退分支上；
 上表说明现在抓得到了。
 
-**门禁**：`ops check --plugin … --device cuda` = 91 case / 0 failing（两个 dtype 变体都过）；
-本地 `cargo test --release --workspace` 519/0、clippy 0、`ops check` exit 0、
-`check --tp 1/2/4/8` exit 0 且 `--tp 3` exit 1（本轮 Rust 侧无改动）。
+**门禁**：`ops check --plugin … --device cuda` = 94 case / 0 failing；本地
+`cargo test --release --workspace` 519/0、clippy 0、`ops check` exit 0、
+`check --tp 1/2/4/8` exit 0 且 `--tp 3` exit 1。
 
-**已知覆盖缺口（不隐瞒）**：grouped 调度**没有被 `ops check` 覆盖**——门禁今天只生成 f32 case，而
-grouped 是 bf16 的调度；它的证据是上面那次模型级逐位对照 + 空专家探针。要真正进门禁，需要 conformance
-harness 支持"按 dtype 生成 case"（框架侧工作，未排期）。
+**仍存在的覆盖缺口（不隐瞒）**：门禁每个 case 只生成一种 dtype，所以 **bf16 变体不在数值判定里**
+（报告里显示为带理由的 skip，不是 pass）。两条调度在 f32 下都被判了；bf16 那一半靠模型级对照
+（D6.11 的口径）而不是门禁。要补上需要 harness 支持"按 dtype 生成 case"（框架侧工作，未排期）。
+
+### D6.13 — `gated_delta_rule` 的分块扫描：tp=4 前向再砍一半，到 0.97 s（2026-09，本轮）
+
+**背景**：D6.12 之后 `gated_delta_rule` 成了前向第一项（tp=4、S=8：30 次 × 40.5 ms = 1.21 s，
+占 1.99 s 墙钟的 61%）。它的成本与 token 数几乎无关：逐 token 的扫描要跑 S=512 步，每步约 20 个
+ATen 小算子（`select`/`exp`/三四个 matmul/`copy_`），即**每次前向约 30 万个算子调用**——付的是派发，
+不是算术。先说清一条被**排除**的解释：就地更新状态（`mul_`/`add_` 代替每次新建张量）只快 **1.11×**
+（宿主探针 44.5 → 40.2 ms），所以分配不是瓶颈。
+
+**做法**：把同一个扫描按**声明里的 `chunk_size`**（i64，默认 64，本模型声明 64）分块。记 `c_t` 为
+chunk 内累计 log-decay、`δ_t` 为 token 的有效写入，两个恒等式是精确的：
+
+```
+S_t = e^{c_t} S_prev + Σ_{s≤t} e^{c_t - c_s} k_s δ_sᵀ
+o_t = e^{c_t}(q_tᵀ S_prev) + Σ_{s≤t} e^{c_t - c_s}(q_t·k_s) δ_sᵀ
+```
+
+把第一式代回 `δ_t = β_t(v_t - e^{g_t} k_tᵀ S_{t-1})`（**衰减在读取之前施加**，所以系数是 `c_t` 而不是
+`c_{t-1}`），chunk 内的 δ 就成为一个单位下三角方程组
+`(I + tril(diag(β)·[e^{c_t-c_s}(k_t·k_s)], -1)) δ = diag(β)(v - e^{c}(k S_prev))`。
+于是每个 chunk = 一次三角解 + 几次批量 matmul，顺序依赖从 S 步降到 `ceil(S/chunk_size)` 步（512 → 8）。
+用到的都是 ATen 原语（`cumsum`/`tril`/`linalg_solve_triangular`/`matmul`），没有手写 kernel。
+
+**参数面**：`chunk_size = 1` 走逐 token 扫描，`>= 2` 走分块；两条都在同一个 body 里，并且
+**各自有一条 conformance case**（本轮新增 `chunk_size = 1` 的那条，见下）。这不是新契约：算子自己的
+声明早就写着 `'chunk_size' (i64, default 64) sizes the chunked scan`，只是插件里的 body 之前不读它。
+
+**宿主实测**：
+
+| | 每层 | tp=4 墙钟 | 1411 步内合计 |
+|---|---|---|---|
+| D6.12 之后（逐 token 扫描） | 40.5 ms（30 次 1.21 s） | 1.988 s | 2.266 s |
+| 分块扫描（`chunk_size = 64`） | **5.44 ms**（30 次 0.163 s） | **0.974 s** | **0.973 s** |
+
+**7.4×（GDN 本身）**，tp=4 前向再砍一半。改完之后前向的 top 项变成了 **82 次 `intrinsic.all_reduce`
+（0.360 s，37%）**，其后才是 GDN（0.163 s）、`linear`（0.089 s）、`moe_layer`（0.072 s）、`sdpa`
+（0.071 s）——**下一项是集合通信的固定开销，不再是算子体**。注意 step trace 的每步计时是同步探针，
+会放大通信项的绝对值（D6.8 已记）。
+
+**验收**（同一个 `.so`，只改描述里声明的 `chunk_size`，所以对照是同一份代码的两条分支；下面"逐元素
+rel_L2"是 `scripts/hf_qwen36_reference.py` 的 `hidden_values.per_row_relative_l2` 口径，不是它的
+`hidden` 汇总量门）：
+
+| 比法 | 结果 |
+|---|---|
+| f32：分块 vs 逐 token | logits 相对 **2.130e-6**、逐元素 rel_L2 最大 **1.538e-6** —— 重结合噪声 |
+| f32：分块 vs HF f32 | **1.9995e-3**（逐 token 2.0012e-3）—— D6.11 的表不变 |
+| bf16：分块 vs 逐 token | logits **1.053e-1**、逐元素 rel_L2 最大 7.57e-2 |
+| bf16：分块 vs HF bf16 | **1.5144e-1**（逐 token 8.81e-2；HF 自己 bf16-vs-f32 是 1.5233e-1） |
+
+**bf16 那一行怎么读**：f32 上两条分支只差 2e-6，bf16 上却差 1e-1 —— 这不是算法错了，是 **bf16 的
+舍入混沌**：1e-6 级的扰动会改变某些元素"舍入到哪一边"，而每次翻转是 2^-8 的相对跳变，再经 40 层放大。
+D6.11 已经量过同一现象的量级（我们 bf16-vs-f32 1.44e-1、HF bf16-vs-f32 1.52e-1）。所以**bf16 的点估计
+落在 dtype 自身噪声带里，判据只能由 f32 给出**；"8.81e-2 比 1.51e-1 好"是运气，不是质量。
+
+**门禁**：`gated_delta_rule` 现在有**三条 case**（`chunk_size = 2` 走分块、`chunk_size = 1` 走逐 token、
+另有 `g` 为常量 −16 / `chunk_size = 8` 的**饱和 case**）。宿主 `ops check --plugin …` =
+**100 case / 0 failing**。这条饱和 case 是**回归门**，并且验证过它真的会响：把 `pair`/`carry` 改回
+比值前的两个因子相乘的**变异构建**让 gate `exit=1`、`1 failing`，报文点名
+`output out0 element 0 is NaN (non-finite) …`；而另两条 case（`g ∈ [−0.5, 0.5)`，每 chunk
+`|cum| ≤ 0.34`）在同一个变异构建上仍然 pass —— 也就是它们**永远够不到**这个区间。它顺带修掉一个既有
+毛病：旧 case 的 `g` 有一半是正数，而声明写着 `g <= 0`。
+
+**这条 case 之所以必须先修门禁才成立（本轮第二个真问题，且是框架侧的）**：`conformance::compare`
+用 `ratio > worst` 取最大值，而 **`NaN > worst` 是 false** —— 一个输出全是 NaN 的实现会被判**绿**。
+第一版分块 body 在真实模型上就是这个症状，而门禁当时抓不到（那时的 case 也够不到那个区间，两个原因
+叠在一起）。修法：任一侧出现非有限值直接判失败并点名元素（"非有限值是缺陷，不是容差问题"），
+配一条单测 `a_non_finite_output_is_never_within_tolerance`（NaN/±inf 两侧各一遍）。
+
+**过程中被自己的数据抓到的两个真问题**（都记下来，因为它们是这类改动的典型失败模式）：
+
+1. **`δ` 的系数取错**：第一版按 `a_{t-1}`（读取**之前**不衰减）推导，与逐 token 扫描差 **1e-2** 相对。
+   宿主原型上按 `S=4/C=2` 的 tiny case 逐项对比定位到"衰减在读之前施加"这一条。
+2. **`0 × inf = NaN`**：第一版把衰减写成 `exp(cum)` 与 `exp(-cum)` 两个因子相乘。chunk 累计衰减超过
+   `ln(FLT_MAX) ≈ 88.7` 时第二个因子溢出成 inf，而此时第一个已经是次正规数、很快变 0，把它们乘回去的
+   那一步得到 `inf - inf`（k 的符号混合时）或 `0 · inf`（再往后）——都是 NaN。真实模型上确实越过了这条线：
+   从 checkpoint 里读到 `exp(A_log)` 最大 **74.05**（layer 0 的 16 个头）、`dt_bias` 最大 9.39，最强的头
+   每个 token 的 `|g|` 是几百量级，8 个 token 的 chunk 内 `|cum| ≫ 88`。症状（复核过 dump）是
+   两条 dtype 跑都 100% NaN logits，42 行汇总量里 **row 1 起**全部 NaN（`embed.y` 干净，也就是第一层就废了；
+   dump 里的 `hidden_values` 被清成 0，所以看不出"hidden 还好"）。改成**比值形式** `exp(c_t - c_s)`
+   （只在下三角上取指数，指数 ≤ 0）之后没有 NaN；reference provider 早就这么做
+   （`pairwise[i,j] = exp(cum_i - cum_j)`），这条是照着语义真值改的。
+
+**待办（下一项）**：82 次 `all_reduce` 的固定开销、`linear` 298 次每次 0.30 ms、`rmsnorm` 108 次每次
+0.63 ms 这些小算子的派发成本——即"把 1411 步里剩下 1300 步的调度开销压下去"，属于框架侧（算子融合 /
+集合通信合并）而不是再换 body。
 
 ## 待解决
 
@@ -1177,17 +1263,16 @@ harness 支持"按 dtype 生成 case"（框架侧工作，未排期）。
 要收窄的杠杆是**按 slot 选 dtype**（残差流与归一化统计量留 f32、大 GEMM 走 bf16）——"精度是配置"的范畴，
 不擅自改。
 
-**③ `gated_delta_rule` 的分块并行递推待排期**（`moe_layer` 的 grouped 调度已落地，见 D6.12）：
-它是现在前向的第一项（tp=4、S=8：30 次 × 40.5 ms = 1.21 s，占 tp=4 墙钟 1.99 s 的 **61%**），同样是
-**与 token 数几乎无关的固定开销**（声明的递推逐 token 跑的 ATen 循环）。换算法 = 换 body，
-参考递推继续当 oracle，判据同样逐位/容差对照；**并且要连 case 一起加**（D6.12 的教训：一个算子两份
-实现而没有 case，等于没有门禁）。
+**③ `gated_delta_rule` 的分块扫描已落地（D6.13）**。改成前向第一项之后，剩下的最大项是**框架侧的开销**：
+82 次 `intrinsic.all_reduce`（tp=4 下 0.360 s，占步内 37%）、`linear` 298 次 × 0.297 ms、`rmsnorm`
+108 次 × 0.625 ms —— 1411 步里除了两三个算子体之外，剩下 1300 步每次都是 0.3–0.6 ms 的派发/启动成本。
+这是"算子融合 / 集合通信合并"的问题，不是再换一个 body。
 
-**④ 一个 fixture 里的潜在缺陷（与 D6.12 无关，独立小修）**：
+**④ 一个 fixture 里的潜在缺陷（与 D6.12/D6.13 无关，独立小修）**：
 `crates/rustrain-model/tests/fixtures/qwen36-text/model.json:916` 的 `reshape [512, -1, 128]` 把窗口
-长度写死成 512，`params.seq` 改成别的值会在这里报形状错（本轮想造 S=8 稀疏路由对照时撞上）。
-它不影响当前参数（`params.seq = 512`），但是同一类"位置常量"缺陷（D6.6 §4a 修过一次），
-应当改成由 `seq`/`heads` 表达的式子。
+长度写死成 512，`params.seq` 改成别的值会在这里报形状错（本轮想造 S=8 稀疏路由对照时撞上；后来改用
+fixture 的 `chunk_size` 做对照，不需要它）。它不影响当前参数（`params.seq = 512`），但是同一类
+"位置常量"缺陷（D6.6 §4a 修过一次），应当改成由 `seq`/`heads` 表达的式子。
 
 ---
 

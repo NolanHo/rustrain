@@ -45,33 +45,52 @@ rustrain run --plugin ... --recipe plugins/aten/aten.toml --device cuda \
 **歧义**而不是选择（`Registry::resolve_by_default_provider` 按 provider 名匹配，两个都能跑就
 报 ambiguous）。所以调度住在 body 里，由 body 自己挑，并把挑选规则写在一处。
 
-今天只有 `moe_layer` 有两个调度，规则是一句话加一条前提：
+今天有两个算子有两个调度（`moe_layer` 与 `gated_delta_rule`），各自的挑选规则写在一处：
+
+**`moe_layer`** —— 是否满足 `torch._grouped_mm` 的操作数约束：
 
 | 条件 | 调度 |
 |---|---|
 | `torch._grouped_mm` 接受这些操作数（contraction 维是 16 字节的整数倍，`GroupedMMUtils.h: check_valid_strides_and_return_transposed`） | **grouped**：把 (row, slot) 对按专家序排好（host 侧一次，和 reference 循环用的是同一趟），三次 `_grouped_mm` 代替 `E×K` 次小算子 |
 | 形状不满足对齐 | **reference 循环**：逐 (专家, slot) 的 `index_select` + 三次 matmul + `index_copy_` |
 
-两点取舍写在 `ops_moe.cpp` 里，不藏在代码里：
+**`gated_delta_rule`** —— 算子自己声明的 `chunk_size`（i64，默认 64；声明原文就是 "sizes the chunked scan"）：
 
-- **为什么走 grouped**：循环的开销是**每次调用的固定成本**付 `E × K` 遍（本模型几何下 2048 遍），
-  与有多少 token 路由过去无关；本模型的两个调度差 30×（宿主实测 45.4 → 1.50 ms/层，见 spec D6.12）。
-- **形状不满足对齐时**回退到循环而不是报错：形状合法、循环就在同一个 body 里，这是**调度**选择
-  （ATen 自己也按 shape 挑 kernel），不是解析降级，也不是契约变化。代价是**下游看不出跑了哪个**：
-  ABI 没有通道、plan digest 记的是变体而不是 body 内部分支 —— 所以门禁用**两条 case 各跑一条**来
-  覆盖（`H=I=2` 走循环、`H=I=8` 走 grouped），而不是靠"记录回退"。
+| 条件 | 调度 |
+|---|---|
+| `chunk_size >= 2` | **分块扫描**：每个 chunk 一次单位下三角解 + 几次批量 matmul，顺序依赖降为 `ceil(S/chunk_size)` 步 |
+| `chunk_size == 1` | **逐 token 扫描**：声明的递推逐字执行（也是上面那条的退化情形） |
+
+两点取舍写在各自的 body 里，不藏在代码里：
+
+- **为什么走 grouped / 分块**：两者的成本都是**每次调用的固定成本**反复付——`moe_layer` 付 `E × K`
+  遍（本模型几何下 2048 遍）与有多少 token 路由过去无关；`gated_delta_rule` 付 S 遍（512 步 × 约 20 个
+  小算子）。两条路径分别快 30× 与 7.4×（宿主实测，spec D6.12 / D6.13）。就地更新状态那条"看着像瓶颈"
+  的解释被排除过：只快 1.11×。
+- **形状不满足对齐 / chunk_size = 1 时**走另一条调度而不是报错：形状合法、另一条就在同一个 body 里，
+  这是**调度**选择（ATen 自己也按 shape 挑 kernel），不是解析降级，也不是契约变化。代价是**下游看不出
+  跑了哪个**：ABI 没有通道、plan digest 记的是变体而不是 body 内部分支 —— 所以门禁用**每条调度一条
+  case**来覆盖（`moe_layer`：`H=I=2` / `H=I=8`；`gated_delta_rule`：`chunk_size = 1` / `2`），
+  而不是靠"记录回退"。
+- **分块扫描里所有衰减都写成比值** `exp(c_t - c_s)`，绝不写成 `exp(c_t) · exp(-c_s)`：后者要求两个因子同时可表示，
+  而 chunk 累计衰减超过 `ln(FLT_MAX) ≈ 88.7` 时一个上溢成 inf、另一个已是次正规数并很快变 0，把两者乘回去
+  就得到 `inf - inf` 或 `0 · inf` —— NaN（真实模型上确实撞到了）。reference provider 同样用比值形式。
 
 ## 验证（2026-09，宿主 8× L20X，sm_89）
 
 | 证据 | 命令 | 结果 |
 |---|---|---|
 | Rust 宿主 `dlopen` C++ 插件 | `rustrain ops list --plugin librustrain_aten.so` | 88 个实现（32 reference + 28×2 aten：f32 与 bf16 各一） |
-| 逐算子对拍（框架门禁） | `rustrain ops check --plugin … --recipe plugins/aten/aten.toml --device cuda` | `94 case(s): 0 failing`；`cuda.aten.f32` 的 numeric+determinism 全过；`cuda.aten.bf16` 行显示 **skip**（理由写明"dtype f32 is not accepted… 门禁今天每个 case 只生成一种 dtype"），不是 fail——**bf16 变体今天不在门禁的数值判定里**，框架侧 gap |
+| 逐算子对拍（框架门禁） | `rustrain ops check --plugin … --recipe plugins/aten/aten.toml --device cuda` | `100 case(s): 0 failing`；`cuda.aten.f32` 的 numeric+determinism 全过；`cuda.aten.bf16` 行显示 **skip**（理由写明"dtype f32 is not accepted… 门禁今天每个 case 只生成一种 dtype"），不是 fail——**bf16 变体今天不在门禁的数值判定里**，框架侧 gap |
 | `moe_layer` 的两条调度各自被门禁覆盖 | 同上，`--op moe_layer`（新增 `H=I=8` 对齐 case） | 两条 case：`H=I=2` 走循环、`H=I=8` 走 grouped，都 pass；把 `offsets` 改回"组起点"的变异构建让第二条 **FAIL**（gate exit 1），第一条仍 pass —— 即这条 case 真的覆盖 grouped |
+| `gated_delta_rule` 的两条调度各自被门禁覆盖 | 同上，`--op gated_delta_rule`（新增 `chunk_size = 1` case） | `chunk_size = 2` 走分块、`1` 走逐 token，两条都 `pass`（对照 reference provider，它自己是分块实现） |
+| 分块扫描的 NaN 回归门 | 同上（`g = −16`、`chunk_size = 8`、每 chunk `|cum| = 128` 的饱和 case）＋把 `pair`/`carry` 改回两个因子相乘的变异构建 | 当前构建 `100 case / 0 failing`；变异构建 `exit=1`、`1 failing`，报文点名 `output out0 element 0 is NaN (non-finite)`；另两条 GDN case 在变异上仍 pass（它们够不到那个区间） |
 | 插件自检（对照 Rust oracle 源码） | 宿主 `gpu-work/smoke_aten.py` | 31/31 case，26 个算子，两次运行字节一致 |
 | bf16 变体自检（bf16 跑 vs f32 跑后取整到 bf16） | 宿主 `gpu-work/smoke_bf16.py`（2026-09-14） | 61/61 case 通过：全部 28 个算子（含 bf16 的 `gated_delta_rule` fp32 state、`sdpa`、`causal_conv1d`、`moe_layer`），两次运行字节一致；56 个描述符的 per-variant mask / numerics 逐条断言通过 |
 | `moe_layer` 的 grouped 调度（变异对照：把调度条件翻成 false 的同一份源码另编一个 `.so`） | 宿主 `rustrain run`（world=1、同 probe token、bf16 / f32） | bf16 **逐位相同**（logits 与 42 个 hidden state 全等，不是"在容差内"）；f32 差 1.6e-6（重结合顺序不同）；tp=4 的 `max\|diff\|` vs world-1 两条调度都是 **1.21875** |
 | grouped 调度的空专家组 | 宿主 python 探针（同一串 ATen 调用） | 三种稀疏度（0 / 0 / 192 个空专家，共 256）下与循环逐位相同 |
+| `gated_delta_rule` 的分块扫描（对照：同一 `.so`，只把描述里声明的 `chunk_size` 从 64 改成 1） | 宿主 `rustrain run`（world=1、同 probe token） | f32 两条调度差 **2.130e-6**（重结合）；对 HF f32 1.9995e-3（逐 token 2.0012e-3）；tp=4 每层 40.5 → **5.44 ms**，墙钟 1.988 → **0.974 s** |
+| 同上，bf16 | 同上 | 两条调度差 1.053e-1 —— **不是**缺陷：bf16 的舍入混沌，同一量级就是 HF 自己 bf16-vs-f32 的 1.523e-1（spec D6.11/D6.13） |
 
 开发过程中被门禁抓到的两类真问题（都是"看起来对"的）：
 
@@ -92,7 +111,7 @@ rustrain run --plugin ... --recipe plugins/aten/aten.toml --device cuda \
 | `sdpa` | `at::scaled_dot_product_attention`（CUDA 上即 FlashAttention-2 / mem-efficient），GQA 走 `repeat_interleave`，causal 与 additive mask 合成一个再加 |
 | `rope` | ATen 组合：half-split、`inv_freq[j] = theta^(-2j/rotary_dim)`、位置沿第 0 轴 |
 | `causal_conv1d` | `at::conv1d`（cuDNN）depthwise + 裁回长度 L |
-| `gated_delta_rule` | ATen 组合直接跑声明的 recurrence（`S_t = S_{t-1}e^{g_t} + k_t((v_t - S_{t-1}k_t)β_t)`，更新后读）。`chunk_size` 是分块快速路径的尺寸，不改变取值，所以这条 body 不读它 |
+| `gated_delta_rule` | ATen 组合跑声明的递推，两条调度：`chunk_size == 1` 逐 token、`>= 2` 分块（`S_t = S_{t-1}e^{g_t}`；`δ_t = β_t(v_t - k_tᵀS_t)`；`S_t += k_tδ_tᵀ`；更新后读 `o_t = q_tᵀS_t`——衰减在读之前施加） |
 | `topk_router` | `softmax` + 稳定降序排序后取前 k（并列取小专家号），`norm_topk_prob` 照声明 |
 | `embedding` / `gather` / `scatter` | ATen 索引 kernel；负索引一律拒绝（不绕回） |
 | `moe_layer` | ATen 组合：按专家选 token → 三个 matmul → `index_add_`，dropless、升序累加，共享专家 sigmoid 门控 |

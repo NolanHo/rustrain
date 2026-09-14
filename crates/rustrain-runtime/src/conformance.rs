@@ -255,6 +255,12 @@ pub enum Fill {
     Pseudo {
         seed: u64,
     },
+    /// A constant, for inputs whose *magnitude* is the point rather than their
+    /// variation — a log-decay strong enough to exercise the range where
+    /// `exp` saturates, say.
+    Constant {
+        value: f32,
+    },
     /// Indices in `[0, modulo)`, for i32/i64 inputs.
     Indices {
         modulo: i64,
@@ -267,6 +273,7 @@ impl Fill {
             Fill::Zeros => 0.0,
             Fill::Ones => 1.0,
             Fill::Ramp => (i % 17) as f32 * 0.25 - 2.0,
+            Fill::Constant { value } => *value,
             Fill::Indices { .. } => 0.0,
             Fill::Pseudo { seed } => {
                 // xorshift64*: tiny, deterministic, no dependency.
@@ -316,7 +323,6 @@ impl InputSpec {
             fill: Fill::Indices { modulo: 4 },
         }
     }
-
     pub fn numel(&self) -> usize {
         self.shape.iter().product::<i64>().max(0) as usize
     }
@@ -1017,6 +1023,29 @@ pub fn compare(actual: &[Output], expected: &[Output], tol: Tolerance) -> Check 
         }
         for (i, (x, y)) in xs.iter().zip(&ys).enumerate() {
             let (x, y) = (*x as f64, *y as f64);
+            // Non-finite values are never "within tolerance", and they have to be
+            // caught here rather than by the budget test below: `NaN > worst` is
+            // false, so a NaN output would be *silently ignored* — an
+            // implementation that produced nothing but NaNs would pass this gate.
+            // (That is not hypothetical: the first chunked `gated_delta_rule`
+            // overflowed to NaN and this comparison called it green.)
+            if !x.is_finite() || !y.is_finite() {
+                return Check::fail(format!(
+                    "output {} element {i} is {} on the implementation side and {} on the \
+                     reference side; a non-finite value is a defect, not a tolerance question",
+                    a.name,
+                    if x.is_finite() {
+                        format!("{x}")
+                    } else {
+                        format!("{x} (non-finite)")
+                    },
+                    if y.is_finite() {
+                        format!("{y}")
+                    } else {
+                        format!("{y} (non-finite)")
+                    },
+                ));
+            }
             let err = (x - y).abs();
             let scale = tol.abs + tol.rel * y.abs();
             let ratio = if scale > 0.0 { err / scale } else { err };
@@ -1308,6 +1337,29 @@ pub fn default_cases() -> Vec<Case> {
                 .set("chunk_size", 2i64),
         ),
     );
+    // The same operator at `chunk_size = 1`: the declaration says the attribute
+    // "sizes the chunked scan … and does not change the value", and the ATen body
+    // really does branch on it — one token per chunk is the token-by-token scan,
+    // two is the chunked one (`plugins/aten/src/ops_recurrent.cpp`). Two schedules,
+    // two cases: without this one the body's other half would be unjudged, which is
+    // the gap the `moe_layer` aligned case was added to close.
+    cases.push(
+        Case::new(
+            "gated_delta_rule",
+            vec![
+                InputSpec::f32("q", vec![1, 4, 2], Ramp),
+                InputSpec::f32("k", vec![1, 4, 2], Pseudo { seed: 53 }),
+                InputSpec::f32("v", vec![1, 4, 2], Pseudo { seed: 59 }),
+                InputSpec::f32("g", vec![1, 4, 1], Pseudo { seed: 61 }),
+                InputSpec::f32("beta", vec![1, 4, 1], Pseudo { seed: 67 }),
+            ],
+        )
+        .attrs(
+            Attrs::new()
+                .set("state_dtype", "f32")
+                .set("chunk_size", 1i64),
+        ),
+    );
     // moe_layer: the one-operator sparse layer with the static [.., H] in/out
     // contract (op-vocabulary §3.3) — one token (rows=1), E=4, I=2, K=2. The
     // routing indices stay inside [0, E) (the Indices fill is modulo 4, which
@@ -1354,6 +1406,32 @@ pub fn default_cases() -> Vec<Case> {
             InputSpec::f32("shared_expert_gate", vec![1, 8], Pseudo { seed: 113 }),
         ],
     ));
+    // The same operator once more, at a decay strong enough to saturate the
+    // range. Every form of this scan multiplies by `exp` of a cumulative
+    // log-decay, and the arithmetic is only equivalent while those factors are
+    // representable: a chunked body that forms `exp(cum)` and `exp(-cum)`
+    // separately overflows the second past `ln(FLT_MAX) ≈ 88.7` and multiplies it
+    // by a zero, which is NaN — measured on this model, whose own decay reaches
+    // that inside a short chunk. g = -16 over an 8-token chunk is |cum| = 128, one
+    // case that fails loudly if that regression ever comes back, and the first
+    // case here whose `g` is actually non-positive as the declaration requires.
+    cases.push(
+        Case::new(
+            "gated_delta_rule",
+            vec![
+                InputSpec::f32("q", vec![1, 8, 2], Ramp),
+                InputSpec::f32("k", vec![1, 8, 2], Pseudo { seed: 53 }),
+                InputSpec::f32("v", vec![1, 8, 2], Pseudo { seed: 59 }),
+                InputSpec::f32("g", vec![1, 8, 1], Fill::Constant { value: -16.0 }),
+                InputSpec::f32("beta", vec![1, 8, 1], Pseudo { seed: 67 }),
+            ],
+        )
+        .attrs(
+            Attrs::new()
+                .set("state_dtype", "f32")
+                .set("chunk_size", 8i64),
+        ),
+    );
     // rope's T2 completion: partial rotary + theta + position defaults, two
     // outputs — the case the gate used to skip for lack of a convention.
     cases.push(
@@ -1458,6 +1536,33 @@ mod tests {
     use super::*;
 
     use rustrain_abi::Plugin;
+
+    /// A NaN is a defect, not a number outside a budget: the comparison's
+    /// `ratio > worst` test is false for NaN, so without an explicit check an
+    /// implementation whose output is *entirely* NaN would be reported green.
+    #[test]
+    fn a_non_finite_output_is_never_within_tolerance() {
+        let out = |values: [f32; 2]| Output {
+            name: "y".to_string(),
+            dtype: RsDtype::F32,
+            shape: vec![2],
+            bytes: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        };
+        assert!(matches!(
+            compare(&[out([1.0, 2.0])], &[out([1.0, 2.0])], Tolerance::default()),
+            Check::Pass { .. }
+        ));
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let got = compare(&[out([1.0, bad])], &[out([1.0, 2.0])], Tolerance::default());
+            let Check::Fail { detail } = &got else {
+                panic!("{bad} was accepted: {got:?}");
+            };
+            assert!(detail.contains("non-finite"), "the reason names it: {detail}");
+            // And the reference side is held to the same rule.
+            let got = compare(&[out([1.0, 2.0])], &[out([1.0, bad])], Tolerance::default());
+            assert!(got.is_fail(), "{bad} on the reference side was accepted");
+        }
+    }
 
     fn moe_case() -> Case {
         default_cases()
