@@ -54,7 +54,8 @@ pub(crate) struct LoadOutcome {
     pub slots: usize,
     /// Widened f32 bytes that reached the device — the number that must fall as a mesh widens.
     pub weight_bytes: u64,
-    /// Wall time of the whole load, workers and device writes included.
+    /// Wall time of the whole load — the index parse, the pairing, the workers and the device
+    /// writes.
     pub wall: Duration,
     /// Time the calling thread spent *inside* the device copies, not waiting for the workers to
     /// hand over the next tensor — the number that says what the copies cost, and the one that
@@ -154,6 +155,7 @@ pub(crate) fn load_weights(
     checkpoint: &Path,
     executor: &mut rustrain_runtime::Executor,
 ) -> Result<LoadOutcome> {
+    let load_started = Instant::now();
     let meta = load_checkpoint(checkpoint)?;
 
     // `run` needs the bytes, not just the metadata: a snapshot has no `data_offsets`, so nothing
@@ -333,13 +335,19 @@ pub(crate) fn load_weights(
     let next = std::sync::atomic::AtomicUsize::new(0);
     let outcomes: std::sync::Mutex<Vec<GroupOutcome>> =
         std::sync::Mutex::new(Vec::with_capacity(groups.len()));
-    let (tx, rx) = std::sync::mpsc::channel::<LoadedWeight>();
+    // A *bounded* channel: the point of streaming the weights into the executor is that the host
+    // does not hold a second copy of every tensor it owns, and an unbounded queue would quietly
+    // hand back all of it whenever the fill runs faster than the copies do (it does: ~9 s of fill
+    // against ~19 s of copies). One slot in flight per worker is the bound.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<LoadedWeight>(workers);
     let mut sink = Sink {
         seen: vec![false; plan.slots.len()],
         ..Sink::default()
     };
-    let load_started = Instant::now();
     let mut write_busy = Duration::ZERO;
+    // Set when a device copy fails: the workers check it before taking another tensor, so a
+    // failure does not turn into "read the rest of the checkpoint first, then report".
+    let abort = std::sync::atomic::AtomicBool::new(false);
     let written: Result<()> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
@@ -367,10 +375,17 @@ pub(crate) fn load_weights(
         // touch the groups and the channel, and the copies happen here, overlapped with them.
         for weight in rx {
             let started = Instant::now();
-            executor
+            let copied = executor
                 .write_f32(weight.slot, &weight.values)
-                .with_context(|| format!("writing the weight slot `{}`", weight.name))?;
+                .with_context(|| format!("writing the weight slot `{}`", weight.name));
             write_busy += started.elapsed();
+            let () = match copied {
+                Ok(()) => {}
+                Err(error) => {
+                    abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(error);
+                }
+            };
             sink.bytes += (weight.values.len() * 4) as u64;
             sink.slots += 1;
             sink.seen[weight.slot.0] = true;
@@ -382,11 +397,10 @@ pub(crate) fn load_weights(
         }
         Ok(())
     });
-    written?;
-
     // Deterministic error reporting: the lowest group index that failed is the one reported, no
-    // matter which worker got there first. It outranks the writer's error, which is only ever a
-    // consequence of the groups that did complete.
+    // matter which worker got there first. A failed device copy is reported only after that — it
+    // is the later, less specific failure (it says a slot could not be written, not what was
+    // wrong with the tensor), and it would otherwise mask a description the loader can name.
     let mut outcomes = outcomes.into_inner().expect("the loader's result lock");
     outcomes.sort_by_key(|(index, _)| *index);
     let mut stats = LoadStats {
@@ -401,6 +415,8 @@ pub(crate) fn load_weights(
         stats.read += group_stats.read;
         stats.fill += group_stats.fill;
     }
+
+    written?;
 
     // Every weight slot of *this* plan must have been loaded exactly once; a weight slot with no
     // pairing is an unbound slot (already rejected above), and one loaded twice would be a
@@ -575,7 +591,7 @@ fn strides_of(shape: &[i64]) -> Vec<i64> {
 fn load_group(
     group: &Group,
     rank: usize,
-    sink: &std::sync::mpsc::Sender<LoadedWeight>,
+    sink: &std::sync::mpsc::SyncSender<LoadedWeight>,
 ) -> Result<LoadStats> {
     let mut stats = LoadStats {
         tensors_read: 1,

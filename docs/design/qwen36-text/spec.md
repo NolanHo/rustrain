@@ -545,12 +545,13 @@ Debug 速度卡在这里，所以先修它。
 | 一次 sweep（baseline + tp=2） | **22 m 43 s** | **58–61 s**（23×） |
 | world=1 单次运行（进程） | 624.9 s | **30.5–32.9 s**（20×） |
 | world=1 的**加载**墙钟 | ~614 s | **20.5 s** |
-| 加载 CPU-sum（16 worker 相加） | 406.9 s | **188.8 s**（fill 145 + read 24 + write 20） |
+| 加载各相位读数之和（read/fill 是 16 worker 相加，write 是墙钟） | 406.9 s | **217.1 s**（fill 153 + read 24 + write 19） |
 | 读到的字节 | 109.0 GiB | **66.1 GiB**（= 去重字节） |
 | `widen` / `transform` / `slice` 三个相位 | 71 / 420 / 74 s | **不存在了**（合并成一次 `fill`） |
 | 设备回写 | 串行，全部读完之后 15 s | **与读/填充重叠**，写者 = 调用线程；**但回写本身仍是 18.8 s** |
 
-`checkpoint_load` 的口径（读它的人必须先看这一句）：`wall_seconds` 是整段加载的墙钟；
+`checkpoint_load` 的口径（读它的人必须先看这一句）：`wall_seconds` 是从 `load_weights` 入口起算的墙钟（含索引解析与 pairing；`LoadOutcome.wall` 在
+加载函数的第一行起表）；
 `read_cpu_seconds` / `fill_cpu_seconds` 是**对 `workers` 个线程求和**（不是墙钟，不能与前者相加）；
 `write_seconds` 是调用线程上设备回写的墙钟，与两者重叠。四个数字相加是无意义的。
 

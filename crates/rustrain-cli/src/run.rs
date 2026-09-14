@@ -629,14 +629,16 @@ fn run_rank(
         } => {
             if *transport_rank != rank || *world_size != mesh.world_size() {
                 bail!(
-                    "this process was given rank {rank} but the transport was set up for rank                      {transport_rank} of world {world_size} (the mesh has {})",
+                    "this process was given rank {rank} but the transport was set up for rank \
+                     {transport_rank} of world {world_size} (the mesh has {})",
                     mesh.world_size()
                 );
             }
             let index = match device {
                 DeviceSpec::Cuda(index) => index,
                 DeviceSpec::Cpu => bail!(
-                    "the NCCL transport needs a CUDA device: rank {rank} of a multi-process world                      runs one rank per GPU"
+                    "the NCCL transport needs a CUDA device: rank {rank} of a multi-process world \
+                     runs one rank per GPU"
                 ),
             };
             let backend = NcclBackend::new(rank, mesh.clone(), index, rendezvous, *library)
@@ -821,7 +823,6 @@ fn run_rank(
     let rank_weight_bytes = load.weight_bytes;
     let checkpoint_bytes = load.stats.bytes_read;
     let write_seconds = load.write.as_secs_f64();
-    let _ = write_seconds;
 
     let started = Instant::now();
     let stats = executor.run().context("executing the forward")?;
@@ -904,9 +905,9 @@ fn run_rank(
         "weight_slots": loaded_count,
         "weight_bytes": rank_weight_bytes,
         "checkpoint_bytes_read": checkpoint_bytes,
-        // The loader is the slowest part of a run by an order of magnitude; these are the phases
-        // it splits into. `bytes_distinct` is what one read per tensor would need — the gap to
-        // `bytes_read` is duplication the `split` bindings cause.
+        // The phases the load splits into. `bytes_distinct` is what one read per tensor would
+        // need; it equals `bytes_read` today (the pairing gives a tensor one transform) and the
+        // two would part company if one tensor could feed two groups.
         "checkpoint_load": {
             "bytes_read": load.stats.bytes_read,
             "bytes_distinct": load.stats.bytes_distinct,
