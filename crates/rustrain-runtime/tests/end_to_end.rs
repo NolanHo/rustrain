@@ -241,6 +241,12 @@ fn compiled_plan_executes_and_produces_the_expected_numbers() {
     let stats = ex.run().unwrap();
     assert_eq!(stats.ops, 1);
     assert_eq!(stats.collectives, 0);
+    // A plan with no collective records no collective time, and the op's own time is measured —
+    // the two numbers a rank-vs-rank comparison reads.
+    assert!(stats.op_nanos > 0, "the op body's time is measured");
+    assert_eq!(stats.collective_nanos, 0);
+    assert_eq!(stats.first_collective_nanos, 0);
+    assert!(stats.collective_nanos_by_kind.is_empty());
 
     assert_eq!(ex.read_f32(y).unwrap(), vec![2.0, 4.0, 6.0, 8.0]);
 }
@@ -320,6 +326,23 @@ fn row_parallel_weight_inserts_a_collective_the_runtime_drives() {
         "the runtime must drive the all-reduce"
     );
     assert_eq!(stats.ops, 1);
+    // One collective, timed: the by-kind map accounts for exactly the total, and the first
+    // collective's time (communicator creation on a real backend) is part of it.
+    assert!(stats.collective_nanos > 0);
+    assert!(stats.first_collective_nanos > 0);
+    assert!(stats.first_collective_nanos <= stats.collective_nanos);
+    assert_eq!(
+        stats.collective_nanos_by_kind.values().sum::<u64>(),
+        stats.collective_nanos
+    );
+    assert_eq!(
+        stats
+            .collective_nanos_by_kind
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![rustrain_plan::intrinsic::ALL_REDUCE.to_string()]
+    );
     // With one process the all-reduce is the identity, so the value survives.
     assert_eq!(ex.read_f32(y).unwrap(), vec![3.0, 6.0, 9.0, 12.0]);
 }

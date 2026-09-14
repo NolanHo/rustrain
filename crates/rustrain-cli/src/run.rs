@@ -477,6 +477,17 @@ pub(crate) fn emit_result(
         result.wall.as_secs_f64(),
         gib(result.peak_bytes)
     );
+    // Where rank 0's own wall clock went, so a skew between ranks can be attributed without a
+    // profiler: the collective backends, the first collective (communicator creation), the plugin
+    // bodies, and the rest (the executor's own walks).
+    println!(
+        "  rank 0 time: collectives {:.3} s (first {:.3} s), ops {:.3} s, other {:.3} s",
+        result.rank0_collective_seconds,
+        result.rank0_first_collective_seconds,
+        result.rank0_op_seconds,
+        (result.wall.as_secs_f64() - result.rank0_collective_seconds - result.rank0_op_seconds)
+            .max(0.0)
+    );
     println!(
         "  probe {} token(s) in the declared window of {window} (padded with 0; causal execution \
          keeps rows 0..{} exact)",
@@ -551,8 +562,24 @@ pub(crate) struct MeshResult {
     rank0_steps: usize,
     rank0_ops: usize,
     rank0_collectives: usize,
+    /// Rank 0's own forward split into collective time, op time, and the executor's remainder.
+    rank0_collective_seconds: f64,
+    rank0_first_collective_seconds: f64,
+    rank0_op_seconds: f64,
     /// Per-rank metrics (JSON), rank order.
     ranks: Vec<serde_json::Value>,
+}
+
+/// Wall-clock seconds since the epoch, for the phase boundaries of one rank's run.
+///
+/// `Instant` cannot be compared across processes; a rank's *arrival* at the first collective can
+/// only be expressed on a shared clock, and that arrival is what decides who spends the group's
+/// formation time inside its own forward.
+fn unix_seconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 fn mesh_text(cfg: &ParallelConfig) -> String {
@@ -823,10 +850,17 @@ fn run_rank(
     let rank_weight_bytes = load.weight_bytes;
     let checkpoint_bytes = load.stats.bytes_read;
     let write_seconds = load.write.as_secs_f64();
+    let load_finished_unix = unix_seconds();
 
+    // The pre-forward phases are timed against the wall clock, not against an `Instant`: ranks
+    // are separate processes on one host, so `SystemTime` is the only clock that can say which
+    // rank reached the first collective first. That is the whole question behind a per-rank wall
+    // difference — a rank that arrives early pays the group's formation inside its own forward.
+    let forward_started_unix = unix_seconds();
     let started = Instant::now();
     let stats = executor.run().context("executing the forward")?;
     let wall = started.elapsed();
+    let forward_finished_unix = unix_seconds();
 
     // ---- the outputs, from rank 0 only -----------------------------------
     let (logits, vocab, summaries, hidden_names, hidden_values, hidden_cols) = if rank == 0 {
@@ -929,8 +963,27 @@ fn run_rank(
         "collective_sent_bytes": stats.collective_sent_bytes,
         "collective_recv_bytes": stats.collective_recv_bytes,
         "collectives_by_kind": collectives_by_kind,
+        // Where the forward's wall clock went: the sum of the collective backends' own time, the
+        // same per intrinsic kind, the first collective alone (communicators are created on first
+        // use, so a rank that arrives late pays for the whole group here), and the plugin bodies.
+        // Each is the rank's own time; a difference between ranks in one of these *is* the
+        // asymmetry, which is what they exist to localize.
+        "collective_seconds": stats.collective_nanos as f64 / 1e9,
+        "collective_seconds_by_kind": stats
+            .collective_nanos_by_kind
+            .iter()
+            .map(|(kind, nanos)| (kind.clone(), *nanos as f64 / 1e9))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        "first_collective_seconds": stats.first_collective_nanos as f64 / 1e9,
+        "op_seconds": stats.op_nanos as f64 / 1e9,
         "peak_bytes": peak_bytes,
         "wall_seconds": wall.as_secs_f64(),
+        // Unix seconds at three phase boundaries. Same host, separate processes: comparing them
+        // across ranks shows the arrival skew, which is what a per-rank wall difference really
+        // measures when the first collective is a group rendezvous.
+        "load_finished_unix": load_finished_unix,
+        "forward_started_unix": forward_started_unix,
+        "forward_finished_unix": forward_finished_unix,
         "window": window,
         // Rank 0 only; the other ranks carry the same structure with nothing.
         "logits": if rank == 0 {
@@ -1152,6 +1205,9 @@ pub(crate) fn assemble_ranks(
         rank0_steps: rank0["plan_steps"].as_u64().unwrap_or(0) as usize,
         rank0_ops: rank0["ops"].as_u64().unwrap_or(0) as usize,
         rank0_collectives: rank0["collectives"].as_u64().unwrap_or(0) as usize,
+        rank0_collective_seconds: rank0["collective_seconds"].as_f64().unwrap_or(0.0),
+        rank0_first_collective_seconds: rank0["first_collective_seconds"].as_f64().unwrap_or(0.0),
+        rank0_op_seconds: rank0["op_seconds"].as_f64().unwrap_or(0.0),
         ranks,
     })
 }

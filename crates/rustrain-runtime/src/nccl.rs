@@ -1177,7 +1177,8 @@ mod tests {
                 }
                 let expected: Vec<i64> = (0..local.len())
                     .map(|flat| {
-                        ((flat / count) * degree + rank) as i64 * count as i64 + (flat % count) as i64
+                        ((flat / count) * degree + rank) as i64 * count as i64
+                            + (flat % count) as i64
                     })
                     .collect();
                 assert_eq!(

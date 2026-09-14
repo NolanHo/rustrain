@@ -264,6 +264,20 @@ pub struct RunStats {
     /// One entry per executed collective, in execution order — the per-step
     /// evidence the D6 metrics report aggregates by kind and group.
     pub collective_records: Vec<CollectiveRecord>,
+    /// Nanoseconds spent inside collective backends, summed over the run. Kept in
+    /// nanoseconds so `RunStats` stays `Eq` (a float here would make the whole
+    /// struct uncomparable) and so the metrics report can decide its own unit.
+    pub collective_nanos: u64,
+    /// The same, per intrinsic op name: `intrinsic.all_gather` → nanoseconds.
+    /// The first entry of a kind carries its lazily created communicator
+    /// (`ncclCommInitRank` and the id-file rendezvous), which is why the
+    /// per-kind numbers are read next to `first_collective_nanos`.
+    pub collective_nanos_by_kind: std::collections::BTreeMap<String, u64>,
+    /// Nanoseconds the *first* collective of the run took: communicator creation
+    /// happens on first use, so this is where a rank that arrives late pays.
+    pub first_collective_nanos: u64,
+    /// Nanoseconds spent inside plugin `execute` calls, summed over the run.
+    pub op_nanos: u64,
 }
 
 /// One executed collective, as the metrics report reads it. The group travels
@@ -709,6 +723,7 @@ impl Executor {
                     };
                     let input = in_tensors[0];
                     let mut output = out_tensors.remove(0);
+                    let collective_started = std::time::Instant::now();
                     let report = self
                         .collectives
                         .execute(&request, &input, &mut output, self.allocator.as_mut())
@@ -717,6 +732,15 @@ impl Executor {
                             op: label.clone(),
                             reason,
                         })?;
+                    let nanos = collective_started.elapsed().as_nanos() as u64;
+                    if stats.collectives == 0 {
+                        stats.first_collective_nanos = nanos;
+                    }
+                    stats.collective_nanos += nanos;
+                    *stats
+                        .collective_nanos_by_kind
+                        .entry(op.clone())
+                        .or_default() += nanos;
                     stats.collectives += 1;
                     stats.steps += 1;
                     stats.collective_sent_bytes += report.sent_bytes;
@@ -754,6 +778,7 @@ impl Executor {
                     // for shape inference; the attribute array is owned by the
                     // step and outlives the call. The implementation may write
                     // only the outputs it declared, which `infer` verified.
+                    let op_started = std::time::Instant::now();
                     let status = unsafe {
                         execute(
                             &mut ctx,
@@ -798,6 +823,7 @@ impl Executor {
                         }
                     }
 
+                    stats.op_nanos += op_started.elapsed().as_nanos() as u64;
                     stats.ops += 1;
                     stats.steps += 1;
                 }
