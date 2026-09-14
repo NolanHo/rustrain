@@ -1030,6 +1030,20 @@ fn run_rank(
             // write_wait_seconds` spans the streaming phase, so a load that is slow on the copy
             // side and one that is slow on the read side are told apart by these two numbers.
             "write_wait_seconds": load.write_wait.as_secs_f64(),
+            "write_chunks": load.write_chunks,
+            // Copy time per chunk, bucketed: a uniform transport and a fast path with outliers have
+            // the same average and completely different fixes.
+            "write_histogram_us": load
+                .write_histogram
+                .iter()
+                .map(|(bound, chunks, bytes)| {
+                    serde_json::json!({
+                        "under": if *bound == u64::MAX { "inf".to_string() } else { bound.to_string() },
+                        "chunks": chunks,
+                        "mib": *bytes as f64 / (1u64 << 20) as f64,
+                    })
+                })
+                .collect::<Vec<_>>(),
         },
         "plan_steps": plan_steps,
         "ops": stats.ops,

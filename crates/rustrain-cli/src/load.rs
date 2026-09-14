@@ -64,6 +64,15 @@ pub(crate) struct LoadOutcome {
     /// Time the calling thread spent *waiting* for the pool rather than copying. `write + write_wait`
     /// is the writer's whole span, so the pair says which stage the load is bound by.
     pub write_wait: Duration,
+    /// Device copies the writer issued, and the element count they moved. `bytes/4/chunks` is the
+    /// average piece size — the number that says whether a slow copy is per-call overhead (small
+    /// pieces) or the transport (large ones).
+    pub write_chunks: usize,
+    /// Per-chunk copy durations as `(bucket upper bound in microseconds, chunks, bytes)`, for the
+    /// buckets `<500 us`, `<1 ms`, `<2 ms`, `<5 ms`, and `>=5 ms`. An average hides the shape: 5004
+    /// copies at 5 GB/s is either a uniform slow transport or a fast path with pathological
+    /// outliers, and the two have different fixes.
+    pub write_histogram: Vec<(u64, usize, u64)>,
     /// How many workers the pool ran (`LOAD_WORKERS` capped by the group count); the phase times
     /// below are sums over them.
     pub workers: usize,
@@ -93,6 +102,10 @@ pub(crate) struct LoadedWeight {
     pub values: Vec<f32>,
 }
 
+/// How many chunk buffers the pool keeps. See the note where it is built: this is a cache-locality
+/// knob as much as a memory bound.
+const POOL_BUFFERS: usize = 16;
+
 /// How large a chunk a member is streamed in.
 ///
 /// One member used to be materialised as a single `Vec<f32>`: a 40 MB weight became 40 MB of host
@@ -111,6 +124,17 @@ const CHUNK_BYTES: usize = 8 << 20;
 /// multiple GB/s. One worker per tensor fixes both sides at once, and the memory it costs is one
 /// tensor's checkpoint bytes plus its slots per worker.
 const LOAD_WORKERS: usize = 16;
+
+/// `LOAD_WORKERS`, overridable for measurement. The pool's shape has changed twice while the
+/// constant stayed put (the narrowed read, then the 8 MiB chunk stream), and the right number is a
+/// property of the pipeline, not of the machine — so it can be measured without a rebuild.
+fn load_workers() -> usize {
+    std::env::var("RUSTRAIN_LOAD_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= 1)
+        .unwrap_or(LOAD_WORKERS)
+}
 
 /// The most read syscalls a group's narrowed read may cost. Past this the covering window is
 /// cheaper than the syscalls, so the loader reads the whole window instead — a fallback that only
@@ -338,7 +362,7 @@ pub(crate) fn load_weights(
     // host memory: that hides the host-to-device copies behind the reads (they used to be a
     // serial 19-23 s after every byte had been read), and the rank stops holding a second, f32
     // copy of every weight it owns.
-    let workers = LOAD_WORKERS.min(groups.len()).max(1);
+    let workers = load_workers().min(groups.len()).max(1);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let outcomes: std::sync::Mutex<Vec<GroupOutcome>> =
         std::sync::Mutex::new(Vec::with_capacity(groups.len()));
@@ -352,8 +376,13 @@ pub(crate) fn load_weights(
     // pages must be faulted in before the copy can read them — and the copy is the load's
     // bottleneck (spec.md §D6.10), so the faults were being paid on the critical path. Bounded:
     // the workers and the channel can hold a few chunks each, and nothing else wants one.
+    // A *small* pool on purpose: each buffer is filled by a worker and then read by the writer's
+    // device copy, and the copy reads host memory at the DRAM rate for a cold source (9.8-11.5
+    // GB/s measured) but at 15-16 GB/s when the source is still in cache. Sixteen buffers of 8 MiB
+    // is 128 MiB of in-flight chunks, which is the point where the two are told apart without
+    // starving the writer (the producer is faster than the copier, so it waits anyway).
     let pool: std::sync::Arc<std::sync::Mutex<Vec<Vec<f32>>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(2 * workers + 4)));
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(POOL_BUFFERS)));
     let mut sink = Sink {
         seen: vec![false; plan.slots.len()],
         ..Sink::default()
@@ -365,6 +394,14 @@ pub(crate) fn load_weights(
     // more, or better-shaped, workers) — and the two have opposite fixes, which is why the number
     // has to exist rather than be inferred from `read_cpu_seconds`.
     let mut write_wait = Duration::ZERO;
+    let mut write_chunks = 0usize;
+    let mut buckets: [(u64, usize, u64); 5] = [
+        (500, 0, 0),
+        (1_000, 0, 0),
+        (2_000, 0, 0),
+        (5_000, 0, 0),
+        (u64::MAX, 0, 0),
+    ];
     // Set when a device copy fails: the workers check it before taking another tensor, so a
     // failure does not turn into "read the rest of the checkpoint first, then report".
     let abort = std::sync::atomic::AtomicBool::new(false);
@@ -412,11 +449,22 @@ pub(crate) fn load_weights(
                 break;
             };
             write_wait += waited.elapsed();
+            write_chunks += 1;
             let started = Instant::now();
+            let chunk_bytes = (weight.values.len() * 4) as u64;
             let copied = executor
                 .write_f32_at(weight.slot, weight.element_offset, &weight.values)
                 .with_context(|| format!("writing the weight slot `{}`", weight.name));
-            write_busy += started.elapsed();
+            let taken = started.elapsed();
+            write_busy += taken;
+            let micros = taken.as_micros() as u64;
+            for bucket in &mut buckets {
+                if micros < bucket.0 {
+                    bucket.1 += 1;
+                    bucket.2 += chunk_bytes;
+                    break;
+                }
+            }
             let () = match copied {
                 Ok(()) => {}
                 Err(error) => {
@@ -433,7 +481,7 @@ pub(crate) fn load_weights(
             }
             // Hand the buffer back for the next chunk: it is warm, which is the whole point.
             let mut pool = pool.lock().expect("the chunk pool");
-            if pool.len() < 2 * workers + 4 {
+            if pool.len() < POOL_BUFFERS {
                 pool.push(weight.values);
             }
         }
@@ -504,6 +552,8 @@ pub(crate) fn load_weights(
         wall: load_started.elapsed(),
         write: write_busy,
         write_wait,
+        write_chunks,
+        write_histogram: buckets.to_vec(),
         workers,
     })
 }
