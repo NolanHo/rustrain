@@ -85,6 +85,12 @@ struct Sink {
     seen: Vec<bool>,
     slots: usize,
     bytes: u64,
+    /// Elements written into each slot. A streamed weight arrives in pieces, so "the slot was
+    /// seen" is no longer enough to prove it was *filled*: a lost, duplicated or misplaced chunk
+    /// would leave a gap or an overlap that no other check would notice (a zeroed region of a
+    /// weight is a plausible-looking tensor). This counter is the structural check — one number
+    /// per slot, compared against the slot's length at the end of the load.
+    written: Vec<u64>,
 }
 
 /// One weight slot's data — or a slice of it — ready to write into the executor.
@@ -385,6 +391,7 @@ pub(crate) fn load_weights(
         std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(POOL_BUFFERS)));
     let mut sink = Sink {
         seen: vec![false; plan.slots.len()],
+        written: vec![0u64; plan.slots.len()],
         ..Sink::default()
     };
     let mut write_busy = Duration::ZERO;
@@ -473,6 +480,7 @@ pub(crate) fn load_weights(
                 }
             };
             sink.bytes += (weight.values.len() * 4) as u64;
+            sink.written[weight.slot.0] += weight.values.len() as u64;
             // A streamed weight arrives as several chunks; the slot is counted once, when its
             // first chunk lands, and `seen` is simply idempotent.
             if !sink.seen[weight.slot.0] {
@@ -537,10 +545,24 @@ pub(crate) fn load_weights(
     // pairing is an unbound slot (already rejected above), and one loaded twice would be a
     // non-bijective pairing (rejected too) — this walk is the loader's own backstop.
     for (index, slot) in plan.slots.iter().enumerate() {
-        if slot.kind == rustrain_plan::SlotKind::Weight && !sink.seen[index] {
+        if slot.kind != rustrain_plan::SlotKind::Weight {
+            continue;
+        }
+        if !sink.seen[index] {
             bail!(
                 "weight slot `{}` of the rank-{rank} plan was loaded from no checkpoint tensor",
                 slot.name
+            );
+        }
+        // Every element exactly once. A streamed weight is written in pieces, and this is what
+        // makes "in pieces" as verifiable as "in one go" used to be.
+        let expected: u64 = slot.shape.iter().map(|axis| *axis as u64).product();
+        if sink.written[index] != expected {
+            bail!(
+                "weight slot `{}` of the rank-{rank} plan received {} element(s), but its local \
+                 shape holds {expected}: a chunk was lost, duplicated or written twice",
+                slot.name,
+                sink.written[index]
             );
         }
     }
