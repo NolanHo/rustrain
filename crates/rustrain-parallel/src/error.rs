@@ -176,6 +176,13 @@ pub enum ShardError {
          units"
     )]
     UnitMismatch { dim: i64, global: i64, unit: i64 },
+    #[error(
+        "cannot shard dim {dim}: a replicating shard of the {global}-element axis over {degree} \
+         ranks gives its ranks different slice lengths, and a slot has one shape for every rank \
+         (this is the `ceil(units / degree)` case where the consumer's own slice crosses a unit \
+         boundary — split the axis, or declare a coarser unit)"
+    )]
+    NonUniformSlabs { dim: i64, global: i64, degree: i64 },
 
     #[error(
         "group mask bit {bit} is out of range: the mesh has {axes} axes, so mask bits \

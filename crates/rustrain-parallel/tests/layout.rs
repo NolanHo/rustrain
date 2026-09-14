@@ -377,6 +377,110 @@ fn a_unit_that_cannot_tile_the_axis_is_named_as_such() {
     ));
 }
 
+/// A replicating slab must cover the *span* its consumer's own slice maps to. The key/value case:
+/// a rank holding query heads `[…, (c+1)·q/d)` needs every key/value head in
+/// `[floor(c·kv/d), ceil((c+1)·kv/d))` — which is two heads for some rank whenever `kv < d`, as
+/// soon as the query slice crosses a key/value boundary. Clamping the slab to `ceil(kv/d)` heads
+/// would drop one silently; `kv = 3, tp = 4` is the smallest case that says so.
+#[test]
+fn a_replicating_slab_covers_the_span_the_consumer_needs() {
+    use rustrain_parallel::ShardMode;
+
+    // The real ratio first: 24 query heads over 3 key/value heads (GQA repeat 8), tp = 4.
+    let mode = ShardMode::Replicate { unit: 1 };
+    let (q, kv, tp) = (24i64, 3i64, 4i64);
+    let mut spans = Vec::new();
+    for c in 0..tp {
+        let (offset, len) = mode.slab(kv, c, tp).expect("3 heads over 4 ranks");
+        let first_q = c * q / tp;
+        let last_q = (c + 1) * q / tp;
+        let want = first_q * kv / q..((last_q * kv + q - 1) / q);
+        assert!(
+            offset <= want.start && offset + len >= want.end,
+            "rank {c} holds query heads {first_q}..{last_q}, which need key/value heads \
+             {want:?}, but its slab is {offset}..{}",
+            offset + len
+        );
+        spans.push((offset, len));
+    }
+    assert_eq!(
+        spans,
+        vec![(0, 1), (0, 2), (1, 2), (2, 1)],
+        "the boundary ranks need one head, the crossing ones two"
+    );
+
+    // The property, over every shape where a unit can be taken: the slab covers the span, stays
+    // inside the axis, and is never empty.
+    for units in 1..=8i64 {
+        for degree in 1..=8i64 {
+            let mode = ShardMode::Replicate { unit: 4 };
+            let global = units * 4;
+            for coord in 0..degree {
+                let (offset, len) = mode
+                    .slab(global, coord, degree)
+                    .expect("units of 4 tile the axis");
+                let first = offset / 4;
+                let last = (offset + len) / 4;
+                let want_first = coord * units / degree;
+                let want_last = ((coord + 1) * units + degree - 1) / degree;
+                assert!(
+                    first <= want_first && last >= want_last,
+                    "{units} units over {degree} ranks, coordinate {coord}: slab {first}..{last} \
+                     does not cover {want_first}..{want_last}"
+                );
+                assert!(
+                    last <= units && last > first,
+                    "a slab is non-empty and inside the axis"
+                );
+            }
+        }
+    }
+}
+
+/// A slot has one shape for every rank, so an axis whose replicating slabs differ in *length*
+/// between ranks has no local shape at all — and that is a refusal, not a shape that fits the
+/// first rank. `kv = 3, tp = 4` is the case: the ranks' spans are 1, 2, 2, 1 heads.
+#[test]
+fn a_replicating_axis_with_different_slab_lengths_has_no_local_shape() {
+    use rustrain_parallel::{ShardError, ShardSpec};
+
+    let m = mesh(cfg(4, 1, 1, 1, 1));
+    let tp = axis(&m, "tp");
+    let two_heads = ParallelLayout {
+        dims: vec![ShardSpec::replicating(1, tp, 256)],
+        partial: None,
+    };
+    assert_eq!(
+        two_heads.local_shape(&[4, 512], &m).unwrap(),
+        vec![4, 256],
+        "two heads over four ranks: every rank holds one whole head"
+    );
+
+    let three_heads = ParallelLayout {
+        dims: vec![ShardSpec::replicating(1, tp, 256)],
+        partial: None,
+    };
+    assert!(
+        matches!(
+            three_heads.local_shape(&[4, 768], &m),
+            Err(ShardError::NonUniformSlabs {
+                dim: 1,
+                global: 768,
+                degree: 4
+            })
+        ),
+        "three heads over four ranks would need per-rank shapes"
+    );
+    assert!(
+        three_heads
+            .local_shape(&[4, 768], &m)
+            .unwrap_err()
+            .to_string()
+            .contains("one shape"),
+        "the refusal must say why"
+    );
+}
+
 /// Two specs on one dim: the weaker promise wins, and of two units the coarser is the weaker one.
 #[test]
 fn two_specs_on_one_dim_take_the_coarser_unit() {

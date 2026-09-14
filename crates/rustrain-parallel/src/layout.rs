@@ -52,12 +52,18 @@ pub enum ShardMode {
     /// framework refuses.
     #[default]
     Divide,
-    /// Every rank owns the slice it *needs*, even when that means two ranks hold the same one:
-    /// the axis is cut into `global / unit` **units**, a rank owns `ceil(units / degree)` adjacent
-    /// ones, and the offsets are `floor(coord * units / degree) * unit`. This is how a
-    /// tensor-parallel attention keeps its key/value heads when there are fewer heads than ranks
-    /// (`docs/design/qwen36-text/spec.md` §D6.6): each rank's query slice maps to the key/value
-    /// heads it needs, and the slabs overlap rather than communicate.
+    /// Every rank owns the slice it *needs*, even when that means two ranks hold the same one: the
+    /// axis is cut into `global / unit` **units** and coordinate `c` owns every whole unit from
+    /// `floor(c * units / degree)` up to `ceil((c + 1) * units / degree)`.
+    ///
+    /// This is how a tensor-parallel attention keeps its key/value heads when there are fewer
+    /// heads than ranks (`docs/design/qwen36-text/spec.md` §D6.6). The bounds are the ones the
+    /// consumer's own slice maps to: a rank holding query heads `[c·q/d, (c+1)·q/d)` needs every
+    /// key/value head in `[floor(c·kv/d), ceil((c+1)·kv/d))`, whatever the ratio `q/kv` is — the
+    /// span has to be at least `ceil(units/degree)` units, and the two differ exactly when
+    /// `units < degree` (two key/value heads over four ranks, `floor`/`ceil` widening as the
+    /// query slice passes a boundary). Clamping to `ceil(units/degree)` there would hand a rank one
+    /// head where its queries need two, and the attention would silently drop a head.
     ///
     /// Not to be confused with [`ParallelLayout::replicate`], which means *no* shard at all.
     Replicate {
@@ -102,12 +108,40 @@ impl ShardMode {
                     return None;
                 }
                 let units = global / unit;
-                let local = (units + degree - 1) / degree;
-                let offset = (coord * units / degree).min(units - local);
-                Some((offset * unit, local * unit))
+                let offset = coord * units / degree;
+                let end = ((coord + 1) * units + degree - 1) / degree;
+                let end = end.max(offset + 1).min(units);
+                Some((offset * unit, (end - offset) * unit))
             }
         }
     }
+}
+
+/// Why an axis cannot be given a uniform slab, before the dim it belongs to is known.
+enum SlabFailure {
+    NotDivisible,
+    UnitMismatch(i64),
+    NonUniform,
+}
+
+/// The slab *every* coordinate of `degree` holds along an axis of `global` elements, or why none
+/// can: a slot has one shape for all ranks, so an axis whose ranks would hold different lengths
+/// has no local shape at all. (A replicate mode can produce those — `ceil(units/degree)` units is
+/// not what a rank whose consumer slice crosses a unit boundary needs.)
+fn uniform_slab(mode: ShardMode, global: i64, degree: i64) -> Result<(i64, i64), SlabFailure> {
+    let Some((offset, len)) = mode.slab(global, 0, degree) else {
+        return Err(match mode {
+            ShardMode::Replicate { unit } => SlabFailure::UnitMismatch(unit),
+            ShardMode::Divide => SlabFailure::NotDivisible,
+        });
+    };
+    for coord in 1..degree {
+        match mode.slab(global, coord, degree) {
+            Some((_, other)) if other == len => {}
+            _ => return Err(SlabFailure::NonUniform),
+        }
+    }
+    Ok((offset, len))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -317,19 +351,24 @@ impl ParallelLayout {
         let mut local = Vec::with_capacity(global.len());
         for (d, &size) in global.iter().enumerate() {
             let (mode, divisor) = self.axis_shard(d as i64, tensor_rank, mesh)?;
-            match mode.slab(size, 0, divisor) {
-                Some((_, len)) => local.push(len),
-                None => {
-                    return Err(match mode {
-                        ShardMode::Replicate { unit } => ShardError::UnitMismatch {
+            match uniform_slab(mode, size, divisor) {
+                Ok((_, len)) => local.push(len),
+                Err(failure) => {
+                    return Err(match failure {
+                        SlabFailure::NotDivisible => ShardError::NotDivisible {
+                            dim: d as i64,
+                            global: size,
+                            divisor,
+                        },
+                        SlabFailure::UnitMismatch(unit) => ShardError::UnitMismatch {
                             dim: d as i64,
                             global: size,
                             unit,
                         },
-                        ShardMode::Divide => ShardError::NotDivisible {
+                        SlabFailure::NonUniform => ShardError::NonUniformSlabs {
                             dim: d as i64,
                             global: size,
-                            divisor,
+                            degree: divisor,
                         },
                     });
                 }

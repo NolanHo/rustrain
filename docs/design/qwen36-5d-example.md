@@ -145,7 +145,7 @@ D5 与 HF 对齐时会再验一次（那是唯一能证伪的机械手段）。
 | 约束 | 值 | 违反时 |
 |---|---|---|
 | `num_attention_heads % tp == 0` | 16 % tp | 报错 |
-| `num_key_value_heads % tp == 0` **或** KV 复制 | 2 % tp | tp≥4 时需复制 KV（Megatron 的退化路径：`attention.py:352` 置 1 后 all-gather） |
+| `num_key_value_heads % tp == 0` **或** 声明式 KV 复制 | 2 % tp | tp≥4 时用声明式复制：`"mode": "replicate", "unit": "head_dim"`，每个 rank 拿它的 q 头需要的 kv 头（`spec.md` §D6.6）。Megatron 那条退化路径（`attention.py:352` 置 1 后 all-gather）在这里不需要 —— 复制是声明出来的，不是把度数降成 1 绕过去 |
 | `linear_num_value_heads % tp == 0` | 32 % tp | 报错 |
 | `linear_num_key_heads % tp == 0` | 16 % tp | 报错 |
 | `moe_intermediate_size % tp == 0` | 512 % tp | 报错 |

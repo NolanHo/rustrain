@@ -592,40 +592,71 @@ hidden **与改动前逐位相同**（`np.array_equal` → True，`max|d| 0.0`�
 checkpoint 不在 page cache 时仍是主要成本之一）；③ 更高度数（tp=8 / ep）受益更大，但那些配置本身还在
 D6 的阻断项里（见下）。
 
-### D6.6 — tp≥4 的 KV 复制：机制已落地，模型接线还差一步（2026-09，本轮）
+### D6.6 — tp≥4 的 KV 复制：声明式 unit + 消费端边界（2026-09，已落地并验收）
 
-**要解决什么**：`check --tp 4` 死在 `slot layers.3.kh`：`dim 1` 全局 2（KV 头）不能被 4 整除。
+**要解决什么**：`check --tp 4` 死在 `slot layers.3.self_attn.k_proj`：`dim 1` 全局 512
+（2 个 KV 头 × 256）按 4 等分要切出 128 = **半个头**。
 `qwen36-5d-example.md` §4 早就写了"tp≥4 需 KV 复制"，但它没说清**复制的粒度**。
 
 **这一轮想清楚的三件事**：
 
 1. **"head 偏移位置常量"其实不需要**。原先的设想是：每个 rank 持有一部分 q 头，sdpa 需要知道自己的
    q 头在全局的偏移才能把 q 头映射到 kv 头（GQA 的 repeats=8）。真正需要的是**让每个 rank 恰好持有它
-   那部分 q 头需要的 kv 头**：q 头按 tp 连续切，rank r 的 q 头 `[r·q/tp,(r+1)·q/tp)` 映射到的 kv 头区间是
-   `[⌊r·kv/tp⌋, ⌊r·kv/tp⌋+⌈kv/tp⌉)`（可直接由除法证明），所以只要 **kv 轴的 slab 用同一个规则算**，
-   本地 `sdpa` 的"本地 q 头 / 本地 kv 头"分组就自动正确 —— 偏移被 slab 本身吃掉了，
-   算子不需要新的位置常量。
+   那部分 q 头需要的 kv 头**：q 头按 tp 连续切，rank `c` 的 q 头 `[c·q/tp,(c+1)·q/tp)` 映射到的 kv 头
+   区间是 **`[⌊c·kv/tp⌋, ⌈(c+1)·kv/tp⌉)`**（`q = kv × repeats`，把 q 头号除以 repeats 即得，两边同一条
+   除法），所以只要 **kv 轴的 slab 用同一条规则算**，本地 `sdpa` 的"本地 q 头 / 本地 kv 头"分组就自动
+   正确 —— 偏移被 slab 本身吃掉了，算子不需要新的位置常量。
+   **修正（独立审查抓到的）**：这条边界**不等于**"每 rank `ceil(kv/tp)` 个头"。两者只在 `kv` 是
+   `tp` 的倍数、或每 rank 恰好 1 个头时相等。反例 `kv = 3, tp = 4`：rank 1 的 q 头需要 kv 头
+   `[⌊3/4⌋, ⌈6/4⌉) = {0,1}` 两个头，而 `ceil(3/4) = 1` 只给一个 —— 按老写法算出来的 slab 会让
+   attention **静默少一个头**。现在的实现对复制模式取 `[⌊c·U/d⌋, ⌈(c+1)·U/d⌉)` 的**整单元**（`U` =
+   单元数），并在**各 rank slab 长度不一致**时拒绝：一个 slot 只有一个形状（`ShardError::NonUniformSlabs`），
+   所以 `kv = 3, tp = 4` 是**编译期报错**，而不是让边界 rank 少一个头、或让别的 rank 拿一个装不下的
+   缓冲区。`kv = 2, tp = 4/8` 下每 rank 恰好 1 个头，是合法用例，也是本模型实际用的那一档。
 2. **复制必须按"单位"而不是按元素**。KV 投影的输出特征轴是 512（2 头 × 256），tp=4 时按元素
    `ceil(512/4)=128` 会切出**半个头**（本轮实测：`l1.instantiate` 通过后 `l1.compile` 在 reshape 上报
    `[512,128] cannot fill -1`，正是这个错误被抓住）。所以复制模式带 **unit**：
-   轴按 `unit` 分成若干单位，一个 rank 拿 `ceil(units/degree)` 个连续单位，slab 可以重叠。
-   KV 权重声明 `unit = head_dim` → 每 rank 恰好 1 个头。
+   轴按 `unit` 分成若干单元，rank `c` 拿 `floor(c·U/d)` 起、`ceil((c+1)·U/d)` 止的**全部整单元**
+   （slab 可以重叠）。KV 权重声明 `unit = head_dim` → `kv=2, tp=4/8` 时每 rank 恰好 1 个头。
 3. **声明式，不是 fallback**。`Divide`（默认，严格整除，不整除仍是硬错误）与
    `Replicate{unit}`（声明后才允许重叠）是两种**声明的**语义；描述里写成
    `"axes": {"1": [{"axis": "tp", "mode": "replicate", "unit": "head_dim"}]}`，字符串形式
-   `["tp"]` 不变（既有描述零改动）。unit 与 `split.sizes` 一样解析参数名或整数字面量。
+   `["tp"]` 不变（既有描述零改动）。unit 与 `split.sizes` 一样解析参数名或整数字面量；
+   **写了 unit 却没写 `mode: replicate` 是描述错误**（此前 unit 会被静默丢弃，等于描述说"按头切"、
+   计划按元素切）。
+
+**同一轮补上的拒绝清单（每条都有测试）**：
+
+| 情况 | 之前 | 现在 |
+|---|---|---|
+| `unit` 无 `mode: replicate` | 静默丢弃 unit | `expand` 报描述错误，点名 slot 与 unit |
+| refold 的最后一个轴不是 operand 的最后一轴（如 `[512,128] → [64,4,4,64]`） | 轴号照搬 | `UnmappableViewShard`（对所有 mode，`Divide` 同样拒绝） |
+| 合轴（rank 减少）时复制单元落在被折叠的轴上 | 轴号照搬 | 拒绝（单元的"长度"不再对应输出轴的元素） |
+| 复制权重落在 `linear`/`embedding`/`matmul` 的收缩轴上 | 有的分支静默接受 | `UnsupportedWeightLayout`（all_reduce 会把重叠部分算两遍） |
+| 复制轴各 rank slab 长度不同（`kv=3, tp=4`） | 按 coord 0 的形状凑合 | `NonUniformSlabs` |
+| 同一个 dim 两个 spec、mode 不一致 | 取**最后**一个 spec 的 mode | 取更弱的承诺（复制优先，同为复制取更粗的 unit），有测试 |
+
+**修正一条写错的话**：§落地里曾说"digest 只哈希决策，不哈希 layout"。实际 `compute_digest` 的
+preimage 是 `DigestInput { plan, decisions }`，**plan 里的 slot layout 是被哈希的**。真正成立的是另一半：
+`ShardSpec::mode` 在 `Divide`（默认）时**不序列化**，所以既有计划的 wire form 与 digest 逐字节不变；
+新增字段只在**真的声明了复制**的计划里改变 digest —— 那种计划本来就是另一套分片，digest 变了才是对的。
 
 **落地了什么（本次提交，全部有测试）**：
 `rustrain-parallel`：`ShardMode{Divide,Replicate{unit}}` 成为 `ShardSpec` 的字段（默认 `Divide`，
-**序列化时省略**，所以既有 plan 的 wire form 与 digest 不变 —— digest 只哈希决策，不哈希 layout，
-两重保险），`local_shape` 与新增的 `slab(global,dim,coord,degree,rank)` 走同一个函数；
+**序列化时省略**，所以既有 plan 的 wire form 不变），`local_shape` 与 `slab(global,dim,coord,degree,rank)`
+走同一个函数（`local_shape` 走 `uniform_slab`：逐 coord 校验长度一致）；
 `rustrain-plan`：`DeclaredAxis`（plan 的词汇）+ `instantiate` 从声明建 spec + 传播链路
 （linear 列并行、view 的维度平移、二元算子的 dim 合并）都携带 mode；
 `rustrain-model`：描述侧的 `AxisDecl`（untagged：字符串或对象）与 unit 解析；
-`rustrain-cli`：加载器不再自己算 `coord*local`，改成问 layout 要 `slab`（一个事实一个来源）。
+`rustrain-cli`：加载器不再自己算 `coord*local`，改成问**声明它的那个 spec 的 mode** 要 `slab`
+（同一个 dim 上可能有多个 spec，layout 级的 dim 查询会取错）—— 一个事实一个来源。
 测试：`a_replicating_shard_hands_each_rank_the_units_it_needs`（512/4 → 每 rank 一个头、
 4 单位 8 rank 的重叠、单位不整除被拒、严格路径不变）、`an_axis_may_declare_how_its_slabs_relate`
-（两种写法 + unit 解析）。
+（两种写法 + unit 解析 + 有 unit 无 mode 被拒）、`a_replicating_slab_covers_the_span_the_consumer_needs`
+（消费端边界：`kv=3,tp=4` 的 1/2/2/1 头跨度 + 各 (units, degree) 的性质测试）、
+`a_replicating_axis_with_different_slab_lengths_has_no_local_shape`（`NonUniformSlabs`）、
+`the_real_description_instantiates_and_propagates_on_the_acceptance_mesh` 所在的
+`instantiate.rs` 里另加了 `tp=4` 下 k_proj 的 unit=256 与本地形状 = 一个整头。
 
 **同一轮补上的那一步：reshape/view 的 unit 换算**。k_proj 的**权重**按 head 单位切一次就对，但**激活**
 路径 `k = x @ w [seq,512]` → `reshape [seq,2,256]` 的映射原先只平移轴号，不知道"512 特征轴上的

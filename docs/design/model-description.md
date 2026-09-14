@@ -222,6 +222,12 @@ HF / legacy 的 checkpoint 是 `[out, in]`，所以 binding 用 `transpose` 归�
     "transform": ["transpose(0,1)"],
     "axes": { "0": ["tp"] } },                       // row：切 K -> partial
 
+  // KV 头比 rank 少：声明式复制，unit 是"头"，不是元素（`qwen36-text/spec.md` §D6.6）
+  { "slot":   "layers.*.self_attn.k_proj.weight",
+    "source": "model.layers.{*}.self_attn.k_proj.weight",
+    "transform": ["transpose(0,1)"],
+    "axes": { "1": [ { "axis": "tp", "mode": "replicate", "unit": "head_dim" } ] } },
+
   // 三通道专家权重：HF [E, out, in] -> slot [E, in, out]
   { "slot":   "layers.*.mlp.experts.gate_up_proj",
     "source": "model.layers.{*}.mlp.experts.gate_up_proj",
@@ -250,7 +256,20 @@ HF / legacy 的 checkpoint 是 `[out, in]`，所以 binding 用 `transpose` 归�
     `take` / `concat` / `split(dim,sizes)` **已移除**（没有消费者也没有定义 = 死钩子）。
   - **未知动词在 `expand` 期报错**；`slice` 的越界是 `shape_mismatch`（fail）。
     **不存在"动词没实现所以 skip"的分支** —— skip 不得用来掩盖契约未实现。
-- `axes` 里是**符号轴名**；instantiate 时解析成 `GroupMask` 并执行 §2.2 的除法。
+- `axes` 里是**符号轴名**，instantiate 时解析成 `GroupMask` 并执行 §2.2 的除法。轴有两种写法：
+  - **字符串**（`"tp"`，等价于 `{"axis":"tp"}`）= `Divide`：严格整除，不整除是硬错误。既有描述零改动。
+  - **对象**（`{"axis":"tp","mode":"replicate","unit":"head_dim"}`）= `Replicate`：只在"轴的元素数少于
+    组内 rank 数"时才需要，语义是**每个 rank 拿到它自己那份消费端切片需要的单元**。unit 表示轴以多大
+    的粒度分单元（`head_dim` 是参数名或整数字面量，与 `split.sizes` 同一条解析路径），默认 1 个元素；
+    **写 `unit` 而不写 `mode: replicate` 是描述错误**（unit 只对复制有意义，沉默丢弃它就是另一套分片）。
+  - 复制 slab 的边界是消费端切片自己的边界：坐标 `c` 拿到 `[⌊c·U/d⌋, ⌈(c+1)·U/d⌉)` 的全部**整单元**
+    （`U = 元素数 / unit`）。一个 rank 持有的 q 头是 `[c·q/d, (c+1)·q/d)`，对应的 kv 头正是
+    `[⌊c·kv/d⌋, ⌈(c+1)·kv/d⌉)`，所以"q 轴与 kv 轴用同一条规则算"就够，不需要任何 head 偏移位置常量。
+  - **一个 slot 只有一个形状**：如果复制的 slab 长度**逐 rank 不同**（`kv = 3, tp = 4` 的边界 rank
+    要 2 个头、其余要 1 个），`instantiate` 直接报 `NonUniformSlabs` —— 不是按第一个 rank 的形状凑合，
+    因为另一个 rank 的注意力会静默少一个头。`kv = 2, tp = 4/8` 每 rank 恰好 1 个头，是它的合法用例。
+  - 同一个 dim 上有多个 spec 时取**更弱的承诺**（同为复制则取更粗的 unit：整 512 单元必然也是整 128
+    单元），这条规则同时用于 `local_shape` 与 `slab`。
 - **切分轴住在这里**：不是模板，也不是框架侧规则表（I-5 / P6）。它与"从 checkpoint 取哪一块"
   是同一条事实，所以必须同一处声明、同一处被加载器与形状算术读取。
 
@@ -363,11 +382,9 @@ D1 的验收测试暴露了十处未定义。以下裁定**是契约的一部分
 | 2. **形状** | 对每个 slot：把**声明**（`DeclaredAxes`，符号轴名）与从激活传播来的 layout 解析成 `GroupMask`，执行 §2.2 除法；不整除 → 报错。实际布局由**同一张规则表**推出（`shard::propagate` 的 `Linear`/`MatMul`/`Elementwise`/`Declared`），不为实例化再写第二张 |
 | 3. **组可用性** | 每个用到的 `GroupMask` 必须在 mesh 里有定义（位不越界）；否则 `GroupUnavailable`。**度数 1 的组合法**（size-1 组），不是错误 |
 | 4. **位置常量** | 把与 rank 有关的**编译期常量**烘进节点属性：flat QKV 的通道偏移、CP 的序列偏移、本地专家范围（`rank * local`）。它们在进程生命周期内不变，是常量不是运行期参数（`architecture.md` §2.2） |
-| 4a. **位置常量（D4 未做）** | D4 只做到 1–3；位置常量（flat QKV 的通道偏移、CP 的序列偏移、本地专家范围）推迟到 **D5** —— 数值对齐前必须先有它们。`instantiate` 里留注释指到这里，不假装做了。**2026-09 修正（本轮再修）**：`tp≥4 的 attention head 偏移`**不需要位置常量** —— 见
-`qwen36-text/spec.md` §D6.6：把 kv 轴的 slab 用与 q 相同的规则算（声明式复制 + unit），每个 rank
-就恰好持有它的 q 头需要的 kv 头，算子按本地头数分组即正确。原来那条"需要 head 偏移"的判断作废。
+| 4a. **位置常量（部分已落地）** | flat QKV 的通道偏移不需要（权重在 binding 层按 `split` 拆成独立 slot）；专家范围由 slot 的本地形状表达；**随 rank 变化的形状字面量写成 `-1`**（§3.10）。**tp≥4 的 attention head 偏移不需要位置常量** —— 见 `qwen36-text/spec.md` §D6.6：kv 轴用与 q 轴相同的规则算 slab（声明式复制 + unit），每个 rank 恰好持有它的 q 头需要的 kv 头，算子按本地头数分组即正确，偏移被 slab 本身吃掉。仍然缺的是 **CP 的序列偏移**（今天没有任何槽声明 `cp` 轴，所以 `--cp N` 是空转）与 **vocab 分片 embedding 的行偏移**（见 4b，本轮改成 replicate 绕开）。
 
-**2026-09 修正**：本模型不需要其中三项 —— 权重在 binding 层按 `split` 拆成独立 slot（没有 flat QKV 通道偏移），专家范围由 slot 的本地形状表达，而**随 rank 变化的形状字面量一律写成 `-1`**（见 §3.10）。真正还缺的是三项：**CP 的序列偏移**（没有任何槽声明 `cp` 轴，所以今天 `--cp N` 是空转）、**tp≥4 的 attention head 偏移**（KV 需要复制，见 `qwen36-5d-example.md` §4），以及 **vocab 分片 embedding 的行偏移**（见下）。 |
+**2026-09 修正**：本模型不需要其中三项 —— 权重在 binding 层按 `split` 拆成独立 slot（没有 flat QKV 通道偏移），专家范围由 slot 的本地形状表达，而**随 rank 变化的形状字面量一律写成 `-1`**（见 §3.10）。真正还缺的是两项：**CP 的序列偏移**、**vocab 分片 embedding 的行偏移**（见下）；tp≥4 的 attention head 偏移已由声明式 KV 复制解决（§4a）。 |
 | 4b. **vocab 分片 embedding 的行偏移（D6 发现，未做）** | 查表 `out[s] = W[ids[s]]` 在被切表的行维上**不是集合通信能解决的事**：rank `r` 只持有行 `[r·local_vocab, (r+1)·local_vocab)`，它必须查 `ids[s] - r·local_vocab` 并把落在自己范围外的 id 贡献成 0，那个 `all_reduce` 才是"各 rank 的局部贡献之和"。**没有这个偏移就是静默错值**（rank 1 用全局 id `t` 查到了第 `local_vocab + t` 行），所以本轮把 `embed.w` 改成 **replicate**：整表在每张卡上，代价 2 GB/rank，换来的是每一度都精确。偏移量作为位置常量落地后才能重新分片 |
 | 5. **重写（D4 未做）** | `instantiate` **不重命名任何 slot**：全局 slot 名原样保留（形状已本地化、节点集合已按 stage 裁剪，改名不影响这两者）。slot 重命名（加 rank 无关的稳定后缀）推迟到 **D5** —— 执行器按 rank 消费具体 plan、需要区分产物时再落地 |
 
