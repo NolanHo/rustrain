@@ -38,14 +38,40 @@ rustrain run --plugin ... --recipe plugins/aten/aten.toml --device cuda \
         --tokens 9707,11,1879,0,323,358,314,279 --out /var/tmp/rustrain.npz
 ```
 
+## 调度（schedule）：同一个算子的第二种算法
+
+一个算子的 **body** 可以在保持契约与数值语义的前提下换一种算法，这不需要新变体、新 provider
+或新配方——变体是 `(provider, dtype)` 的解析单位，同一算子的两个都能接受该 dtype 的变体是
+**歧义**而不是选择（`Registry::resolve_by_default_provider` 按 provider 名匹配，两个都能跑就
+报 ambiguous）。所以调度住在 body 里，由 body 自己挑，并把挑选规则写在一处。
+
+今天只有 `moe_layer` 有两个调度，规则是一句话加一条前提：
+
+| 条件 | 调度 |
+|---|---|
+| `torch._grouped_mm` 接受这些操作数（contraction 维是 16 字节的整数倍，`GroupedMMUtils.h: check_valid_strides_and_return_transposed`） | **grouped**：把 (row, slot) 对按专家序排好（host 侧一次，和 reference 循环用的是同一趟），三次 `_grouped_mm` 代替 `E×K` 次小算子 |
+| 形状不满足对齐 | **reference 循环**：逐 (专家, slot) 的 `index_select` + 三次 matmul + `index_copy_` |
+
+两点取舍写在 `ops_moe.cpp` 里，不藏在代码里：
+
+- **为什么走 grouped**：循环的开销是**每次调用的固定成本**付 `E × K` 遍（本模型几何下 2048 遍），
+  与有多少 token 路由过去无关；本模型的两个调度差 30×（宿主实测 45.4 → 1.50 ms/层，见 spec D6.12）。
+- **形状不满足对齐时**回退到循环而不是报错：形状合法、循环就在同一个 body 里，这是**调度**选择
+  （ATen 自己也按 shape 挑 kernel），不是解析降级，也不是契约变化。代价是**下游看不出跑了哪个**：
+  ABI 没有通道、plan digest 记的是变体而不是 body 内部分支 —— 所以门禁用**两条 case 各跑一条**来
+  覆盖（`H=I=2` 走循环、`H=I=8` 走 grouped），而不是靠"记录回退"。
+
 ## 验证（2026-09，宿主 8× L20X，sm_89）
 
 | 证据 | 命令 | 结果 |
 |---|---|---|
 | Rust 宿主 `dlopen` C++ 插件 | `rustrain ops list --plugin librustrain_aten.so` | 88 个实现（32 reference + 28×2 aten：f32 与 bf16 各一） |
-| 逐算子对拍（框架门禁） | `rustrain ops check --plugin … --recipe plugins/aten/aten.toml --device cuda` | 30/30 条 `cuda.aten.f32` 行 numeric+determinism 全过；30 条 `cuda.aten.bf16` 行在解析处 FAIL——门禁用 f32 case 喂 bf16-only 变体，按 R-1 拒绝运行（框架侧 gap，非插件缺陷）；reference 留在 host |
+| 逐算子对拍（框架门禁） | `rustrain ops check --plugin … --recipe plugins/aten/aten.toml --device cuda` | `94 case(s): 0 failing`；`cuda.aten.f32` 的 numeric+determinism 全过；`cuda.aten.bf16` 行显示 **skip**（理由写明"dtype f32 is not accepted… 门禁今天每个 case 只生成一种 dtype"），不是 fail——**bf16 变体今天不在门禁的数值判定里**，框架侧 gap |
+| `moe_layer` 的两条调度各自被门禁覆盖 | 同上，`--op moe_layer`（新增 `H=I=8` 对齐 case） | 两条 case：`H=I=2` 走循环、`H=I=8` 走 grouped，都 pass；把 `offsets` 改回"组起点"的变异构建让第二条 **FAIL**（gate exit 1），第一条仍 pass —— 即这条 case 真的覆盖 grouped |
 | 插件自检（对照 Rust oracle 源码） | 宿主 `gpu-work/smoke_aten.py` | 31/31 case，26 个算子，两次运行字节一致 |
 | bf16 变体自检（bf16 跑 vs f32 跑后取整到 bf16） | 宿主 `gpu-work/smoke_bf16.py`（2026-09-14） | 61/61 case 通过：全部 28 个算子（含 bf16 的 `gated_delta_rule` fp32 state、`sdpa`、`causal_conv1d`、`moe_layer`），两次运行字节一致；56 个描述符的 per-variant mask / numerics 逐条断言通过 |
+| `moe_layer` 的 grouped 调度（变异对照：把调度条件翻成 false 的同一份源码另编一个 `.so`） | 宿主 `rustrain run`（world=1、同 probe token、bf16 / f32） | bf16 **逐位相同**（logits 与 42 个 hidden state 全等，不是"在容差内"）；f32 差 1.6e-6（重结合顺序不同）；tp=4 的 `max\|diff\|` vs world-1 两条调度都是 **1.21875** |
+| grouped 调度的空专家组 | 宿主 python 探针（同一串 ATen 调用） | 三种稀疏度（0 / 0 / 192 个空专家，共 256）下与循环逐位相同 |
 
 开发过程中被门禁抓到的两类真问题（都是"看起来对"的）：
 

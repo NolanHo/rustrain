@@ -1020,6 +1020,9 @@ NUMA 亲和（探针两节点都快；把 loader 绑到 node 0 反而更慢，�
 | HF bf16 vs HF f32 | 1.523e-1 | 1.634e-1 |
 | 我们 bf16 vs HF f32 | 1.447e-1 | 1.688e-1 |
 
+（这张表的 f32 行是当时的**循环**调度测的；f32 现在在对齐形状下也走 grouped，同一比法给
+2.0012e-3 / 1.6946e-3 —— 三位有效数字不变，见 D6.12。）
+
 **读数**：
 
 - 我们 bf16 与 HF bf16 的差（8.8e-2）**比 HF 自己 bf16 与 f32 的差（1.52e-1）还小**；两份 bf16 的
@@ -1088,6 +1091,79 @@ NUMA 亲和（探针两节点都快；把 loader 绑到 node 0 反而更慢，�
 <0.8 s，且两者都是**与 token 数几乎无关的固定开销**（S 从 8 到 512，`moe_layer` 只从 98 ms 涨到 135 ms）。
 即：接下来最大的调试速度杠杆是这两处的实现体（grouped GEMM / 分块并行递推）。
 
+### D6.12 — `moe_layer` 的 grouped 调度：前向砍掉一半，bf16 逐位不变（2026-09，本轮）
+
+**背景**：D6.11 的 step trace 显示前向的 84% 在两个算子体上，`moe_layer` 41 次 × 59.3 ms = 2.43 s
+是最大的一个，而它的成本与 token 数几乎无关（8 token 98 ms、512 token 135 ms）——付的是
+**每次调用的固定开销** `E × K` 遍（本模型几何 2048 遍），不是算术。
+
+**做法**（`plugins/aten/src/ops_moe.cpp`，T1，不手写 kernel）：把 (row, slot) 对按专家序排好
+—— host 侧一趟，和 reference 循环需要的 `rows_by` 是**同一趟**，所以两个调度不可能对"谁看见哪些行"
+产生分歧 —— 然后用三次 `torch._grouped_mm` 代替 `E × K` 次小算子。投影的 down 权重 `[E,H,I]` 用
+**转置视图**传入（`_grouped_mm` 接受 strided 的 `mat2`，所以没有 `E*H*I` 的每层拷贝）。
+
+**调度住在 body 里，不是第二个变体或第二个 provider**：解析单位是 `(provider, dtype)`，
+`Registry::resolve_by_default_provider` 按 **plugin 名**匹配 `[kernel].default`——同一个 `.so`
+发布 `cuda.aten.*` 与 `cuda.aten_grouped.*` 会让每个算子出现两个可跑的候选，报 ambiguous（本轮先按
+"第二个 family" 实现过一次，正是在这里退回来的）。所以规则只有两条，写在 body 里：
+
+- **形状满足 `torch._grouped_mm` 的 16 字节对齐**（`GroupedMMUtils.h:
+  check_valid_strides_and_return_transposed`；本模型 H=2048、I=512，bf16 下 `H % 8 == I % 8 == 0`）
+  → grouped；
+- **不满足**（conformance 的小 case 就是 `H=I=2`）→ reference 循环。
+
+两种 dtype 都走 grouped（f32 在对齐时也走；早期版本把 f32 挡在循环里，理由是"f32 是所有数值断言的
+口径"，但那样等于让分组调度在门禁里没有任何 case —— 见下）。
+
+**宿主实测（tp=4、bf16、S=8，`RUSTRAIN_STEP_TRACE=9`，两份原始 trace 存于
+`/var/tmp/d6-12-trace-{grouped,reference}.txt`，同一台机器相隔数分钟）**：
+
+| | `moe_layer` 每次 | `gated_delta_rule` 每次 | tp=4 墙钟 | tp=4 vs world-1 `max\|diff\|` |
+|---|---|---|---|---|
+| reference 循环（变异 `.so`） | 45.4 ms（41 次 1.863 s） | 41.4 ms | **4.876 s** | 1.21875 |
+| grouped 调度（当前构建） | **1.50 ms**（41 次 0.062 s） | 40.5 ms | **1.988 s** | **1.21875（同值）** |
+
+`moe_layer` **−97%（30×）**，tp=4 墙钟 **−59%**。两次读数（本轮的 45.4→1.50、上一轮的 57.4→4.26）
+指向同一结论，绝对值的差异是会话间波动，**同一会话内的对照才是证据**。改完之后
+**`gated_delta_rule` 成了前向第一项**（1.21 s / 2.0 s ≈ 61%）。
+
+**验收判据是"逐位相同"**（改搬运路径就用这个判据，见判据纪律）。变异对照：把调度条件翻成 `false`
+的**同一份源码**另编一个 `.so`（`/root/rustrain-gpu/aten-build-mut`），对比同一组 probe token 的 dump——
+
+| 比法 | 结果 |
+|---|---|
+| 该变异 `.so` 的 bf16 dump vs 改动前的 bf16 dump | **逐位相同**（logits 与 42 个 hidden state）——对照组本身有效 |
+| grouped bf16 dump vs 变异 dump（world=1、同 token） | **逐位相同**：logits `max\|diff\| = 0`，逐元素 rel_L2 全 0 |
+| grouped bf16 vs HF bf16（D6.11 的口径） | logits **8.8116e-2**、逐元素 rel_L2 最大 **1.3173e-1** —— 与循环一字不差 |
+| grouped f32 dump vs 变异 f32 dump | **不是**逐位：logits 相对 **1.616e-6**、逐元素 rel_L2 最大 **1.213e-6**（f32 的 grouped GEMM 重结合顺序与逐专家 `matmul` 不同；远在门禁 1e-4 之内） |
+| grouped f32 vs HF f32 | logits **2.0012e-3**（循环 2.0000e-3）、逐元素 rel_L2 最大 **1.6946e-3**（循环 1.6938e-3）——D6.11 的表到三位有效数字不变 |
+| 空专家组（256 个专家里 192 个没人路由） | 同一串 ATen 调用的探针：与循环**逐位相同** |
+
+**门禁现在覆盖两个调度**（本轮新增，`crates/rustrain-runtime/src/conformance.rs`）：`moe_layer`
+有两条 case —— `H=I=2`（不对齐，走循环）与 `H=I=8`（f32 下 16/4=4 的最小对齐几何，走 grouped；
+模 4 的下标填充让 4 个专家里 2 个没有行，所以**空专家组也进了门禁**）。**这条 case 是被审查指出
+"一个算子两份实现却没有 case"之后补的，并且用变异验证过它真的覆盖**：
+
+| `ops check --op moe_layer` | case 1（H=I=2，循环） | case 2（H=I=8，grouped） |
+|---|---|---|
+| 当前构建 | pass | **pass** |
+| 把 `offsets` 改回"组起点"的变异构建 | pass | **FAIL**（gate exit 1） |
+
+**A/B 抓到过一个真 bug**（记录，因为它是这套流程存在的理由）：第一版把 `offsets[e]` 当成专家组
+的**起点**，而 `torch._grouped_mm` 的约定是**终点**（`GroupedMMUtils.h: _grouped_mm_fallback`
+按 `mat_a.slice(0, group_start, offs[i])` 切，并让 `group_start = offs[i]`）。后果是每个专家的行
+被挪到邻居身上、最后一个专家被丢掉：bf16 logits 相对误差 **8.83e-1**（对 HF bf16 是 8.37e-1，而循环
+是 8.81e-2）。当时 `ops check` 抓不到它——门禁只生成 f32 case（`H=I=2`）且它落在对齐回退分支上；
+上表说明现在抓得到了。
+
+**门禁**：`ops check --plugin … --device cuda` = 91 case / 0 failing（两个 dtype 变体都过）；
+本地 `cargo test --release --workspace` 519/0、clippy 0、`ops check` exit 0、
+`check --tp 1/2/4/8` exit 0 且 `--tp 3` exit 1（本轮 Rust 侧无改动）。
+
+**已知覆盖缺口（不隐瞒）**：grouped 调度**没有被 `ops check` 覆盖**——门禁今天只生成 f32 case，而
+grouped 是 bf16 的调度；它的证据是上面那次模型级逐位对照 + 空专家探针。要真正进门禁，需要 conformance
+harness 支持"按 dtype 生成 case"（框架侧工作，未排期）。
+
 ## 待解决
 
 **① EP 的 dispatch/combine 落地方式待用户裁定**（改契约面，不擅自决定）：
@@ -1101,9 +1177,17 @@ NUMA 亲和（探针两节点都快；把 loader 绑到 node 0 反而更慢，�
 要收窄的杠杆是**按 slot 选 dtype**（残差流与归一化统计量留 f32、大 GEMM 走 bf16）——"精度是配置"的范畴，
 不擅自改。
 
-**③ 两个算子体的快路径待排期**（换实现体 = T2，参考体保留当 oracle）：`moe_layer` 的 grouped GEMM
-（宿主实测 `torch._grouped_mm` 0.21 ms vs 现行循环）与 `gated_delta_rule` 的分块并行递推；
-这是本项目目前最大的调试速度杠杆（占前向 84%）。
+**③ `gated_delta_rule` 的分块并行递推待排期**（`moe_layer` 的 grouped 调度已落地，见 D6.12）：
+它是现在前向的第一项（tp=4、S=8：30 次 × 40.5 ms = 1.21 s，占 tp=4 墙钟 1.99 s 的 **61%**），同样是
+**与 token 数几乎无关的固定开销**（声明的递推逐 token 跑的 ATen 循环）。换算法 = 换 body，
+参考递推继续当 oracle，判据同样逐位/容差对照；**并且要连 case 一起加**（D6.12 的教训：一个算子两份
+实现而没有 case，等于没有门禁）。
+
+**④ 一个 fixture 里的潜在缺陷（与 D6.12 无关，独立小修）**：
+`crates/rustrain-model/tests/fixtures/qwen36-text/model.json:916` 的 `reshape [512, -1, 128]` 把窗口
+长度写死成 512，`params.seq` 改成别的值会在这里报形状错（本轮想造 S=8 稀疏路由对照时撞上）。
+它不影响当前参数（`params.seq = 512`），但是同一类"位置常量"缺陷（D6.6 §4a 修过一次），
+应当改成由 `seq`/`heads` 表达的式子。
 
 ---
 

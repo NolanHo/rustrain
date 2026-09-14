@@ -40,6 +40,13 @@ namespace rsaten {
 /// numerics declare. The f32 variant is the conformance gate's workhorse and
 /// `--dtype f32` debugging; the bf16 variant is what a bf16 model plan
 /// resolves to (its numerics accumulate in f32 — ATen's bf16 matmul does).
+///
+/// A *schedule* — a second way to compute one operator's declared arithmetic —
+/// lives inside the body, not in a second variant or a second family: the
+/// resolver picks a variant by (provider, dtype), so two variants of one
+/// operator that both accept the plan's dtype are an ambiguity, not a choice
+/// (`Registry::resolve_by_default_provider`). `moe_layer` is the first operator
+/// with two schedules; its body documents how it picks between them.
 inline constexpr const char* VARIANT_F32 = "cuda.aten.f32";
 inline constexpr const char* VARIANT_BF16 = "cuda.aten.bf16";
 

@@ -1329,6 +1329,31 @@ pub fn default_cases() -> Vec<Case> {
             InputSpec::f32("shared_expert_gate", vec![1, 2], Pseudo { seed: 113 }),
         ],
     ));
+    // The same operator, a second time, at a geometry its **fast schedule** can
+    // take. `moe_layer` has two: a per-(expert, slot) loop, and one
+    // `torch._grouped_mm` per projection on the expert-ordered pairs (see
+    // `plugins/aten/src/ops_moe.cpp`). The grouped one requires every matrix
+    // operand's contraction extent to be a multiple of 16 bytes, so the case
+    // above (H = I = 2) can only ever run the loop — a second implementation of
+    // one operator with no case is a gap, not a saving. Here H = I = 8, which is
+    // the smallest aligned geometry at f32 (16 / 4 = 4), and the modulo-4 index
+    // fill leaves two of the four experts with no rows, so the empty-group path
+    // is exercised too. Same declared contract, one problem size up.
+    cases.push(Case::new(
+        "moe_layer",
+        vec![
+            InputSpec::f32("h", vec![1, 8], Ramp),
+            InputSpec::f32("routing_weights", vec![1, 2], Pseudo { seed: 83 }),
+            InputSpec::indices("routing_indices", vec![1, 2]),
+            InputSpec::f32("experts_gate_proj", vec![4, 8, 8], Pseudo { seed: 89 }),
+            InputSpec::f32("experts_up_proj", vec![4, 8, 8], Pseudo { seed: 97 }),
+            InputSpec::f32("experts_down_proj", vec![4, 8, 8], Pseudo { seed: 101 }),
+            InputSpec::f32("shared_gate_proj", vec![8, 8], Pseudo { seed: 103 }),
+            InputSpec::f32("shared_up_proj", vec![8, 8], Pseudo { seed: 107 }),
+            InputSpec::f32("shared_down_proj", vec![8, 8], Pseudo { seed: 109 }),
+            InputSpec::f32("shared_expert_gate", vec![1, 8], Pseudo { seed: 113 }),
+        ],
+    ));
     // rope's T2 completion: partial rotary + theta + position defaults, two
     // outputs — the case the gate used to skip for lack of a convention.
     cases.push(
