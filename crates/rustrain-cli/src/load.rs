@@ -1163,7 +1163,7 @@ mod tests {
     /// returns with nothing read — which is the difference between "the pool stops when a device
     /// copy fails" and "the pool finishes reading the checkpoint first and then reports".
     #[test]
-    fn an_aborted_load_stops_before_touching_the_disk() {
+    fn an_aborted_group_returns_before_touching_the_disk() {
         let group = Group {
             tensor: "model.absent.weight".to_string(),
             shape: vec![2, 2],
