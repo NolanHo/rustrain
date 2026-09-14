@@ -103,3 +103,22 @@ rustrain run --plugin ... --recipe plugins/aten/aten.toml --device cuda \
   `_grouped_mm` / 排序分桶是快速路径。
 - 三处 `expand` 语义的算子（`sdpa` 的 mask、`broadcast`）会在视图上做一次 `reshape`；
   非连续输入的 `reshape` 会隐式拷贝，代价在但正确。
+
+## ABI v2：算子的切分规则也是声明
+
+每个算子在 `OpDef` 里声明 `shard`（`RS_SHARD_*`），`plugin.cpp` 把它填进 `rs_op_desc::shard`。
+规则属于**算子**而不是变体：同一个算子的 reference 实现与 ATen 实现必须声明同一条规则，否则框架报
+"implementations of `X` disagree about its sharding rule" 并拒绝推导该节点的布局。
+
+| 规则 | 本插件的算子 |
+|---|---|
+| `RS_SHARD_DECLARED` | `reduce` |
+| `RS_SHARD_ELEMENTWISE` | `view`/`reshape`/`transpose`/`narrow`/`cat`/`broadcast`/`elementwise_*`/`compare`/`softmax`/`rmsnorm`/`layernorm`/`rope`/`gather`/`scatter`/`cross_entropy` |
+| `RS_SHARD_LINEAR` | `linear` |
+| `RS_SHARD_EMBEDDING` | `embedding` |
+| `RS_SHARD_MATMUL` | `matmul`/`bmm` |
+| `RS_SHARD_PASS_THROUGH` | `causal_conv1d`/`gated_delta_rule`/`l2norm`/`rmsnorm_gated`/`sdpa`/`topk_router`/`moe_layer` |
+
+`sdpa` 的 per-head 形式也随 v2 改成**声明形式、计数来自张量**：`per_head: true`，头数读
+`q.shape[-2]` / `k.shape[-2]`，GQA 分组 = 本地 q 头 ÷ 本地 kv 头。原来的 `num_heads` / `num_kv_heads`
+是全局计数，分片后会和它描述的张量矛盾（`qwen36-5d-example.md` §4）。

@@ -205,6 +205,24 @@ L3 在验证宿主上跑通（数值对齐 HF）。
 
 ---
 
+## 附：每个算子声明自己的切分规则（ABI v2）
+
+切分不是算子，**但"分片怎么流过这个算子"是算子的契约**。每个实现用 `rs_op_desc::shard`
+声明一条规则种类，框架的推导代数按声明求值（`rustrain-plan::shard::ShardRules`）：
+
+| 规则 | 语义 | 词表里谁在用 |
+|---|---|---|
+| `DECLARED` | 不推导：输入输出都保持槽位上已声明的布局 | `reduce`、`adamw` |
+| `ELEMENTWISE` | 所有输入共享一个分布，所有输出就是它 | 逐元素 / 索引 / 归约 / `rmsnorm` / `layernorm` / `rope` / view 家族 |
+| `LINEAR` | `out = x @ wᵀ`：权重输出维分片（列并行），收缩维分片（行并行，欠一次 all-reduce） | `linear` |
+| `EMBEDDING` | `out = w[ids]`：`Linear` 的算术，操作数按 kernel 的顺序（权重在前） | `embedding` |
+| `MATMUL` | 批量收缩 | `matmul` / `bmm` |
+| `PASS_THROUGH` | 输出跟随**输入 0**，其余输入保持各自声明 | `causal_conv1d`、`l2norm`、`rmsnorm_gated`、`gated_delta_rule`、`sdpa`、`topk_router`、`moe_layer` |
+
+**同一算子的多个实现必须声明同一条规则** —— 规则属于算子，不属于变体；不一致由框架报错，
+不按 recipe 选中谁来决定语义。未知的规则编号同样是错误，不降级成 `DECLARED`。
+新增规则**种类**才是 T3（框架新增一种判断），应罕见且被注意到。
+
 ## 8. 融合的粒度：从原语到整模型（Megakernel 可行性）
 
 "Megakernel" 底下混着三件不同的事，必须分开回答：

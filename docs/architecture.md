@@ -31,6 +31,10 @@ kernel 做对照**，对研究比编译期检查更有价值。
 3. digest 必须记插件身份（`plugin@version` + origin），否则同配置不可复现。
 4. **规则不得按算子名查框架侧的表** —— 那会把 T2 泄漏成 T3。规则要作为**描述符里的声明**
    （`{kind, 参数}`）出现；新算子只要规则种类已存在就不重编框架。
+   **已落地（ABI v2）**：`rs_op_desc::shard`（`DECLARED` / `ELEMENTWISE` / `LINEAR` / `EMBEDDING` /
+   `MATMUL` / `PASS_THROUGH`）由每个实现自己声明，框架的推导代数（`rustrain-plan::shard`）按声明求值；
+   按算子名分类的 `rule_for` 已删除。同一算子的多个实现**必须声明同一条规则**，不一致是报告出来的错误
+   （规则属于算子，不属于变体），未知的规则编号也是错误，不降级成 `DECLARED`。
 
 ---
 
@@ -460,7 +464,7 @@ rustrain-abi          （无内部依赖）
 
 | crate | 职责 | 明确不负责 |
 |---|---|---|
-| `rustrain-abi` | ABI v1：POD 描述符、插件入口、装载、插件作者辅助 | 不依赖 tch/CUDA；不认识具体算子 |
+| `rustrain-abi` | ABI v2：POD 描述符（含算子自己声明的切分规则 `shard`）、插件入口、装载、插件作者辅助 | 不依赖 tch/CUDA；不认识具体算子 |
 | `rustrain-ops` | 算子字典 + recipe 解析 | 不懂图、不懂调度 |
 | `rustrain-parallel` | 进程组、rank 布局、切分规格与转换规则 | 不懂算子、不懂 plan |
 | `rustrain-plan` | Plan IR、切分校验与通信插入、显存规划、校验、编译、digest | 不执行 |

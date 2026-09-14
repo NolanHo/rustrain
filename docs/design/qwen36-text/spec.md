@@ -227,21 +227,50 @@ L1 全绿（按契约 skip 的四个项除外）；`l1.instantiate` 的 `details
 - 一个测试证明 `Partial` 被兑现：row-parallel linear 之后插入了 `all_reduce({tp})`
 - 一个测试证明 PP 裁剪：`pp=2` 时 stage 0 的节点集合不含 layers 20–39
 
-### D6 — 多 rank 执行与并行效果（用户 2026-09 追加）
+### D6 — 多 rank 执行与并行效果（2026-09 修订：GPU-only、一进程一卡）
 
-**用户的三条决定**：① 权重用宿主上的共享路径 `/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B`（67 GB，**不下载**）；② **8 卡并行，要测出 TP / EP 等并行效果**；③ 卡上占显存的进程"没啥用"（但那 8 个进程在另一个 PID namespace 里，宿主 `ps` 看不到；且**本次不需要**——每卡 ~82 GB 空闲，8 卡分片后每 rank 只需 ~9 GB）。
+**用户的三条决定（不变）**：① 权重用宿主上的共享路径
+`/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B`（67 GB，**不下载**）；
+② **8 卡并行，要测出 TP / EP 等并行效果**；③ 卡上占显存的进程本次不需要。
 
-**必须说清的前提**：reference provider 是**纯 Rust CPU** 实现（I-1）。所以 D6 能测的是**并行机制的正确性与代价**，不是 GPU 壁钟加速：
+**2026-09 修订（用户约束覆盖本节原始形态）**：用户裁定 **除小规模对照外不再允许 CPU 执行**。
+原始 D6 的形态（8 个 CPU reference-provider 进程 + 共享内存 rendezvous）**作废**：它违反该约束，
+而且参考 kernel 是标量 Rust，测出来的不是并行效果。修订后的 D6 = **一进程一卡 + GPU 插件
+（`cuda.aten.f32`）+ 真实集合通信（NCCL）**；reference provider 退回 `ops check` 的逐算子 oracle。
 
-1. **正确性**：8 个 rank 进程（同机 localhost）按 mesh 各持自己的分片，真实执行集合通信，logits 必须与 world=1 的单进程前向一致（容差另定，与 HF 的 1% 是两回事）。
-2. **代价指标**（每 rank、每配置）：权重字节数（分片是否真的减少）、步骤数、集合通信次数与字节量、峰值显存/内存投影 —— 这些是"并行效果"在计划层的真实读数，也是 TP/EP 选择该看的数。
-3. **壁钟**：8 个 CPU rank 的吞吐不会加速（reference kernel 是标量 Rust，且 8 份进程争同一台机的核），把它测出来并如实报告，不假装是加速。
+**交付物**
 
-**GPU 加速不在 D6**：需要一个新的 kernel 插件（CUDA/Tilelang/CUTLASS），按架构那是 T1 实现体，换插件不改框架。它是 D6 之后的独立交付，也是唯一能把"并行效果"变成倍数的路径。
+- **D6.1 传输与启动**：`rustrain-runtime` 的 NCCL 后端（运行期 `dlopen`，核心 crate 的依赖闭包仍
+  零 CUDA —— I-1 不变）；`--rank/--world/--rdzv` 的单 rank 执行形态；`rustrain launch` 以 N 个
+  OS 进程一进程一卡启动（`std::process::Command`，不残留进程）；NCCL unique id 经**文件
+  rendezvous** 交换（每次运行独立目录，超时报错而不是挂死）。
+- **D6.2 正确性**：同一段 token 下，每个可执行的 world>1 配置的 logits 与 **world=1 GPU 前向**
+  一致；判据是逐元素 rel_L2 与 `max|diff| / max|logits|`（阈值随数据记录），**与"对齐 HF 的 1%"是两回事**。
+- **D6.3 代价指标**（每 rank、每配置）：权重字节（分片是否真的减少）、步数、集合通信次数与收发
+  字节、峰值显存投影 / 实测、墙钟。8 个 rank 的墙钟**不承诺加速**，如实报告。
 
-**配置扫描**（每项都要跑通并出数）：`tp=8`；`tp=4,ep=2`；`tp=2,ep=4`；`tp=2,cp=2,ep=2`；`dp=8`；以及 world=1 作为基准。
+**可行配置矩阵（2026-09 实测判定；写在这里，而不是假装都能跑）**
+
+| 配置 | 状态 | 证据 / 阻断点 |
+|---|---|---|
+| `world=1`（GPU 基线） | ✅ | D5：40 层 f32，1382 步，6.6 s，峰值 134.2 GiB |
+| `tp=2` | ✅ 可执行（编译通过，数值待多进程验证） | 见下面的 D6.0：规则改为描述符声明后才编译得通；2 个 kv 头 ÷ 2 = 1，GQA 分组语义正确 |
+| `tp=4` / `tp=8` | ⛔ 阻断 | `rustrain check --tp 4` 在 `l1.instantiate` 报 `slot layers.3.kh`：dim 1 全局 2 不可被 4 整除。设计文档 §4 写明 **tp≥4 需 KV 复制**；且 `sdpa` 的 `num_heads`/`num_kv_heads` 是全局值，分片后还缺 **head 偏移位置常量**（`model-description.md` §4.2 步骤 4，D4 未做） |
+| `ep>1` | ⛔ 阻断 | `moe_layer` 声明了两个 `ALL_TO_ALL {tp, ep}`，但**计划器与编译器从不读 `RsCollective`**（读者只有 ABI 访问器和一个断言 `n_collectives == 2` 的测试）→ 声明式集合通信这条路径（I-3 的第二条）没有实现，EP 跑起来不会通信 |
+| `cp>1` | ⛔ 空转 | 描述里没有任何槽声明 `cp` 轴（只有 `tp`/`ep`），`--cp N` 只是给 mesh 加一个没人用的轴；rope 位置、卷积边界、跨 rank K/V 交换都还没有位置常量与通信声明 |
+| `dp>1` | ⚠️ 无通信 | 前向没有梯度可归约；DP 只复制权重。如实报告"权重字节不减少、集合通信 0 次" |
+
+**执行顺序（2026-09 修订）**：**D6.0 规则体系**（tp=2 先编译通过；实测它一直编译不过）→ D6.1（任何配置都需要的
+传输）→ 用 `tp=2` 端到端验收 D6.2 / D6.3 → 再逐个打开阻断项
+（tp≥4 的 KV 复制 + head 偏移位置常量；EP 的声明式集合通信路径）。**每个阻断项都改契约面，开工前
+单独向用户确认。**
+
+**不在 D6**：反向、训练循环、CP 的真实语义、多节点（跨机）rendezvous、上游速度 kernel。
 
 ### D6 状态（2026-09，逐步推进）
+
+> 1–12 是**修订前的历史记录**（ATen 插件 → GPU 前向 → D5 判定），保留为判断过程的来源；
+> D6.1 / D6.2 / D6.3 的当前状态追加在 12 之后。
 
 1. **ATen 插件**（提交 `14136b0`）：28 个算子映射到 ATen（cuBLAS / FlashAttention-2 / cuDNN /
    ATen 组合），C++17 + ABI v1；宿主上 `ops list --plugin` 列出 60 个实现，GPU 逐算子自检 31/31。
@@ -318,6 +347,47 @@ L1 全绿（按契约 skip 的四个项除外）；`l1.instantiate` 的 `details
    （std 相对差 1% → 7% → 末端 1.5–2 倍），而 `norm.y`（RMSNorm 会归一掉尺度）只差 6%，末 token 的
    `argmax` 两边都是 220（方向对了）。1% 的每层偏差：(1.01)^40 ≈ 1.5 与观测吻合。要定位它，只能像
    §7 那样逐层逐算子对值，而不是看摘要。
+
+### D6.0 — 切分规则成为描述符的声明（ABI v2，2026-09）
+
+**为什么先做这个**：D6 原本以为 TP 只差传输。实测不是 —— `rustrain run --tp 2` 在真实描述上**编译不过**：
+
+```
+node NodeId(36) (causal_conv1d@reference.f32) inferred output 0 shape [512, 1024] but slot SlotId(30) declares [512, 2048]
+```
+
+根因在 `shard::rule_for`：它**按算子名**分类，而模型自己的 7 个算子（`causal_conv1d`、`gated_delta_rule`、
+`l2norm`、`rmsnorm_gated`、`sdpa`、`topk_router`、`moe_layer`）全部落到 `ShardRule::Declared`，
+于是分片传不过去：输入被切成 `[512,1024]`，输出还是 replicate 的 `[512,2048]`。而 `check --tp 2` 报全绿
+是因为 `l1.compile` / `l1.operator_shapes` / `l1.slot_allocation` 三项是 **skip**（见 C6 的 D5 账）。
+**`tp > 1` 在这个模型上从未可执行过**。这正是 SKILL 的 I-5（"规则不得按算子名查框架侧的表"）所禁止的形态。
+
+**做了什么（用户裁定：规则进描述符，ABI v2）**：
+
+1. **ABI v1 → v2**：`rs_op_desc` 追加 `shard`（`DECLARED` / `ELEMENTWISE` / `LINEAR` / `EMBEDDING` /
+   `MATMUL` / `PASS_THROUGH`），184 → 192 字节；C 头、C fixture 的 `_Static_assert`、Rust 尺寸/偏移断言同步。
+2. **框架**：`shard::rule_for` 删除，改为 `ShardRules` 声明查询；`Registry` 实现它（**同一算子的多个实现
+   必须声明同一条规则**，不一致是错误；未知编号也是错误，不降级）；`instantiate` 与 `propagate` 都按声明求值。
+   新增规则种类 `PASS_THROUGH`（输出跟随输入 0、其余输入保持自己的声明）—— 这是 T3，值得，因为它
+   一次性覆盖 7 个算子。
+3. **两个 provider 各自声明**：reference（32 个算子）与 ATen 插件（28 个），同名算子声明一致。
+4. **描述侧的三处真错**（都是 tp>1 才暴露的"形状对、语义错"）：
+   - reshape 的**被分片维度写成字面量**（`[512,16,128]`）→ 改为 `-1`（按本地元素数解析）：
+     描述是拓扑无关的，字面量的 head 数是全局事实，tp=2 上本地只有 8 个 head。写错是硬错误，不静默。
+   - **MoE 的 tp 轴按错了维**：`experts.down_proj` 是行并行，要切**收缩维 I**（dim 2），原来切的是输出维 H
+     （dim 1）；shared expert 的 gate/up 是列并行（切输出维 dim 0），原来切的是输入维 H；shared down 同理
+     反过来。切错维**形状照样整除、网络照样跑**，只有数值对比能发现。
+   - `sdpa` 的 `num_heads` / `num_kv_heads` 是**全局**计数，分片后与张量矛盾 → 改为 `per_head` 布尔声明
+     形式，头数**从张量自己的轴读**（GQA 分组 = 本地 q 头 / 本地 kv 头）。
+5. **`check` 的边界随之变清楚**：一个**没有任何 provider 发布**的算子没有可读的切分规则，`l1.instantiate`
+   直接 `fail` 并点名（`nonexistent_op`）；"有实现但本机跑不了"（dtype/device/sm）仍然是
+   `l1.implementation_availability` 的 `skip`，退出码不受影响。`check_l2` 的对应用例按新真相重写。
+
+**证据**：新增回归 `run::tests::the_real_plan_compiles_after_the_runner_surgery_at_tp_two`
+（真实描述 × tp=2 → 实例化 + runner surgery + 编译通过；断言 layer 0 的 q 本地形状 `[512,1024]` 且插入了
+all_reduce）。工作区测试全绿、clippy 0 warning、`ops check` exit 0。
+**未做（诚实记录）**：`check` 的三项 skip 仍然存在 —— 补它是 D6.1 之前的下一个改动；tp≥4 仍卡在
+KV 头整除（需 KV 复制 + head 偏移位置常量）；EP 仍卡在声明式集合通信未接线。
 
 ### D5 — 前向数值对齐 HuggingFace
 

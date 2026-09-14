@@ -47,7 +47,8 @@ description: rustrain 的架构操作规则。改动 crate 边界、ABI、plan I
   它们来自 recipe 与描述符。
 - **I-5 · 规则不得按算子名或张量名查框架侧的表。** `match op { "linear" => ... }` 形式的规则表把 T2
   泄漏成 T3：加一个规则形态框架已经完全认识的新算子，却要重编框架。规则要作为描述符里的**声明**
-  （`{kind, 参数}`）。**现状违反此条**（`shard::rule_for`），是重构要修的第一件事。
+  （`{kind, 参数}`）。**已落地（ABI v2）**：`rs_op_desc::shard` + `rustrain-plan::shard::ShardRules`，
+  `rule_for` 已删除。同一算子的多个实现必须声明同一条规则，不一致是错误；未知编号也是错误。
   切分轴与"从 checkpoint 取哪一块"是同一条事实，住在**参数映射**里。
 - **I-6 · plan 里没有 topology 这个概念，只有它的结果。** plan 携带具体 layout（含度数）、axis id、
   形状与节点集合，以及 digest 里的 topology 指纹；**不得携带可遍历的 mesh / rank 列表**。
@@ -77,6 +78,9 @@ description: rustrain 的架构操作规则。改动 crate 边界、ABI、plan I
                                      `at::from_blob(nullptr)` 会去问"这个指针在哪块设备上"然后失败。
                                      形状只能来自 shape/stride 算术（D6 GPU 首跑抓到的就是这条）
 ❌ 描述里重复 config 的数值        → 引用参数名，不复制数值
+❌ 被分片的维度写成字面量           → 描述是拓扑无关的：`reshape` 的被分片轴写 `-1`（按本地元素数解析），
+                                     字面量的 head/channel 数在 tp>1 上直接是错的（`-1` 写错是硬错误，不静默）
+❌ 按算子名查切分规则表             → 规则是描述符的声明（ABI v2 已落地；`Declared` 是显式声明，不是缺省兜底）
 ❌ 模型描述只支持"纯列表"或"纯派生"一种形式 → 两种都必须支持（Qwen 与 GLM5 各用一种）
 ```
 
@@ -100,7 +104,9 @@ description: rustrain 的架构操作规则。改动 crate 边界、ABI、plan I
 1. 先问：能不能用现有的 kind / 属性表达？**能就别加原语。** 词表越小越好。
 2. 加进 `docs/design/op-vocabulary.md` 的词表（**词表的唯一权威**；spec §2.4 只是指针）。
 3. 在 reference provider 实现，含 `infer` / `memory` / `doc`（把不受数学约束的选择写进 doc）。
-4. 补切分规则 —— **作为描述符里的声明**，不是框架里的 `match`（I-5）。
+4. 补切分规则 —— **作为描述符里的声明**（`OpSpec::shard(...)` / `rs_op_desc::shard`），不是框架里的
+   `match`（I-5）。规则种类只有 `Declared` / `Elementwise` / `Linear` / `Embedding` / `MatMul` /
+   `PassThrough`（输出跟随输入 0、其余输入保持自己的声明）；需要**新的种类**才是 T3，重编框架是预期的。
 5. 补一致性门禁的 case。
 6. 补 VJP 规则（若可导）。
 
@@ -112,6 +118,8 @@ description: rustrain 的架构操作规则。改动 crate 边界、ABI、plan I
 1. `include/rustrain_op.h` 与 `src/ffi.rs` **必须同时改**，且字段**只能追加、不得重排**。
 2. 更新两端钉死的尺寸断言（Rust 侧 `ffi::tests::layout` + C fixture 的 `_Static_assert`）。
 3. 提高 `RUSTRAIN_ABI_VERSION`，并确认装载期的版本协商会拒绝旧插件而不是猜测兼容。
+   （v1 → v2 追加 `rs_op_desc::shard` 就是这么做的：184 → 192 字节、`offset_of(.., shard) == 184`、
+   C fixture 的 `_Static_assert` 同步，宿主上两个 provider 都要重新构建。）
 4. 更新 `docs/architecture.md` 的边界契约一节。
 
 ### 4.4 改**模型描述**格式（T2/T3 边界）
