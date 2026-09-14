@@ -354,14 +354,17 @@ pub(crate) fn load_weights(
             let tx = tx.clone();
             // Only the sender moves; the pool's shared state stays borrowed, so the calling
             // thread still owns `outcomes` and the sink after the scope.
-            let (next, groups, outcomes) = (&next, &groups, &outcomes);
+            let (abort, next, groups, outcomes) = (&abort, &next, &groups, &outcomes);
             handles.push(scope.spawn(move || {
                 loop {
+                    if abort.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
                     let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(group) = groups.get(index) else {
                         break;
                     };
-                    let outcome = load_group(group, rank, &tx);
+                    let outcome = load_group(group, rank, &tx, abort);
                     outcomes
                         .lock()
                         .expect("the loader's result lock")
@@ -390,8 +393,9 @@ pub(crate) fn load_weights(
             sink.slots += 1;
             sink.seen[weight.slot.0] = true;
         }
-        // Every sender is dropped (the workers finished, or the `?` above ended this scope), so
-        // the loop above cannot hang; the joins are what is left of the pool.
+        // Reaching here means `rx` yielded everything it ever will: either every worker finished
+        // and dropped its sender, or a failed copy returned early and dropped the receiver (which
+        // unblocks any worker waiting in `send`). The joins are what is left of the pool.
         for handle in handles {
             handle.join().expect("a loader worker panicked");
         }
@@ -408,14 +412,31 @@ pub(crate) fn load_weights(
         bytes_distinct: distinct.values().sum(),
         ..LoadStats::default()
     };
+    let mut group_error: Option<anyhow::Error> = None;
     for (_, outcome) in outcomes {
-        let group_stats = outcome?;
-        stats.bytes_read += group_stats.bytes_read;
-        stats.tensors_read += group_stats.tensors_read;
-        stats.read += group_stats.read;
-        stats.fill += group_stats.fill;
+        match outcome {
+            Ok(group_stats) => {
+                stats.bytes_read += group_stats.bytes_read;
+                stats.tensors_read += group_stats.tensors_read;
+                stats.read += group_stats.read;
+                stats.fill += group_stats.fill;
+            }
+            Err(error) => {
+                group_error = Some(error);
+                break;
+            }
+        }
     }
-
+    if let Some(error) = group_error {
+        // The copy failure is the less specific of the two, but it is not dropped: on a device
+        // out-of-memory it is the sentence that explains what actually happened.
+        return Err(match written {
+            Ok(()) => error,
+            Err(copy_error) => {
+                anyhow::anyhow!("{error:#}; a device copy also failed: {copy_error:#}")
+            }
+        });
+    }
     written?;
 
     // Every weight slot of *this* plan must have been loaded exactly once; a weight slot with no
@@ -592,7 +613,13 @@ fn load_group(
     group: &Group,
     rank: usize,
     sink: &std::sync::mpsc::SyncSender<LoadedWeight>,
+    abort: &std::sync::atomic::AtomicBool,
 ) -> Result<LoadStats> {
+    // A failed device copy elsewhere means nothing this group produces can be written; stop
+    // before the read, not after it.
+    if abort.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(LoadStats::default());
+    }
     let mut stats = LoadStats {
         tensors_read: 1,
         ..LoadStats::default()
@@ -653,6 +680,9 @@ fn load_group(
     // startup, and the widened intermediate was one more full copy of the tensor in host memory.
     let strides = strides_of(&group.shape);
     for member in &group.members {
+        if abort.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
         let mut cuts = Cuts::identity(&group.shape);
         let resolved = |index: i64, what: &str| -> Result<usize> {
             axis(index, group.shape.len()).ok_or_else(|| anyhow::anyhow!("{what}"))
@@ -1125,6 +1155,37 @@ mod tests {
         assert_eq!(
             cuts.fill(&bytes, "bf16", &strides_of(&source)).unwrap(),
             explicit
+        );
+    }
+
+    /// An aborted load must stop *before* the read. The group points at a shard that cannot be
+    /// opened, so a `load_group` that ignores the flag fails loudly and one that honours it
+    /// returns with nothing read — which is the difference between "the pool stops when a device
+    /// copy fails" and "the pool finishes reading the checkpoint first and then reports".
+    #[test]
+    fn an_aborted_load_stops_before_touching_the_disk() {
+        let group = Group {
+            tensor: "model.absent.weight".to_string(),
+            shape: vec![2, 2],
+            dtype: "bf16".to_string(),
+            shard: std::path::PathBuf::from("/nonexistent/rustrain/shard.safetensors"),
+            data: (0, 8),
+            steps: Vec::new(),
+            members: Vec::new(),
+        };
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+
+        let aborted = std::sync::atomic::AtomicBool::new(true);
+        let stats = load_group(&group, 0, &tx, &aborted).expect("an aborted group reads nothing");
+        assert_eq!(stats.bytes_read, 0);
+        assert_eq!(stats.tensors_read, 0);
+
+        let running = std::sync::atomic::AtomicBool::new(false);
+        let error = load_group(&group, 0, &tx, &running)
+            .expect_err("without the flag the missing shard is a real error");
+        assert!(
+            format!("{error:#}").contains("shard"),
+            "the error must be the read, not the flag: {error:#}"
         );
     }
 

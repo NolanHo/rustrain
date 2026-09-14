@@ -518,7 +518,8 @@ fn non_overlapping_activations_share_one_buffer() {
     let slot_bytes = 64 * 4;
     assert!(
         reused >= 3,
-        "five same-sized activations in a chain should reuse storage at least three times, got {reused}          (pool {} B)",
+        "five same-sized activations in a chain should reuse storage at least three times, got \
+         {reused} (pool {} B)",
         compiled.memory.transient_pool_bytes
     );
     assert!(
