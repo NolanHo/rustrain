@@ -284,6 +284,12 @@ pub struct RunStats {
     pub first_collective_nanos: u64,
     /// Nanoseconds spent inside plugin `execute` calls, summed over the run.
     pub op_nanos: u64,
+    /// Collectives that travelled through host staging, and those that moved device bytes
+    /// directly. Reported because staging is where an expensive exchange silently becomes
+    /// expensive: a non-contiguous operand pays a device→host→device round trip, and this count is
+    /// the only place that says so.
+    pub staged_collectives: u64,
+    pub direct_collectives: u64,
 }
 
 /// One executed collective, as the metrics report reads it. The group travels
@@ -686,7 +692,7 @@ impl Executor {
         let trace_top: Option<usize> = std::env::var("RUSTRAIN_STEP_TRACE")
             .ok()
             .and_then(|value| value.parse().ok());
-        let mut traced: Vec<(String, u64)> = Vec::new();
+        let mut traced: Vec<(usize, String, u64)> = Vec::new();
         // An explicit flag rather than "the field is still zero": a first collective that measured
         // zero nanoseconds would be indistinguishable from "not yet".
         let mut first_distributing_seen = false;
@@ -858,8 +864,11 @@ impl Executor {
             }
 
             if trace_top.is_some() {
-                let label = self.plan.steps[index].label();
-                traced.push((label, step_started.elapsed().as_nanos() as u64));
+                traced.push((
+                    index,
+                    self.plan.steps[index].label(),
+                    step_started.elapsed().as_nanos() as u64,
+                ));
             }
 
             for (slot, t) in adopted {
@@ -877,10 +886,14 @@ impl Executor {
         }
 
         self.stats = stats.clone();
+        let (staged, direct) = self.collectives.path_counts();
+        stats.staged_collectives = staged;
+        stats.direct_collectives = direct;
+
         if let Some(top) = trace_top {
             let mut by_label: std::collections::BTreeMap<String, (usize, u64)> =
                 std::collections::BTreeMap::new();
-            for (label, nanos) in &traced {
+            for (_, label, nanos) in &traced {
                 let entry = by_label.entry(label.clone()).or_default();
                 entry.0 += 1;
                 entry.1 += nanos;
@@ -902,6 +915,18 @@ impl Executor {
                     "  {label}: {count} call(s), {:.3} s total, {:.3} ms each",
                     total as f64 / 1e9,
                     total as f64 / 1e6 / count.max(1) as f64
+                );
+            }
+            // An aggregate hides the shape of the distribution: one 2-second call and 41 uniform
+            // 60 ms calls have the same total and completely different causes. The slowest single
+            // steps are printed next to it so the two are distinguishable at a glance.
+            let mut singles = traced.clone();
+            singles.sort_by_key(|(_, _, nanos)| std::cmp::Reverse(*nanos));
+            eprintln!("  slowest single step(s):");
+            for (index, label, nanos) in singles.iter().take(top.min(5)) {
+                eprintln!(
+                    "    step {index} {label}: {:.3} ms",
+                    *nanos as f64 / 1e6
                 );
             }
         }

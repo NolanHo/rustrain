@@ -446,12 +446,6 @@ impl NcclBackend {
         &self.lib.path
     }
 
-    /// How many collectives took the staging path, and how many ran directly on
-    /// the slots' buffers.
-    pub fn path_counts(&self) -> (u64, u64) {
-        (self.staged_calls, self.direct_calls)
-    }
-
     /// The communicator for `mask`, created on first use — and already there when `warm` ran.
     ///
     /// Every member creates it, and `ncclCommInitRank` blocks until the whole group arrives — that
@@ -893,6 +887,12 @@ impl NcclBackend {
 }
 
 impl CollectiveBackend for NcclBackend {
+    /// How many collectives took the staging path, and how many ran directly on
+    /// the slots' buffers.
+    fn path_counts(&self) -> (u64, u64) {
+        (self.staged_calls, self.direct_calls)
+    }
+
     /// Creates each group's communicator now, while the caller has something else to do.
     ///
     /// `ncclCommInitRank` blocks until every member of the group has arrived, and the id file's

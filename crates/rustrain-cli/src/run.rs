@@ -1033,6 +1033,13 @@ fn run_rank(
         "collective_sent_bytes": stats.collective_sent_bytes,
         "collective_recv_bytes": stats.collective_recv_bytes,
         "collectives_by_kind": collectives_by_kind,
+        // Device bytes or a host round trip: a staged shape-changing collective runs about an
+        // order of magnitude slower than a direct one, so the split is the first thing to read
+        // when a collective shows up in the step trace.
+        "collective_paths": {
+            "staged": stats.staged_collectives,
+            "direct": stats.direct_collectives,
+        },
         // Where the forward's wall clock went: the sum of the collective backends' own time, the
         // same per intrinsic kind, the first distributing collective alone, and the plugin bodies.
         // On a warmed NCCL world the first collective is where the group's *arrival skew* lands:

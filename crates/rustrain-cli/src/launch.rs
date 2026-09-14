@@ -372,7 +372,11 @@ fn run_world(
         // with four ranks it would bury the table it belongs to).
         if trace_requested() {
             for line in String::from_utf8_lossy(&output.stderr).lines() {
-                if line.contains("step trace") || line.contains("call(s),") {
+                if line.contains("step trace")
+                    || line.contains("call(s),")
+                    || line.contains("slowest single step")
+                    || line.trim_end().ends_with(" ms")
+                {
                     eprintln!("rank {rank}: {line}");
                 }
             }

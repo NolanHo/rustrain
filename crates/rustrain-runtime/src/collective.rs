@@ -145,6 +145,16 @@ pub trait CollectiveBackend {
     fn warm(&mut self, _groups: &[GroupMask]) -> Result<(), String> {
         Ok(())
     }
+
+    /// How many collectives travelled through host staging, and how many moved device bytes
+    /// directly. A backend with no staging path reports `(0, 0)`, which is the truth for it.
+    ///
+    /// This is a *diagnostic*, not a statistic: a run where the expensive collective stages is a
+    /// run whose layouts (non-contiguous operands) are worth fixing, and the count is the only
+    /// thing that says so from the outside.
+    fn path_counts(&self) -> (u64, u64) {
+        (0, 0)
+    }
 }
 
 /// A backend behind a mutex, so a second thread can warm it while the main thread does something
@@ -199,6 +209,13 @@ impl CollectiveBackend for SharedBackend {
             .lock()
             .map_err(|_| Self::poisoned())?
             .warm(groups)
+    }
+
+    fn path_counts(&self) -> (u64, u64) {
+        match self.inner.lock() {
+            Ok(backend) => backend.path_counts(),
+            Err(_) => (0, 0),
+        }
     }
 }
 

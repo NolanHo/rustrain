@@ -146,6 +146,33 @@ int32_t moe_execute(rs_ctx*, const rs_tensor* const* in, uint32_t n_in, rs_tenso
         at::Tensor up = view(in[I_EXPERTS_UP]);
         at::Tensor down = view(in[I_EXPERTS_DOWN]);
 
+        // Which rows selected which expert is a fact about *data*, and the loop below needs it
+        // per (expert, k). Asking the device for it inside the loop — `at::nonzero` returns a
+        // data-dependent shape, so each call synchronises — costs E * K of those per call: 2048
+        // synchronisations, measured at ~92 ms of the ~98 ms this layer used to take. They are
+        // computed once, on the host, from a tensor that is tiny by construction ([rows, K]);
+        // nothing else changes, so the same rows are selected in the same (ascending) order and
+        // the same expert sub-matrices are multiplied with the same shapes.
+        auto indices_cpu = indices.to(at::kCPU).contiguous();
+        const bool wide = indices_cpu.scalar_type() == at::kLong;
+        const void* index_data = indices_cpu.data_ptr();
+        std::vector<std::vector<std::vector<int64_t>>> rows_by(
+            static_cast<size_t>(E), std::vector<std::vector<int64_t>>(static_cast<size_t>(K)));
+        for (int64_t r = 0; r < rows; ++r) {
+            for (int64_t k = 0; k < K; ++k) {
+                const int64_t at = r * K + k;
+                const int64_t e = wide ? static_cast<const int64_t*>(index_data)[at]
+                                       : static_cast<int64_t>(static_cast<const int32_t*>(index_data)[at]);
+                if (e < 0 || e >= E) {
+                    return fail("moe_layer: routing index " + std::to_string(e) + " at row " +
+                                std::to_string(r) + ", slot " + std::to_string(k) +
+                                " is outside [0, " + std::to_string(E) +
+                                "); out-of-range indices are a hard error, never a drop");
+                }
+                rows_by[static_cast<size_t>(e)][static_cast<size_t>(k)].push_back(r);
+            }
+        }
+
         // One contribution per (row, selected expert) pair, then a reduction
         // over k. Accumulating with `index_add_` would be shorter but it uses
         // atomics on CUDA: two runs on the same input can produce different
@@ -157,10 +184,13 @@ int32_t moe_execute(rs_ctx*, const rs_tensor* const* in, uint32_t n_in, rs_tenso
         at::Tensor contributions = at::zeros({rows, K, plan.hidden}, h.options());
         for (int64_t e = 0; e < E; ++e) {
             for (int64_t k = 0; k < K; ++k) {
-                at::Tensor selected = at::nonzero(indices.select(1, k) == e).reshape({-1});
-                if (selected.numel() == 0) {
+                const std::vector<int64_t>& rows_here =
+                    rows_by[static_cast<size_t>(e)][static_cast<size_t>(k)];
+                if (rows_here.empty()) {
                     continue;
                 }
+                at::Tensor selected =
+                    at::tensor(rows_here, at::dtype(at::kLong)).to(h.device());
                 at::Tensor x = h.index_select(0, selected);
                 at::Tensor g = at::matmul(x, gate.select(0, e));
                 at::Tensor u = at::matmul(x, up.select(0, e));
