@@ -487,11 +487,72 @@ python3 scripts/make_tiny_checkpoint.py --out /root/rustrain-gpu/d6tiny-logits -
   --out /var/tmp/d6-tiny-logits-sweep.json --plugin /root/rustrain-gpu/aten-build/librustrain_aten.so \
   --recipe plugins/aten/aten.toml --device cuda --nccl-lib "$NCCL" --keep-rdzv
 
-# 真实模型验收（baseline world=1 + tp=2，各读一遍 67 GB checkpoint，约 23 分钟）
+# 真实模型验收（baseline world=1 + tp=2，各读一遍 67 GB checkpoint）
 bash /root/rustrain-gpu/host-d6-run.sh        # ./rustrain launch --sweep tp=2 ... --keep-rdzv
 python3 /root/rustrain-gpu/host-compare.py    # 逐层 rel_L2 + logits（dump 在 <out>.rdzv/）
 python3 /root/rustrain-gpu/host-logits.py     # 两半 vocab 的 max|d| / rel_L2 / 差异列
+bash /root/rustrain-gpu/load-bench.sh         # 加载分相计时（read / fill / write）
+python3 /root/rustrain-gpu/check_load.py      # 与上一次的 dump 逐位比对 + 新加载分相
 ```
+
+### D6.4 — 加载路径：从 10 分钟到 1 分钟（2026-09）
+
+**为什么单独做**：D6.2/D6.3 每次验收要跑两遍加载，一次 sweep 23 分钟里只有 14 秒是前向。
+Debug 速度卡在这里，所以先修它。
+
+**先量再改**（`checkpoint_load` 分相计时，宿主机，world=1，真实 67 GB checkpoint）：
+
+| 相位 | 单线程读数 | 说明 |
+|---|---|---|
+| transform | **420.1 s** | `transpose` 的逐元素下标除法 |
+| slice | 74.2 s | transform 内 slice + `split` 段 + 分片 slab，各自 `vec![0.0; n]` |
+| widen | 70.6 s | bf16 → f32，全张量 |
+| read | 34.2 s | 873 次整张量读（**热缓存**；冷缓存单流实测 ~160 MB/s） |
+| write | 15.0 s | 逐个 slot 的 `cudaMemcpyHtoD`（串行，全部读完之后） |
+| 合计 | **614.0 s**（进程 624.9 s） | CPU 占 92%，`Threads: 1` |
+
+两个被数字纠正的判断：① `checkpoint_bytes_read` = 117,051,115,776 **不是**"整个 checkpoint" ——
+它 = 71,010,502,912 的**去重字节**（= `weight_bytes`/4 × 2，正好 66.1 GiB）+ 46,040,612,864 的**重复读**：
+873 个 pair 落在 712 个张量上，`split` 的每个段都把同一个张量整读一遍（`in_proj_qkv` ×3 段 ×30 层、
+`gate_up_proj` ×2 段 ×41 处）；② 磁盘不是瓶颈（热缓存 34 s / 66 GiB ≈ 3 GB/s），**CPU 是**。
+
+**三个改动（都在 `crates/rustrain-cli/src/load.rs`）**：
+
+1. **按 `(tensor, transform)` 合组**：一个张量只读一次、只 widen 一次，`split` 的各段从同一份数据上切。
+   `bytes_read == bytes_distinct` 从此是**不变量**（`run_split.rs` 用 metrics 钉住：5 个 pair、3 个张量、
+   读到的字节 = 三个张量之和）。
+2. **16 个 worker 并行**（`LOAD_WORKERS`）：文件读与 CPU 各自并行。实测 16 > 48（48 个 worker 反而更慢：
+   缓存压力与临时缓冲的页错误把 CPU-sum 从 407 s 抬到 565 s）。
+3. **`Cuts`：把 transform / split / 分片 slab 合成为一张下标映射，一次遍历填充**。
+   每个 binding 操作只有两种形态 —— "交换两个轴"（transpose）或"取某一轴的子区间"（slice、split 段、
+   分片 slab），所以整条链可以在**不搬一个字节**的情况下合成：结果轴的 `(checkpoint 轴, 起点, 长度)`。
+   之后按结果的 row-major 序走一趟 odometer，每个输出元素直接从未经中间缓冲的 checkpoint 字节读出来。
+   原来那条链（widen 一份拷贝 → transpose 一份 → slice 一份 → 再 slice 一份）每个字节搬四遍。
+
+   被替换掉的四个函数（`widen` / `transpose_axes` / `slice_axis` / `row_major_strides`）**没有删除**，
+   改为 `#[cfg(test)]`：它们是 `Cuts` 的**参考实现**，`the_composed_walk_matches_the_explicit_chain`
+   用一条覆盖四种操作的链逐元素比对新旧两条路径（bf16 取值精确可表示，所以比对是精确相等）。
+
+**结果（宿主实测）**：
+
+| | 改前 | 改后 |
+|---|---|---|
+| 一次 sweep（baseline + tp=2） | **22 m 43 s** | **1 m 14 s**（18×） |
+| world=1 单次运行 | 624.9 s | **47.0 s**（13×） |
+| 加载 CPU-sum（16 worker 相加） | 406.9 s | **183 s**（fill 141 + read 23 + write 19） |
+| 读到的字节 | 109.0 GiB | **66.1 GiB**（= 去重字节） |
+| `widen` / `transform` / `slice` 三个相位 | 71 / 420 / 74 s | **不存在了**（合并成一次 `fill`） |
+
+**数值不变（这是本次改动的验收判据）**：新加载路径下重跑 tp=2，rank 0 的 `logits` 与全部 42 层
+hidden **与改动前逐位相同**（`np.array_equal` → True，`max|d| 0.0`），digest 不变
+（`4290629e4ac02128…`），sweep 判据仍是 `max|diff| 2.670e-5 / bound 1.298e-4 PASS`。加载器只决定
+"同样的 f32 值怎么进 slot"，不决定值本身；这条判据把"只改了搬字节的方式"钉死。
+
+**本次没做的（诚实记录，下一步的素材）**：① **H2D 回写仍串行**（19–23 s，全部加载完之后逐个 slot 拷贝），
+把它流式化（`Executor::new` 提到加载之前、worker 通过通道交给写线程）能把它藏进 fill 的时间里；
+② **tp>1 仍读整份 66.1 GiB**：rank 只需要的 slab 已经是 `Cuts` 里现成的（`(轴, 起点, 长度)`），
+把组的读范围收窄到并集即可 —— tp=2 应降到 ~38 GiB，tp=8 更多；③ 冷缓存时单流读只有 ~160 MB/s
+（16 worker 已经并行，但 checkpoint 不在 page cache 时仍是主要成本之一）。
 
 ### D5 — 前向数值对齐 HuggingFace
 
