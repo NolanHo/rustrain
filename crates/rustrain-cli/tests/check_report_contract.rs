@@ -66,19 +66,16 @@ const C6_CHECK_IDS: [&str; 16] = [
     "l2.tensor_consumption",
 ];
 
-/// The three L1 sub-checks that still need `Plan::compile`, which `rustrain check` does not run
-/// yet (D5's planner half is outstanding) — a `skip` at every dtype, no matter how well
-/// resolution goes. D4 turned the other three compile-dependent sub-checks real: with the mesh,
-/// `instantiate` and the propagation pass run without any implementation, so
-/// `l1.layout_propagation`, `l1.partial_fulfillment` and `l1.collective_axes` are `pass` on this
-/// fixture now.
-const COMPILE_DEPENDENT_SKIPS: [&str; 3] =
-    ["l1.compile", "l1.operator_shapes", "l1.slot_allocation"];
+/// The three L1 sub-checks that need `Plan::compile`. They are `skip` exactly when compilation
+/// cannot run here — i.e. when nothing available on this host implements some operator (at the
+/// description's own `bf16` with an f32-only reference provider, every node). Once `check` runs the
+/// compiler (2026-09), an all-resolved run turns all three into real checks, so this is no longer a
+/// constant `skip` set but a dtype-dependent one.
+const COMPILE_DEPENDENT_IDS: [&str; 3] = ["l1.compile", "l1.operator_shapes", "l1.slot_allocation"];
 
-/// The `skip` set of an accepted run **at `--dtype f32`**: every node of the real fixture resolves
-/// (moe_layer included — D5's provider half is closed), so implementation availability is a
-/// `pass` and only the three compile-dependent sub-checks are left.
-const EXPECTED_SKIPS: [&str; 3] = COMPILE_DEPENDENT_SKIPS;
+/// The `skip` set of an accepted run **at `--dtype f32`**: every node of the real fixture resolves,
+/// so the compiler runs, and no item is skipped at all.
+const EXPECTED_SKIPS: [&str; 0] = [];
 
 /// The `skip` set at bf16 / f16 (and the description's own bf16): the reference provider accepts
 /// `f32` only, so every node is unresolved and implementation availability joins the three
@@ -258,24 +255,28 @@ const EXPECTED_STATUS: [(&str, Status); 15] = [
     ("l2.dtype_compatibility", Status::Pass),
 ];
 
-/// The status table a run expects, derived from [`EXPECTED_STATUS`] with the one dtype-dependent
-/// id overridden: implementation availability is a `pass` when the availability table is the
-/// empty (all-resolved) form and a `skip` otherwise. Deriving one id from the shared table is
-/// deliberate — the other fourteen ids are dtype-independent and stay pinned in one place.
+/// The status table a run expects, derived from [`EXPECTED_STATUS`] with the dtype-dependent ids
+/// overridden. All four are the same fact: when every node resolves on this host, availability is a
+/// `pass` **and** compilation runs — so `l1.compile`, `l1.operator_shapes` and `l1.slot_allocation`
+/// are real checks; when resolution fails (bf16 against the f32-only reference provider) the
+/// compiler stops at resolution, and all four are `skip` with reasons.
+///
+/// The remaining eleven ids are dtype-independent and stay pinned in one place.
 fn expected_status_for(availability: &Availability) -> BTreeMap<String, Status> {
     let mut map: BTreeMap<String, Status> = EXPECTED_STATUS
         .iter()
         .map(|(id, status)| ((*id).to_string(), *status))
         .collect();
-    let availability_status = if availability.entries.is_empty() {
+    let resolved_here = availability.entries.is_empty();
+    let status = if resolved_here {
         Status::Pass
     } else {
         Status::Skip
     };
-    map.insert(
-        "l1.implementation_availability".to_string(),
-        availability_status,
-    );
+    map.insert("l1.implementation_availability".to_string(), status);
+    for id in COMPILE_DEPENDENT_IDS {
+        map.insert(id.to_string(), status);
+    }
     map
 }
 
@@ -854,9 +855,10 @@ fn a_rejected_argument_emits_the_sixteenth_id_and_changes_nothing_else() {
     );
 
     for (id, status) in &accepted {
-        if id == "l1.implementation_availability" {
-            // The one status the dtype legitimately decides: the fallback run is bf16 (skip with
-            // the whole-plan list), the accepted run is f32 (pass). See the doc comment.
+        if id == "l1.implementation_availability" || COMPILE_DEPENDENT_IDS.contains(&id.as_str()) {
+            // The statuses the dtype legitimately decides: the fallback run is bf16 (nothing
+            // resolves, so availability and the three compile-dependent items are `skip`), the
+            // accepted run is f32 (all four are real checks). See the doc comment.
             continue;
         }
         assert_eq!(

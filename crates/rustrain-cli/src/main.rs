@@ -1055,6 +1055,9 @@ fn check(args: CheckArgs) -> Result<()> {
     //
     // Propagation deliberately stays stage-0-only: the cross-stage seam decision (complete the
     // partial before the seam, or hand it over) is D5's, and every propagation reason says so.
+    // Stage 0's instantiated plan outlives this block: the compile-dependent L1 sub-checks read it
+    // after every other item was produced.
+    let mut stage_zero: Option<rustrain_plan::Plan> = None;
     match (&expanded, mesh.as_ref()) {
         (Some((_, plan)), Some(mesh)) => {
             let stages = rustrain_plan::instantiate_stages(
@@ -1066,7 +1069,6 @@ fn check(args: CheckArgs) -> Result<()> {
             let mut failures: Vec<String> = Vec::new();
             let mut empty: Vec<usize> = Vec::new();
             let mut stage_counts: Vec<String> = Vec::new();
-            let mut stage_zero: Option<rustrain_plan::Plan> = None;
             for stage in stages {
                 match stage.result {
                     Err(e) => {
@@ -1143,8 +1145,9 @@ fn check(args: CheckArgs) -> Result<()> {
                     ));
                 }
             } else {
-                let stage_zero =
-                    stage_zero.expect("stage 0 is not empty when every stage instantiated cleanly");
+                let stage_zero = stage_zero
+                    .as_ref()
+                    .expect("stage 0 is not empty when every stage instantiated cleanly");
                 report.checks.push(CheckItem::pass_with_details(
                     "l1.instantiate",
                     format!(
@@ -1154,7 +1157,7 @@ fn check(args: CheckArgs) -> Result<()> {
                     ),
                     stage_counts,
                 ));
-                match rustrain_plan::shard::propagate(&stage_zero, &registry) {
+                match rustrain_plan::shard::propagate(stage_zero, &registry) {
                     Err(e) => {
                         report.checks.push(CheckItem::fail(
                             "l1.layout_propagation",
@@ -1221,9 +1224,23 @@ fn check(args: CheckArgs) -> Result<()> {
         }
     }
 
-    report
-        .checks
-        .extend(compile_dependent_l1_checks(expanded.is_some()));
+    // `--dtype` is an L1 input (C6): the compile items must ask the operators about the precision
+    // being *checked*, not about the one the description happens to declare. Without this a
+    // `--dtype f32` run on a bf16 description compiles a bf16 plan, the f32-only reference provider
+    // refuses it, and the report would call the host's limits a plan defect.
+    let checked_stage_zero = stage_zero.map(|plan| {
+        let mut plan = plan;
+        for slot in &mut plan.slots {
+            slot.dtype = checked_dtype(slot.dtype, override_dtype);
+        }
+        plan
+    });
+    report.checks.extend(compile_dependent_l1_checks(
+        expanded.is_some(),
+        checked_stage_zero.as_ref(),
+        &registry,
+        &recipe,
+    ));
 
     // ---- L1: implementation availability (never a `fail`, always a reason) --
     match &expanded {
@@ -1531,53 +1548,136 @@ fn collective_axes(propagation: &rustrain_plan::shard::ShardPropagation, mesh: &
     )
 }
 
-/// C2's remaining L1 sub-checks that still cannot run, one `skip` each.
+/// C2's three compile-dependent L1 sub-checks, run for real: the stage-0 plan goes through
+/// `Plan::compile` — resolution, shape inference, layout propagation's collectives, and the memory
+/// plan — and each item reports one part of what that pass proves.
 ///
-/// C2 lists seven things L1 covers. `l1.structure` covers what `load` + `expand` +
-/// `check_structure` can answer, `l1.implementation_availability` covers operator resolution, and
-/// with D4 the mesh exists — `l1.instantiate`, `l1.layout_propagation`, `l1.partial_fulfillment`
-/// and `l1.collective_axes` now run for real. The three left over all need a compiled plan, and
-/// `rustrain check` does not run `Plan::compile` yet — the compiler is D5's planner half, still
-/// outstanding. (Resolution itself is no longer the reason: with `moe_layer` published, every node
-/// of the real description resolves at `--dtype f32`. A check that never runs its compile is still
-/// a skip, not a pass.)
-fn compile_dependent_l1_checks(expanded: bool) -> Vec<CheckItem> {
-    // `(id, why this sub-check needs a compiled plan)`, in C2's order.
-    const SUBCHECKS: [(&str, &str); 3] = [
-        (
-            "l1.compile",
-            "`Plan::compile` is not run by `rustrain check` yet — the compiler is D5's planner \
-             half, still outstanding; until it lands this sub-check cannot run",
-        ),
-        (
-            "l1.operator_shapes",
-            "operators are only asked for their shapes by the compiler's shape-inference pass, \
-             and `rustrain check` does not run the compiler yet (D5's planner half is \
-             outstanding)",
-        ),
-        (
-            "l1.slot_allocation",
-            "allocation and alias analysis live in the plan's memory pass, and `rustrain check` \
-             does not run the compiler yet (D5's planner half is outstanding)",
-        ),
-    ];
-    SUBCHECKS
-        .iter()
-        .map(|(id, why)| {
-            let reason = if expanded {
+/// The three are separate items because they fail for different reasons and a reader has to know
+/// which one did: a plan can compile with an operator whose `infer` disagrees (it cannot — that is
+/// `operator_shapes`), a plan can pass shape inference and still have no workable allocation
+/// (`slot_allocation`), and compilation can stop *before* either question is asked when nothing on
+/// this host implements an operator (`l1.compile` is then a `skip`, not a `fail`: C2 makes
+/// availability a host limitation, which is what `l1.implementation_availability` says in full).
+///
+/// The environment is the one the availability item used (`TargetEnv::default()`): both items must
+/// answer about the same host, or the report would blame the plan for the host's limits.
+fn compile_dependent_l1_checks(
+    expanded: bool,
+    stage_zero: Option<&rustrain_plan::Plan>,
+    registry: &Registry,
+    recipe: &Recipe,
+) -> Vec<CheckItem> {
+    const IDS: [&str; 3] = ["l1.compile", "l1.operator_shapes", "l1.slot_allocation"];
+    let skip_all =
+        |why: &str| -> Vec<CheckItem> { IDS.iter().map(|id| CheckItem::skip(id, why)).collect() };
+
+    if !expanded {
+        return skip_all(
+            "not evaluated: the description did not expand into a plan, and this sub-check needs \
+             a compiled one",
+        );
+    }
+    let Some(stage_zero) = stage_zero else {
+        return skip_all(
+            "not evaluated: no PP stage instantiated, so there is no plan to compile — see \
+             `l1.instantiate`",
+        );
+    };
+
+    match rustrain_plan::Compiler::new(registry, recipe, TargetEnv::default()).compile(stage_zero) {
+        Ok(compiled) => {
+            let shapes = CheckItem::pass(
+                "l1.operator_shapes",
                 format!(
-                    "not evaluated: {why}. `l1.structure` covers expansion and `check_structure` \
-                     only and does not stand in for this sub-check"
+                    "every one of the {} node(s) reports the shape its slot declares (the \
+                     compiler refuses a plan whose inference disagrees, so a compiled plan is the \
+                     evidence)",
+                    compiled.plan.nodes.len()
+                ),
+            );
+            let allocation = if compiled.memory.unsupported.is_empty() {
+                CheckItem::pass(
+                    "l1.slot_allocation",
+                    format!(
+                        "every slot is placed and no node asked for a policy this runtime cannot \
+                         execute: {}",
+                        compiled.memory.summary()
+                    ),
                 )
             } else {
-                format!(
-                    "not evaluated: the description did not expand into a plan, and `{id}` needs a \
-                     compiled one (D5)"
+                CheckItem::fail(
+                    "l1.slot_allocation",
+                    format!(
+                        "{} node(s) asked for an activation policy the runtime cannot execute: {}",
+                        compiled.memory.unsupported.len(),
+                        compiled
+                            .memory
+                            .unsupported
+                            .iter()
+                            .map(|(node, op, policy)| format!("{node:?} ({op}) wants {policy:?}"))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                    Vec::new(),
                 )
             };
-            CheckItem::skip(id, reason)
-        })
-        .collect()
+            let compile = CheckItem::pass(
+                "l1.compile",
+                format!(
+                    "the stage-0 (rank 0) plan compiles: {} step(s), {} inserted collective(s), \
+                     digest {}",
+                    compiled.steps.len(),
+                    compiled.inserted.len(),
+                    compiled.digest
+                ),
+            );
+            vec![compile, shapes, allocation]
+        }
+        Err(rustrain_plan::PlanError::Resolve { node, ref op, .. }) => {
+            let why = format!(
+                "not evaluated: compilation resolves operators before it plans, and nothing \
+                 available on this host implements `{op}` (node {node:?}) — see \
+                 `l1.implementation_availability` for the full list of unresolved operators"
+            );
+            vec![
+                CheckItem::skip("l1.compile", why.clone()),
+                CheckItem::skip("l1.operator_shapes", why.clone()),
+                CheckItem::skip("l1.slot_allocation", why),
+            ]
+        }
+        Err(error) => {
+            let shapes_id = matches!(
+                error,
+                rustrain_plan::PlanError::InferFailed { .. }
+                    | rustrain_plan::PlanError::InferredShapeMismatch { .. }
+                    | rustrain_plan::PlanError::InferMissing { .. }
+                    | rustrain_plan::PlanError::ArityMismatch { .. }
+            );
+            let mut items = vec![CheckItem::fail(
+                "l1.compile",
+                format!("the stage-0 (rank 0) plan does not compile: {error}"),
+                Vec::new(),
+            )];
+            if shapes_id {
+                items.push(CheckItem::fail(
+                    "l1.operator_shapes",
+                    format!("shape inference disagrees with the plan: {error}"),
+                    Vec::new(),
+                ));
+            } else {
+                items.push(CheckItem::skip(
+                    "l1.operator_shapes",
+                    "not evaluated: compilation stopped before the shape comparison — see \
+                     `l1.compile`",
+                ));
+            }
+            items.push(CheckItem::skip(
+                "l1.slot_allocation",
+                "not evaluated: compilation stopped before the memory pass — see `l1.compile`",
+            ));
+            items
+        }
+    }
 }
 
 /// Why one node's operator did not resolve, as the single fact a 1000-node report can carry. The
