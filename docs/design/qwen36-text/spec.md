@@ -674,13 +674,20 @@ shape 一起传），`carry_to_output_rank` 在 refold 时把最后一个轴的 
 | 42 层 hidden 最坏 rel_L2 | 1.652e-6 | 1.838e-6 |
 | argmax（8 行） | 全同 | 全同 |
 | 每 rank 权重 / 峰值 | 34.6 / 35.8 GiB | 18.3 / 19.3 GiB |
-| 每 rank 读到的字节 | 32.7 GiB | 27.1 GiB |
-| 每 rank 前向墙钟 | 8.54–9.28 s | 8.39–8.56 s |
+| 每 rank 读到的字节（`distinct` 66.1 GiB） | 32.7 GiB（189,637 runs，873 pairs / 712 tensors） | 27.1 GiB |
+| 每 rank 加载墙钟 | 9.1 s（read 32.8 / fill 50.0 / write 6.8 CPU 秒，16 worker） | 9.0 s（48.9 / 46.6 / 6.5） |
+| 每 rank 前向墙钟 | 9.45–9.93 s | 9.42–9.91 s |
 | 集合通信（每 rank） | 83 次（1 all_gather + 82 all_reduce） | 同左 |
+| plan 步数 | 1411 | 1411 |
 
-`check --tp 2/4/8` 现在都是 exit 0；`check --tp 3` 仍精确点名不可整除的槽（严格路径没有被削弱）。
+两次运行（`0a24e75` 与 `f719954`，后者改了 slab 规则与一批拒绝路径）数值**逐位相同**：
+logits `max|diff|` 3.338e-5 / 2.766e-5、hidden 最坏 rel_L2 1.652e-6 / 1.838e-6、argmax 全同、
+每 rank 读字节数不变 —— 对 `kv=2, tp=4/8` 新规则与旧规则给出同一批 slab，这正是它该有的样子。
 
-**顺带的一条证据（给 tp=2 那个 4 s 偏差）**：tp=4/tp=8 的 per-rank 墙钟**很紧**（8.4–9.3 s），
+`check --tp 2/4/8` 现在都是 exit 0；`check --tp 3` 仍精确点名不可整除的槽（严格路径没有被削弱）；
+`kv=3, tp=4` 这类"各 rank slab 长度不同"的声明是 `NonUniformSlabs` 编译期错误（不再是静默少一个头）。
+
+**顺带的一条证据（给 tp=2 那个 4 s 偏差）**：tp=4/tp=8 的 per-rank 墙钟**很紧**（9.4–9.9 s），
 而 tp=2 上 rank 1 曾比 rank 0 慢 4 s——说明那不是"多进程都这样"，而是 **2-rank 这一档特有的**
 （下一步就在 tp=2 上打步级时间戳）。
 
