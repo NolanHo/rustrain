@@ -1,0 +1,11 @@
+{
+    "architectures": ["TinySplitForRunTest"],
+    "model_type": "tiny",
+    "text_config": {
+        "hidden_size": 4,
+        "intermediate_size": 9,
+        "vocab_size": 4,
+        "max_position_embeddings": 4,
+        "num_hidden_layers": 1
+    }
+}

@@ -1,0 +1,303 @@
+{
+  "format": "rustrain.model.v1",
+  "name": "run-tiny-split",
+  "dtype": "bf16",
+  "inputs": {
+    "input_ids": {
+      "shape": [
+        "seq"
+      ],
+      "kind": "input",
+      "dtype": "i64"
+    }
+  },
+  "params": {
+    "seq": {
+      "from": "text_config.max_position_embeddings"
+    },
+    "hidden": {
+      "from": "text_config.hidden_size"
+    },
+    "vocab": {
+      "from": "text_config.vocab_size"
+    },
+    "fused": {
+      "from": "text_config.intermediate_size"
+    },
+    "q_out": {
+      "expr": "hidden / 2"
+    },
+    "k_out": {
+      "expr": "hidden - 1"
+    },
+    "v_out": {
+      "expr": "hidden"
+    }
+  },
+  "templates": {
+    "embed": {
+      "inputs": {
+        "ids": {
+          "shape": [
+            "seq"
+          ],
+          "kind": "input",
+          "dtype": "i64"
+        }
+      },
+      "outputs": {
+        "y": {
+          "shape": [
+            "seq",
+            "hidden"
+          ],
+          "kind": "activation"
+        }
+      },
+      "slots": [
+        {
+          "name": "w",
+          "kind": "weight",
+          "shape": [
+            "vocab",
+            "hidden"
+          ]
+        }
+      ],
+      "nodes": [
+        {
+          "op": "embedding",
+          "in": [
+            "w",
+            "ids"
+          ],
+          "out": [
+            "y"
+          ]
+        }
+      ]
+    },
+    "splitter": {
+      "inputs": {
+        "x": {
+          "shape": [
+            "seq",
+            "hidden"
+          ],
+          "kind": "activation"
+        }
+      },
+      "outputs": {
+        "z": {
+          "shape": [
+            "seq",
+            "fused"
+          ],
+          "kind": "activation"
+        }
+      },
+      "slots": [
+        {
+          "name": "w_q",
+          "kind": "weight",
+          "shape": [
+            "hidden",
+            "q_out"
+          ]
+        },
+        {
+          "name": "w_k",
+          "kind": "weight",
+          "shape": [
+            "hidden",
+            "k_out"
+          ]
+        },
+        {
+          "name": "w_v",
+          "kind": "weight",
+          "shape": [
+            "hidden",
+            "v_out"
+          ]
+        },
+        {
+          "name": "q",
+          "kind": "activation",
+          "shape": [
+            "seq",
+            "q_out"
+          ]
+        },
+        {
+          "name": "k",
+          "kind": "activation",
+          "shape": [
+            "seq",
+            "k_out"
+          ]
+        },
+        {
+          "name": "v",
+          "kind": "activation",
+          "shape": [
+            "seq",
+            "v_out"
+          ]
+        }
+      ],
+      "nodes": [
+        {
+          "op": "linear",
+          "in": [
+            "x",
+            "w_q"
+          ],
+          "out": [
+            "q"
+          ]
+        },
+        {
+          "op": "linear",
+          "in": [
+            "x",
+            "w_k"
+          ],
+          "out": [
+            "k"
+          ]
+        },
+        {
+          "op": "linear",
+          "in": [
+            "x",
+            "w_v"
+          ],
+          "out": [
+            "v"
+          ]
+        },
+        {
+          "op": "cat",
+          "in": [
+            "q",
+            "k",
+            "v"
+          ],
+          "out": [
+            "z"
+          ],
+          "attrs": {
+            "dim": -1
+          }
+        }
+      ]
+    },
+    "head": {
+      "inputs": {
+        "z": {
+          "shape": [
+            "seq",
+            "fused"
+          ],
+          "kind": "activation"
+        }
+      },
+      "outputs": {
+        "y": {
+          "shape": [
+            "seq",
+            "vocab"
+          ],
+          "kind": "activation"
+        }
+      },
+      "slots": [
+        {
+          "name": "w",
+          "kind": "weight",
+          "shape": [
+            "fused",
+            "vocab"
+          ]
+        }
+      ],
+      "nodes": [
+        {
+          "op": "linear",
+          "in": [
+            "z",
+            "w"
+          ],
+          "out": [
+            "y"
+          ]
+        }
+      ]
+    }
+  },
+  "stack": [
+    {
+      "template": "embed",
+      "prefix": "embed",
+      "inputs": {
+        "ids": "input_ids"
+      }
+    },
+    {
+      "template": "splitter",
+      "prefix": "splitter",
+      "inputs": {
+        "x": "embed.y"
+      }
+    },
+    {
+      "template": "head",
+      "prefix": "head",
+      "inputs": {
+        "z": "splitter.z"
+      }
+    }
+  ],
+  "binding": [
+    {
+      "slot": "embed.w",
+      "source": "model.embed.weight"
+    },
+    {
+      "source": "model.fused.weight",
+      "transform": [
+        "transpose(0,1)"
+      ],
+      "split": {
+        "dim": 1,
+        "sizes": [
+          "q_out",
+          "k_out",
+          "v_out"
+        ]
+      },
+      "targets": [
+        {
+          "slot": "splitter.w_q"
+        },
+        {
+          "slot": "splitter.w_k"
+        },
+        {
+          "slot": "splitter.w_v"
+        }
+      ]
+    },
+    {
+      "slot": "head.w",
+      "source": "model.head.weight"
+    }
+  ],
+  "outputs": {
+    "logits": "head.y",
+    "hidden": [
+      "splitter.z"
+    ]
+  }
+}

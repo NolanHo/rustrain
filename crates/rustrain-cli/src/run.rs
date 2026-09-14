@@ -413,6 +413,9 @@ pub(crate) fn emit_result(
         "hidden_slots": result.hidden_names,
         "weights": result.loaded_count,
         "checkpoint_bytes": result.checkpoint_bytes,
+        // Reading, widening and the transposes are separate costs with separate fixes; the
+        // load is the slowest part of a run, so its breakdown travels with the run report.
+        "checkpoint_load": result.checkpoint_load,
         "steps": result.rank0_steps,
         "ops": result.rank0_ops,
         "collectives": result.rank0_collectives,
@@ -543,6 +546,8 @@ pub(crate) struct MeshResult {
     wall: Duration,
     loaded_count: usize,
     checkpoint_bytes: u64,
+    /// Rank 0's loader breakdown (bytes read vs distinct, and the phase timings).
+    checkpoint_load: serde_json::Value,
     rank0_steps: usize,
     rank0_ops: usize,
     rank0_collectives: usize,
@@ -728,7 +733,7 @@ fn run_rank(
     let completed_logits = complete_logits(&mut plan, &outputs.logits)?;
 
     // ---- the weights, through the same pairing `check` verifies ---------
-    let loaded = load_weights(&expanded, &model.desc, &plan, mesh, rank, checkpoint)
+    let (loaded, load_stats) = load_weights(&expanded, &model.desc, &plan, mesh, rank, checkpoint)
         .context("loading the checkpoint weights")?;
     let loaded_count = loaded.len();
 
@@ -804,18 +809,19 @@ fn run_rank(
 
     // Each weight's widened f32 buffer is dropped as it is copied into the executor's persistent
     // region, so the peak is the executor's f32 weights, not the executor's plus the loader's.
-    let mut checkpoint_bytes: u64 = 0;
+    let checkpoint_bytes = load_stats.bytes_read;
     // The rank-local slice: the loader reads the whole tensor and extracts
     // this rank's slab, so the *metric* that must fall as the mesh widens is
     // the widened f32 bytes the rank actually holds — not the raw read.
     let mut rank_weight_bytes: u64 = 0;
+    let write_started = Instant::now();
     for weight in loaded {
-        checkpoint_bytes += weight.checkpoint_bytes;
         rank_weight_bytes += (weight.values.len() * 4) as u64;
         executor
             .write_f32(weight.slot, &weight.values)
             .with_context(|| format!("writing the weight slot `{}`", weight.name))?;
     }
+    let write_seconds = write_started.elapsed().as_secs_f64();
 
     let started = Instant::now();
     let stats = executor.run().context("executing the forward")?;
@@ -898,6 +904,18 @@ fn run_rank(
         "weight_slots": loaded_count,
         "weight_bytes": rank_weight_bytes,
         "checkpoint_bytes_read": checkpoint_bytes,
+        // The loader is the slowest part of a run by an order of magnitude; these are the phases
+        // it splits into. `bytes_distinct` is what one read per tensor would need — the gap to
+        // `bytes_read` is duplication the `split` bindings cause.
+        "checkpoint_load": {
+            "bytes_read": load_stats.bytes_read,
+            "bytes_distinct": load_stats.bytes_distinct,
+            "tensors_read": load_stats.tensors_read,
+            "pairs": load_stats.pairs,
+            "read_seconds": load_stats.read.as_secs_f64(),
+            "fill_seconds": load_stats.fill.as_secs_f64(),
+            "write_seconds": write_seconds,
+        },
         "plan_steps": plan_steps,
         "ops": stats.ops,
         "collectives": stats.collectives,
@@ -1123,6 +1141,7 @@ pub(crate) fn assemble_ranks(
         wall: Duration::from_secs_f64(rank0["wall_seconds"].as_f64().unwrap_or(0.0)),
         loaded_count: rank0["weight_slots"].as_u64().unwrap_or(0) as usize,
         checkpoint_bytes: rank0["checkpoint_bytes_read"].as_u64().unwrap_or(0),
+        checkpoint_load: rank0["checkpoint_load"].clone(),
         rank0_steps: rank0["plan_steps"].as_u64().unwrap_or(0) as usize,
         rank0_ops: rank0["ops"].as_u64().unwrap_or(0) as usize,
         rank0_collectives: rank0["collectives"].as_u64().unwrap_or(0) as usize,
