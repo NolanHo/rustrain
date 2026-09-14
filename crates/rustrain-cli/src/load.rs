@@ -43,6 +43,26 @@ pub(crate) struct LoadStats {
     pub fill: Duration,
 }
 
+/// What a load produced: the phase timings, the slots that reached the device, and the wall time
+/// the device writes took (they overlap the reads now, so it is not a phase sum).
+pub(crate) struct LoadOutcome {
+    pub stats: LoadStats,
+    /// Weight slots written into the executor.
+    pub slots: usize,
+    /// Widened f32 bytes that reached the device — the number that must fall as a mesh widens.
+    pub weight_bytes: u64,
+    pub write: Duration,
+}
+
+/// What the writer thread keeps while the workers hand it tensors: which slots arrived, and what
+/// reached the device.
+#[derive(Default)]
+struct Sink {
+    seen: Vec<bool>,
+    slots: usize,
+    bytes: u64,
+}
+
 /// One weight slot's data, ready to write into the executor.
 pub(crate) struct LoadedWeight {
     /// The slot in the **instantiated** (local) plan.
@@ -82,7 +102,7 @@ struct Member {
 
 /// One group's result: its position in the group list (so errors are reported in a fixed order)
 /// and what loading it produced.
-type GroupOutcome = (usize, Result<(Vec<LoadedWeight>, LoadStats)>);
+type GroupOutcome = (usize, Result<LoadStats>);
 
 /// One checkpoint tensor plus every pair that reads it with the same transform.
 ///
@@ -122,7 +142,8 @@ pub(crate) fn load_weights(
     mesh: &Mesh,
     rank: usize,
     checkpoint: &Path,
-) -> Result<(Vec<LoadedWeight>, LoadStats)> {
+    executor: &mut rustrain_runtime::Executor,
+) -> Result<LoadOutcome> {
     let meta = load_checkpoint(checkpoint)?;
 
     // `run` needs the bytes, not just the metadata: a snapshot has no `data_offsets`, so nothing
@@ -285,58 +306,91 @@ pub(crate) fn load_weights(
         });
     }
 
-    // ---- read, widen and transform the groups, in parallel --------------------
+    // ---- read and prepare the groups in parallel, writing each slot as it is ready ----------
     // One worker per tensor, not one per core: the transposes are the bulk of the work and every
-    // worker also holds one tensor's raw + widened + transformed bytes, so the pool is sized by
-    // what the mount and the memory want, not by the CPU count.
+    // worker also holds one tensor's bytes and one result, so the pool is sized by what the mount
+    // and the memory want, not by the CPU count.
+    //
+    // The tensors go straight into the executor from a writer thread rather than accumulating in
+    // host memory: that hides the host-to-device copies behind the reads (they used to be a
+    // serial 19-23 s after every byte had been read), and the rank stops holding a second, f32
+    // copy of every weight it owns.
     let workers = LOAD_WORKERS.min(groups.len()).max(1);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let outcomes: std::sync::Mutex<Vec<GroupOutcome>> =
         std::sync::Mutex::new(Vec::with_capacity(groups.len()));
-    std::thread::scope(|scope| {
+    let (tx, rx) = std::sync::mpsc::channel::<LoadedWeight>();
+    let mut sink = Sink {
+        seen: vec![false; plan.slots.len()],
+        ..Sink::default()
+    };
+    let write_started = Instant::now();
+    let written: Result<()> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
-            scope.spawn(|| {
+            let tx = tx.clone();
+            // Only the sender moves; the pool's shared state stays borrowed, so the calling
+            // thread still owns `outcomes` and the sink after the scope.
+            let (next, groups, outcomes) = (&next, &groups, &outcomes);
+            handles.push(scope.spawn(move || {
                 loop {
                     let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(group) = groups.get(index) else {
                         break;
                     };
-                    let outcome = load_group(group, rank);
-                    outcomes.lock().expect("the loader's result lock").push((index, outcome));
+                    let outcome = load_group(group, rank, &tx);
+                    outcomes
+                        .lock()
+                        .expect("the loader's result lock")
+                        .push((index, outcome));
                 }
-            });
+            }));
         }
+        drop(tx);
+        // The calling thread is the writer. `Executor` owns device pointers and is not `Send`, so
+        // it cannot move to a thread of its own — and it does not need to: the workers only ever
+        // touch the groups and the channel, and the copies happen here, overlapped with them.
+        for weight in rx {
+            executor
+                .write_f32(weight.slot, &weight.values)
+                .with_context(|| format!("writing the weight slot `{}`", weight.name))?;
+            sink.bytes += (weight.values.len() * 4) as u64;
+            sink.slots += 1;
+            sink.seen[weight.slot.0] = true;
+        }
+        // Every sender is dropped (the workers finished, or the `?` above ended this scope), so
+        // the loop above cannot hang; the joins are what is left of the pool.
+        for handle in handles {
+            handle.join().expect("a loader worker panicked");
+        }
+        Ok(())
     });
+    let write = write_started.elapsed();
+    written?;
 
     // Deterministic error reporting: the lowest group index that failed is the one reported, no
-    // matter which worker got there first.
+    // matter which worker got there first. It outranks the writer's error, which is only ever a
+    // consequence of the groups that did complete.
     let mut outcomes = outcomes.into_inner().expect("the loader's result lock");
     outcomes.sort_by_key(|(index, _)| *index);
-
-    let mut loaded: Vec<LoadedWeight> = Vec::with_capacity(p.pairs.len());
-    let mut seen: Vec<bool> = vec![false; plan.slots.len()];
     let mut stats = LoadStats {
         pairs: p.pairs.len(),
         ..LoadStats::default()
     };
     for (_, outcome) in outcomes {
-        let (weights, group_stats) = outcome?;
+        let group_stats = outcome?;
         stats.bytes_read += group_stats.bytes_read;
         stats.bytes_distinct += group_stats.bytes_distinct;
         stats.tensors_read += group_stats.tensors_read;
         stats.read += group_stats.read;
         stats.fill += group_stats.fill;
-        for weight in weights {
-            seen[weight.slot.0] = true;
-            loaded.push(weight);
-        }
     }
 
     // Every weight slot of *this* plan must have been loaded exactly once; a weight slot with no
     // pairing is an unbound slot (already rejected above), and one loaded twice would be a
     // non-bijective pairing (rejected too) — this walk is the loader's own backstop.
     for (index, slot) in plan.slots.iter().enumerate() {
-        if slot.kind == rustrain_plan::SlotKind::Weight && !seen[index] {
+        if slot.kind == rustrain_plan::SlotKind::Weight && !sink.seen[index] {
             bail!(
                 "weight slot `{}` of the rank-{rank} plan was loaded from no checkpoint tensor",
                 slot.name
@@ -344,8 +398,12 @@ pub(crate) fn load_weights(
         }
     }
 
-    loaded.sort_by_key(|w| w.slot);
-    Ok((loaded, stats))
+    Ok(LoadOutcome {
+        stats,
+        slots: sink.slots,
+        weight_bytes: sink.bytes,
+        write,
+    })
 }
 
 /// How one member's tensor is cut out of its checkpoint tensor: for every axis of the **result**,
@@ -491,7 +549,11 @@ fn strides_of(shape: &[i64]) -> Vec<i64> {
 }
 
 /// Reads one checkpoint tensor's bytes and cuts every member's slot out of them.
-fn load_group(group: &Group, rank: usize) -> Result<(Vec<LoadedWeight>, LoadStats)> {
+fn load_group(
+    group: &Group,
+    rank: usize,
+    sink: &std::sync::mpsc::Sender<LoadedWeight>,
+) -> Result<LoadStats> {
     let mut stats = LoadStats {
         tensors_read: 1,
         ..LoadStats::default()
@@ -552,7 +614,6 @@ fn load_group(group: &Group, rank: usize) -> Result<(Vec<LoadedWeight>, LoadStat
     // replaced — widen a copy, transpose a copy, slice a copy, slice a copy — were 92% of a run's
     // startup, and the widened intermediate was one more full copy of the tensor in host memory.
     let strides = strides_of(&group.shape);
-    let mut out = Vec::with_capacity(group.members.len());
     for member in &group.members {
         let mut cuts = Cuts::identity(&group.shape);
         let resolved = |index: i64, what: &str| -> Result<usize> {
@@ -643,14 +704,21 @@ fn load_group(group: &Group, rank: usize) -> Result<(Vec<LoadedWeight>, LoadStat
         let fill_started = Instant::now();
         let values = cuts.fill(&bytes, &group.dtype, &strides)?;
         stats.fill += fill_started.elapsed();
-        out.push(LoadedWeight {
-            slot: member.slot,
-            name: member.slot_name.clone(),
-            values,
-        });
+        // A closed channel means the writer already failed; it reports its own error, so the
+        // workers just stop handing it tensors.
+        if sink
+            .send(LoadedWeight {
+                slot: member.slot,
+                name: member.slot_name.clone(),
+                values,
+            })
+            .is_err()
+        {
+            break;
+        }
     }
 
-    Ok((out, stats))
+    Ok(stats)
 }
 
 /// The pairing errors, with the same wording `check` reports — never weaker ones.

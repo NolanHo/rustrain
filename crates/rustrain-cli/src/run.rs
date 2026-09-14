@@ -732,11 +732,6 @@ fn run_rank(
     // already uses for partials.
     let completed_logits = complete_logits(&mut plan, &outputs.logits)?;
 
-    // ---- the weights, through the same pairing `check` verifies ---------
-    let (loaded, load_stats) = load_weights(&expanded, &model.desc, &plan, mesh, rank, checkpoint)
-        .context("loading the checkpoint weights")?;
-    let loaded_count = loaded.len();
-
     // ---- compile against the configured providers ------------------------
     // The compile target's device follows the allocator: a CUDA device means
     // CUDA variants resolve and the memory plan aligns slot buffers for the
@@ -807,21 +802,25 @@ fn run_rank(
         .write_raw(input_id, &id_bytes)
         .context("feeding the token stream")?;
 
-    // Each weight's widened f32 buffer is dropped as it is copied into the executor's persistent
-    // region, so the peak is the executor's f32 weights, not the executor's plus the loader's.
-    let checkpoint_bytes = load_stats.bytes_read;
-    // The rank-local slice: the loader reads the whole tensor and extracts
-    // this rank's slab, so the *metric* that must fall as the mesh widens is
-    // the widened f32 bytes the rank actually holds — not the raw read.
-    let mut rank_weight_bytes: u64 = 0;
-    let write_started = Instant::now();
-    for weight in loaded {
-        rank_weight_bytes += (weight.values.len() * 4) as u64;
-        executor
-            .write_f32(weight.slot, &weight.values)
-            .with_context(|| format!("writing the weight slot `{}`", weight.name))?;
-    }
-    let write_seconds = write_started.elapsed().as_secs_f64();
+    // ---- the weights, through the same pairing `check` verifies ---------
+    // The loader writes each slot into the executor as it is prepared, so the host does not hold
+    // a second, f32 copy of every weight and the device copies overlap the reads. The rank-local
+    // metric that must fall as the mesh widens is the widened f32 bytes the rank holds — which is
+    // what `weight_bytes` counts, not the raw read.
+    let load = load_weights(
+        &expanded,
+        &model.desc,
+        &plan,
+        mesh,
+        rank,
+        checkpoint,
+        &mut executor,
+    )
+    .context("loading the checkpoint weights")?;
+    let loaded_count = load.slots;
+    let rank_weight_bytes = load.weight_bytes;
+    let checkpoint_bytes = load.stats.bytes_read;
+    let write_seconds = load.write.as_secs_f64();
 
     let started = Instant::now();
     let stats = executor.run().context("executing the forward")?;
@@ -908,12 +907,14 @@ fn run_rank(
         // it splits into. `bytes_distinct` is what one read per tensor would need — the gap to
         // `bytes_read` is duplication the `split` bindings cause.
         "checkpoint_load": {
-            "bytes_read": load_stats.bytes_read,
-            "bytes_distinct": load_stats.bytes_distinct,
-            "tensors_read": load_stats.tensors_read,
-            "pairs": load_stats.pairs,
-            "read_seconds": load_stats.read.as_secs_f64(),
-            "fill_seconds": load_stats.fill.as_secs_f64(),
+            "bytes_read": load.stats.bytes_read,
+            "bytes_distinct": load.stats.bytes_distinct,
+            "tensors_read": load.stats.tensors_read,
+            "pairs": load.stats.pairs,
+            // Wall time per phase; the reads and fills run in LOAD_WORKERS threads, so these do
+            // not add up to the load's wall time, and the device writes overlap both.
+            "read_seconds": load.stats.read.as_secs_f64(),
+            "fill_seconds": load.stats.fill.as_secs_f64(),
             "write_seconds": write_seconds,
         },
         "plan_steps": plan_steps,
