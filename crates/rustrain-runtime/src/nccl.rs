@@ -887,6 +887,20 @@ impl NcclBackend {
 }
 
 impl CollectiveBackend for NcclBackend {
+    /// Creates each group's communicator now, while the caller has something else to do.
+    ///
+    /// `ncclCommInitRank` blocks until every member of the group has arrived, and the id file's
+    /// root has to publish it first — measured at 1.1-2.6 s per multi-rank run on the verification
+    /// host, all of it inside the forward's own wall clock. Warming moves that wait into the
+    /// checkpoint load, which is I/O-bound and has the whole machine idle apart from 16 reader
+    /// threads.
+    fn warm(&mut self, groups: &[GroupMask]) -> Result<(), String> {
+        for mask in groups {
+            self.comm(*mask)?;
+        }
+        Ok(())
+    }
+
     fn execute(
         &mut self,
         req: &CollectiveRequest,

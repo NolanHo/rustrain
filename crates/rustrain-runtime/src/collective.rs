@@ -133,6 +133,72 @@ pub trait CollectiveBackend {
         output: &mut RsTensor,
         host: &mut dyn Allocator,
     ) -> Result<CollectiveReport, String>;
+
+    /// Pre-create whatever each group needs, so the group's *formation* — a rendezvous with every
+    /// other member, which is what `ncclCommInitRank` is — happens before the run's measured work
+    /// instead of inside its first collective.
+    ///
+    /// The default does nothing, and that is the right default: a backend whose groups cost
+    /// nothing to form (the identity, the in-process threads) has nothing to warm. A backend that
+    /// implements it must make the work *idempotent* — `execute` finds the communicator already
+    /// there — because a run may execute the same group many times.
+    fn warm(&mut self, _groups: &[GroupMask]) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// A backend behind a mutex, so a second thread can warm it while the main thread does something
+/// else — loading a 67 GB checkpoint, typically.
+///
+/// The lock is uncontended during the run: once the warming thread has been joined, the executor
+/// is the only caller. What makes that true is that the *loading* path does not touch the
+/// backend: the checkpoint loader writes through the executor's allocator (`Executor::write_raw`),
+/// never through a collective.
+pub struct SharedBackend {
+    inner: Arc<Mutex<Box<dyn CollectiveBackend + Send>>>,
+}
+
+impl SharedBackend {
+    /// Takes ownership of `backend` and returns the shared handle.
+    pub fn new(backend: Box<dyn CollectiveBackend + Send>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(backend)),
+        }
+    }
+
+    /// A second handle, for the thread that warms the groups while this one loads.
+    pub fn handle(&self) -> Arc<Mutex<Box<dyn CollectiveBackend + Send>>> {
+        Arc::clone(&self.inner)
+    }
+
+    /// The message a poisoned lock gets. A panic inside a collective is not something to retry:
+    /// the backend's state (a half-written communicator, a rendezvous ordinal) is unknown.
+    fn poisoned() -> String {
+        "the collective backend's lock was poisoned by a panic in another thread; the backend's          state is unknown, so the run is refused rather than continued"
+            .to_string()
+    }
+}
+
+impl CollectiveBackend for SharedBackend {
+    fn execute(
+        &mut self,
+        req: &CollectiveRequest,
+        input: &RsTensor,
+        output: &mut RsTensor,
+        host: &mut dyn Allocator,
+    ) -> Result<CollectiveReport, String> {
+        self.inner
+            .lock()
+            .map_err(|_| Self::poisoned())?
+            .execute(req, input, output, host)
+    }
+
+    fn warm(&mut self, groups: &[GroupMask]) -> Result<(), String> {
+        self.inner
+            .lock()
+            .map_err(|_| Self::poisoned())?
+            .warm(groups)
+    }
 }
 
 /// The identity backend.
@@ -969,6 +1035,65 @@ mod tests {
 
     use super::*;
     use crate::HostAllocator;
+
+    /// A shared backend must hand the *same* backend both to the executor and to the warming
+    /// thread, or the warm would create a communicator nobody uses and the first collective
+    /// would still pay for a second one. This pins the delegation: every group reaches the inner
+    /// backend's `warm`, through the handle a second thread would hold.
+    #[test]
+    fn a_shared_backend_warms_the_backend_it_executes_on() {
+        #[derive(Default)]
+        struct Recording {
+            warmed: Vec<Vec<u32>>,
+            executed: usize,
+        }
+
+        impl CollectiveBackend for Recording {
+            fn execute(
+                &mut self,
+                _req: &CollectiveRequest,
+                _input: &RsTensor,
+                _output: &mut RsTensor,
+                _host: &mut dyn Allocator,
+            ) -> Result<CollectiveReport, String> {
+                self.executed += 1;
+                Ok(CollectiveReport::default())
+            }
+
+            fn warm(&mut self, groups: &[GroupMask]) -> Result<(), String> {
+                self.warmed
+                    .push(groups.iter().map(|group| group.bits()).collect());
+                Ok(())
+            }
+        }
+
+        let shared = SharedBackend::new(Box::new(Recording::default()));
+        let handle = shared.handle();
+        let groups = [GroupMask::from_bits(0b1), GroupMask::from_bits(0b1 | 0b100)];
+        // From another thread, exactly as the runner does it.
+        let warming = std::thread::spawn(move || {
+            let mut backend = handle.lock().expect("not poisoned");
+            backend.warm(&groups[..])
+        });
+        warming.join().unwrap().unwrap();
+
+        // And the executor's own path still works afterwards, on the same object.
+        let mut shared = shared;
+        let req = CollectiveRequest {
+            kind: CollectiveKind::Sync,
+            group: GroupMask::from_bits(0b1),
+            reduce: None,
+            dim: None,
+            split: None,
+            src: None,
+        };
+        let input = RsTensor::default();
+        let mut output = RsTensor::default();
+        let mut host = HostAllocator::new();
+        shared
+            .execute(&req, &input, &mut output, &mut host)
+            .expect("the shared backend executes");
+    }
 
     /// The allocator is the only thing that knows where a buffer lives, so a
     /// collective must move every byte through it. A backend that dereferenced

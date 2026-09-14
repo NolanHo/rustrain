@@ -638,6 +638,84 @@ fn all_to_all_runs_through_the_collective_backend() {
     assert_eq!(ex.read_f32(y).unwrap(), data);
 }
 
+/// Two collectives must report one *first*: the field is the run's first distributing exchange,
+/// not the latest one to run. Without this, a plan with a cheap first exchange and an expensive
+/// second would attribute the second's time to "the wait at the start", which is the number the
+/// per-rank wall comparison reads.
+#[test]
+fn two_collectives_report_the_first_one_as_the_first() {
+    let (registry, recipe, env) = setup();
+    let parallel = ParallelConfig {
+        tensor: 2,
+        ..Default::default()
+    };
+    let mesh = Mesh::from_config(&parallel);
+    let tp = GroupMask::single(
+        mesh.index_of("tp")
+            .expect("the canonical mesh has a tp axis"),
+    )
+    .expect("the axis index fits in the mask");
+    let mut b = PlanBuilder::new("two-collectives", Phase::Forward, mesh.fingerprint());
+    let x = b.slot("x", RsDtype::F32, vec![4], SlotKind::Input);
+    let w = b.slot_with_layout(
+        "w",
+        RsDtype::F32,
+        vec![3],
+        SlotKind::Weight,
+        ParallelLayout::shard(0, tp),
+    );
+    let y = b.slot("y", RsDtype::F32, vec![4], SlotKind::Activation);
+    let w2 = b.slot_with_layout(
+        "w2",
+        RsDtype::F32,
+        vec![3],
+        SlotKind::Weight,
+        ParallelLayout::shard(0, tp),
+    );
+    let z = b.slot("z", RsDtype::F32, vec![4], SlotKind::Output);
+    b.node(OpRef::new("linear"), vec![x, w], vec![y], Attrs::new(), "a");
+    b.node(
+        OpRef::new("linear"),
+        vec![y, w2],
+        vec![z],
+        Attrs::new(),
+        "b",
+    );
+    let plan = b.build().unwrap();
+
+    let compiled = rustrain_plan::Compiler::new(&registry, &recipe, env)
+        .compile(&plan)
+        .expect("two row-parallel linears compile");
+    assert_eq!(
+        compiled.inserted.len(),
+        2,
+        "each row-parallel weight owes one all_reduce"
+    );
+
+    let mut ex = Executor::new(
+        compiled,
+        Box::new(HostAllocator::new()),
+        Box::new(SingleRank::new(1)),
+    )
+    .unwrap();
+    ex.write_f32(x, &[1.0, 1.0, 1.0, 1.0]).unwrap();
+    ex.write_f32(w, &[1.0, 1.0, 1.0]).unwrap();
+    ex.write_f32(w2, &[1.0, 1.0, 1.0]).unwrap();
+    let stats = ex.run().unwrap();
+    assert_eq!(stats.collectives, 2);
+    assert!(
+        stats.first_collective_nanos > 0 && stats.first_collective_nanos < stats.collective_nanos,
+        "the first of two exchanges is a part of the run's collective time, not the whole of it: \
+         first {} ns, total {} ns",
+        stats.first_collective_nanos,
+        stats.collective_nanos
+    );
+    assert_eq!(
+        stats.collective_nanos_by_kind.values().sum::<u64>(),
+        stats.collective_nanos
+    );
+}
+
 /// The single-rank refusal covers the new collective too: a plan whose
 /// `all_to_all` spans several ranks cannot be executed by doing nothing.
 #[test]

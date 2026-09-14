@@ -26,8 +26,8 @@ pub mod device;
 pub mod nccl;
 
 pub use collective::{
-    CollectiveBackend, CollectiveKind, CollectiveReport, CollectiveRequest, SingleRank,
-    ThreadBackend, ThreadShared,
+    CollectiveBackend, CollectiveKind, CollectiveReport, CollectiveRequest, SharedBackend,
+    SingleRank, ThreadBackend, ThreadShared,
 };
 pub use device::CudaAllocator;
 pub use nccl::NcclBackend;
@@ -268,13 +268,19 @@ pub struct RunStats {
     /// nanoseconds so `RunStats` stays `Eq` (a float here would make the whole
     /// struct uncomparable) and so the metrics report can decide its own unit.
     pub collective_nanos: u64,
-    /// The same, per intrinsic op name: `intrinsic.all_gather` → nanoseconds.
-    /// The first entry of a kind carries its lazily created communicator
-    /// (`ncclCommInitRank` and the id-file rendezvous), which is why the
-    /// per-kind numbers are read next to `first_collective_nanos`.
+    /// The same, per intrinsic op name: `intrinsic.all_gather` → nanoseconds. Read next to
+    /// `first_collective_nanos`: a communicator is created per *group* (one mask, one
+    /// `ncclCommInitRank`), not per kind, so the by-kind split deliberately does not try to say
+    /// which entry paid for one.
     pub collective_nanos_by_kind: std::collections::BTreeMap<String, u64>,
-    /// Nanoseconds the *first* collective of the run took: communicator creation
-    /// happens on first use, so this is where a rank that arrives late pays.
+    /// Nanoseconds the first *distributing* collective of the run took — the first one whose
+    /// group has more than one rank, because a degree-1 group is a local copy and says nothing
+    /// about the world's timing.
+    ///
+    /// Where a backend creates its communicators on first use, this carries that handshake; where
+    /// the runner warms them beforehand (the NCCL path does, during the checkpoint load), what is
+    /// left here is the wait for the other ranks to reach this collective — which is exactly what
+    /// a per-rank wall difference measures when the ranks end together.
     pub first_collective_nanos: u64,
     /// Nanoseconds spent inside plugin `execute` calls, summed over the run.
     pub op_nanos: u64,
@@ -669,6 +675,10 @@ impl Executor {
             resident_bytes: self.stats.resident_bytes,
             ..Default::default()
         };
+        // The mesh, for the one question the timing asks of it: does this collective's group have
+        // more than one rank? A degree-1 group is a local copy, and letting one capture
+        // `first_collective_nanos` would report a wait that no other rank can be part of.
+        let mesh = self.plan.plan.meta.mesh.to_mesh().ok();
 
         for index in 0..self.plan.steps.len() {
             let mut adopted: Vec<(SlotId, RsTensor)> = Vec::new();
@@ -733,7 +743,12 @@ impl Executor {
                             reason,
                         })?;
                     let nanos = collective_started.elapsed().as_nanos() as u64;
-                    if stats.collectives == 0 {
+                    let distributes = mesh
+                        .as_ref()
+                        .and_then(|mesh| group.degree(mesh).ok())
+                        .map(|degree| degree > 1)
+                        .unwrap_or(false);
+                    if distributes && stats.first_collective_nanos == 0 {
                         stats.first_collective_nanos = nanos;
                     }
                     stats.collective_nanos += nanos;

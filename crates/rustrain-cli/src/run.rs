@@ -27,8 +27,8 @@ use rustrain_abi::ffi::RsDtype;
 use rustrain_parallel::{GroupMask, Mesh, ParallelConfig, ParallelLayout};
 use rustrain_plan::{Plan, SlotId};
 use rustrain_runtime::{
-    CollectiveBackend, Executor, HostAllocator, NcclBackend, SingleRank, ThreadBackend,
-    ThreadShared, required_inputs,
+    CollectiveBackend, Executor, HostAllocator, NcclBackend, SharedBackend, SingleRank,
+    ThreadBackend, ThreadShared, required_inputs,
 };
 
 use crate::device::DeviceSpec;
@@ -478,8 +478,9 @@ pub(crate) fn emit_result(
         gib(result.peak_bytes)
     );
     // Where rank 0's own wall clock went, so a skew between ranks can be attributed without a
-    // profiler: the collective backends, the first collective (communicator creation), the plugin
-    // bodies, and the rest (the executor's own walks).
+    // profiler: the collective backends, the first of them (on a NCCL world that is the wait for
+    // the other ranks to arrive — the communicators themselves are warmed during the load), the
+    // plugin bodies, and the rest (the executor's own walks).
     println!(
         "  rank 0 time: collectives {:.3} s (first {:.3} s), ops {:.3} s, other {:.3} s",
         result.rank0_collective_seconds,
@@ -572,14 +573,33 @@ pub(crate) struct MeshResult {
 
 /// Wall-clock seconds since the epoch, for the phase boundaries of one rank's run.
 ///
-/// `Instant` cannot be compared across processes; a rank's *arrival* at the first collective can
-/// only be expressed on a shared clock, and that arrival is what decides who spends the group's
-/// formation time inside its own forward.
+/// `Instant` carries no shared epoch — the standard library exposes neither the raw clock nor an
+/// origin another process could use — so two ranks' `Instant`s cannot be subtracted. That is what
+/// the arrival comparison needs, and `SystemTime` is the only reference two processes on one host
+/// share. (Its one failure mode is a clock step between two samples; the forward's own stamps are
+/// taken microseconds apart, and a step would have to land between the load stamps to matter.)
 fn unix_seconds() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+/// The distinct groups this rank's plan exchanges over, minus the trivial ones.
+///
+/// A group of one has nothing to form and nothing to warm, and the executor would only waste a
+/// communicator on it.
+fn collective_groups(compiled: &rustrain_plan::CompiledPlan, mesh: &Mesh) -> Vec<GroupMask> {
+    let mut groups: Vec<GroupMask> = Vec::new();
+    for step in &compiled.steps {
+        if let rustrain_plan::CompiledStep::Intrinsic { group, .. } = step {
+            let distributes = group.degree(mesh).map(|degree| degree > 1).unwrap_or(false);
+            if distributes && !groups.contains(group) {
+                groups.push(*group);
+            }
+        }
+    }
+    groups
 }
 
 fn mesh_text(cfg: &ParallelConfig) -> String {
@@ -643,6 +663,14 @@ fn run_rank(
     // a device that will not open, or a rendezvous directory that cannot be
     // created is a configuration error, and it should cost seconds rather than
     // a full checkpoint load on every rank.
+    // A NCCL world's group formation (`ncclCommInitRank`, and the id file's root publishing it)
+    // blocks every member until the last one arrives, measured at 1.1-2.6 s on the verification
+    // host and spent inside the forward's own wall clock. The handle below lets a second thread
+    // pay it during the checkpoint load instead; the loader never touches the backend (it writes
+    // through the executor's allocator), so the lock stays uncontended until the forward.
+    let mut warm_handle: Option<
+        std::sync::Arc<std::sync::Mutex<Box<dyn CollectiveBackend + Send>>>,
+    > = None;
     let backend: Box<dyn CollectiveBackend + Send> = match transport {
         Transport::Single => Box::new(SingleRank::new(mesh.world_size())),
         Transport::Threads(shared) => {
@@ -677,7 +705,9 @@ fn run_rank(
                 backend.library(),
                 mesh.world_size()
             );
-            Box::new(backend)
+            let shared = SharedBackend::new(Box::new(backend));
+            warm_handle = Some(shared.handle());
+            Box::new(shared)
         }
     };
     let mut plan = rustrain_plan::instantiate(
@@ -779,6 +809,16 @@ fn run_rank(
     let digest = compiled.digest.clone();
     let peak_bytes = compiled.memory.peak_bytes;
 
+    // The plan is known now, so the groups a NCCL world will form are known too: start paying for
+    // their formation in a thread of its own, while this one loads the checkpoint.
+    let warm_thread = warm_handle.map(|handle| {
+        let groups = collective_groups(&compiled, mesh);
+        std::thread::spawn(move || match handle.lock() {
+            Ok(mut backend) => backend.warm(&groups),
+            Err(_) => Err("the collective backend's lock was poisoned".to_string()),
+        })
+    });
+
     // The slot that holds the complete logits after compilation: the
     // completion view's output when one was added, else the pattern's single
     // match — which must then already be replicated.
@@ -851,6 +891,29 @@ fn run_rank(
     let checkpoint_bytes = load.stats.bytes_read;
     let write_seconds = load.write.as_secs_f64();
     let load_finished_unix = unix_seconds();
+    // The warm is over before this point in any real run (loading 67 GB outlasts a communicator
+    // handshake and its arrival skew), but it is not *assumed* to be: the join is what makes the
+    // forward's clock start on a warmed backend, and how long that join waited is reported as
+    // `warm_seconds` so the wait is attributed rather than lost. A failure is reported too — the
+    // first collective of that group would otherwise fail with the same reason, later and less
+    // clearly.
+    let mut warm_seconds = 0.0;
+    if let Some(thread) = warm_thread {
+        let joined_at = Instant::now();
+        match thread.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(reason)) => eprintln!(
+                "rank {rank}: warming the collective groups failed ({reason}); the first \
+                 collective of that group will report it again"
+            ),
+            Err(_) => eprintln!(
+                "rank {rank}: the collective warm-up thread panicked; the first collective of \
+                 that group will report it again"
+            ),
+        }
+        warm_seconds = joined_at.elapsed().as_secs_f64();
+    }
+    let warm_finished_unix = unix_seconds();
 
     // The pre-forward phases are timed against the wall clock, not against an `Instant`: ranks
     // are separate processes on one host, so `SystemTime` is the only clock that can say which
@@ -964,8 +1027,10 @@ fn run_rank(
         "collective_recv_bytes": stats.collective_recv_bytes,
         "collectives_by_kind": collectives_by_kind,
         // Where the forward's wall clock went: the sum of the collective backends' own time, the
-        // same per intrinsic kind, the first collective alone (communicators are created on first
-        // use, so a rank that arrives late pays for the whole group here), and the plugin bodies.
+        // same per intrinsic kind, the first distributing collective alone, and the plugin bodies.
+        // On a warmed NCCL world the first collective is where the group's *arrival skew* lands:
+        // the rank that reaches it first waits for the others, so a per-rank `wall_seconds`
+        // difference between ranks that end together is this number's difference, not compute.
         // Each is the rank's own time; a difference between ranks in one of these *is* the
         // asymmetry, which is what they exist to localize.
         "collective_seconds": stats.collective_nanos as f64 / 1e9,
@@ -982,6 +1047,11 @@ fn run_rank(
         // across ranks shows the arrival skew, which is what a per-rank wall difference really
         // measures when the first collective is a group rendezvous.
         "load_finished_unix": load_finished_unix,
+        // The time the main thread spent waiting for the group warm-up to finish before starting
+        // the forward's clock. Zero when there is no warm-up to wait for (world size 1, the CPU
+        // thread transport, or a warm that finished during the load, which is the normal case).
+        "warm_seconds": warm_seconds,
+        "warm_finished_unix": warm_finished_unix,
         "forward_started_unix": forward_started_unix,
         "forward_finished_unix": forward_finished_unix,
         "window": window,
