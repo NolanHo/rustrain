@@ -363,7 +363,8 @@ D1 的验收测试暴露了十处未定义。以下裁定**是契约的一部分
 | 2. **形状** | 对每个 slot：把**声明**（`DeclaredAxes`，符号轴名）与从激活传播来的 layout 解析成 `GroupMask`，执行 §2.2 除法；不整除 → 报错。实际布局由**同一张规则表**推出（`shard::propagate` 的 `Linear`/`MatMul`/`Elementwise`/`Declared`），不为实例化再写第二张 |
 | 3. **组可用性** | 每个用到的 `GroupMask` 必须在 mesh 里有定义（位不越界）；否则 `GroupUnavailable`。**度数 1 的组合法**（size-1 组），不是错误 |
 | 4. **位置常量** | 把与 rank 有关的**编译期常量**烘进节点属性：flat QKV 的通道偏移、CP 的序列偏移、本地专家范围（`rank * local`）。它们在进程生命周期内不变，是常量不是运行期参数（`architecture.md` §2.2） |
-| 4a. **位置常量（D4 未做）** | D4 只做到 1–3；位置常量（flat QKV 的通道偏移、CP 的序列偏移、本地专家范围）推迟到 **D5** —— 数值对齐前必须先有它们。`instantiate` 里留注释指到这里，不假装做了。**2026-09 修正**：本模型不需要其中三项 —— 权重在 binding 层按 `split` 拆成独立 slot（没有 flat QKV 通道偏移），专家范围由 slot 的本地形状表达，而**随 rank 变化的形状字面量一律写成 `-1`**（见 §3.10）。真正还缺的是 **CP 的序列偏移**（没有任何槽声明 `cp` 轴，所以今天 `--cp N` 是空转）与 **tp≥4 的 attention head 偏移**（KV 需要复制，见 `qwen36-5d-example.md` §4） |
+| 4a. **位置常量（D4 未做）** | D4 只做到 1–3；位置常量（flat QKV 的通道偏移、CP 的序列偏移、本地专家范围）推迟到 **D5** —— 数值对齐前必须先有它们。`instantiate` 里留注释指到这里，不假装做了。**2026-09 修正**：本模型不需要其中三项 —— 权重在 binding 层按 `split` 拆成独立 slot（没有 flat QKV 通道偏移），专家范围由 slot 的本地形状表达，而**随 rank 变化的形状字面量一律写成 `-1`**（见 §3.10）。真正还缺的是三项：**CP 的序列偏移**（没有任何槽声明 `cp` 轴，所以今天 `--cp N` 是空转）、**tp≥4 的 attention head 偏移**（KV 需要复制，见 `qwen36-5d-example.md` §4），以及 **vocab 分片 embedding 的行偏移**（见下）。 |
+| 4b. **vocab 分片 embedding 的行偏移（D6 发现，未做）** | 查表 `out[s] = W[ids[s]]` 在被切表的行维上**不是集合通信能解决的事**：rank `r` 只持有行 `[r·local_vocab, (r+1)·local_vocab)`，它必须查 `ids[s] - r·local_vocab` 并把落在自己范围外的 id 贡献成 0，那个 `all_reduce` 才是"各 rank 的局部贡献之和"。**没有这个偏移就是静默错值**（rank 1 用全局 id `t` 查到了第 `local_vocab + t` 行），所以本轮把 `embed.w` 改成 **replicate**：整表在每张卡上，代价 2 GB/rank，换来的是每一度都精确。偏移量作为位置常量落地后才能重新分片 |
 | 5. **重写（D4 未做）** | `instantiate` **不重命名任何 slot**：全局 slot 名原样保留（形状已本地化、节点集合已按 stage 裁剪，改名不影响这两者）。slot 重命名（加 rank 无关的稳定后缀）推迟到 **D5** —— 执行器按 rank 消费具体 plan、需要区分产物时再落地 |
 
 **PP 是唯一的"节点集合随 rank 变"的机制**（见 §6.1）。其余四轴都只改形状与通信。
