@@ -53,10 +53,13 @@ pub enum ShardMode {
     #[default]
     Divide,
     /// Every rank owns the slice it *needs*, even when that means two ranks hold the same one:
-    /// `local = ceil(global / degree)`, `offset = floor(coord * global / degree)`. This is how a
+    /// the axis is cut into `global / unit` **units**, a rank owns `ceil(units / degree)` adjacent
+    /// ones, and the offsets are `floor(coord * units / degree) * unit`. This is how a
     /// tensor-parallel attention keeps its key/value heads when there are fewer heads than ranks
     /// (`docs/design/qwen36-text/spec.md` §D6.6): each rank's query slice maps to the key/value
     /// heads it needs, and the slabs overlap rather than communicate.
+    ///
+    /// Not to be confused with [`ParallelLayout::replicate`], which means *no* shard at all.
     Replicate {
         /// The granularity the axis is sharded at, in elements: an axis of `global` elements is
         /// `global / unit` units, and a rank owns whole units. One is the default, but an
@@ -64,6 +67,15 @@ pub enum ShardMode {
         /// ranks in a single-element unit would hand a rank half a head.
         unit: i64,
     },
+}
+
+impl std::fmt::Display for ShardMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShardMode::Divide => f.write_str("divide"),
+            ShardMode::Replicate { unit } => write!(f, "replicate(unit={unit})"),
+        }
+    }
 }
 
 impl ShardMode {
@@ -94,15 +106,6 @@ impl ShardMode {
                 let offset = (coord * units / degree).min(units - local);
                 Some((offset * unit, local * unit))
             }
-        }
-    }
-}
-
-impl std::fmt::Display for ShardMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ShardMode::Divide => f.write_str("divide"),
-            ShardMode::Replicate { unit } => write!(f, "replicate({unit})"),
         }
     }
 }
@@ -317,11 +320,18 @@ impl ParallelLayout {
             match mode.slab(size, 0, divisor) {
                 Some((_, len)) => local.push(len),
                 None => {
-                    return Err(ShardError::NotDivisible {
-                        dim: d as i64,
-                        global: size,
-                        divisor,
-                    })
+                    return Err(match mode {
+                        ShardMode::Replicate { unit } => ShardError::UnitMismatch {
+                            dim: d as i64,
+                            global: size,
+                            unit,
+                        },
+                        ShardMode::Divide => ShardError::NotDivisible {
+                            dim: d as i64,
+                            global: size,
+                            divisor,
+                        },
+                    });
                 }
             }
         }
@@ -330,9 +340,10 @@ impl ParallelLayout {
 
     /// The slab coordinate `coord` of `degree` holds along logical `dim`: `(offset, len)`.
     ///
-    /// The one source for "where does a rank's slice start and how long is it": the layout agrees
-    /// with itself by construction, and the loader asks this instead of re-deriving
-    /// `coord * local` (which is only the same thing while every shard divides).
+    /// `degree` must be the degree of the group that owns `dim`. When several specs shard one dim
+    /// the single mode they agree on is the weaker promise — see [`Self::mode_of`] — so a caller
+    /// that already holds the owning spec should ask that spec's mode instead, which is what the
+    /// checkpoint loader does.
     pub fn slab(
         &self,
         global: i64,
@@ -342,16 +353,24 @@ impl ParallelLayout {
         tensor_rank: i64,
     ) -> Result<(i64, i64), ShardError> {
         let mode = self.mode_of(dim, tensor_rank)?;
-        mode.slab(global, coord, degree)
-            .ok_or(ShardError::NotDivisible {
+        mode.slab(global, coord, degree).ok_or(match mode {
+            ShardMode::Replicate { unit } => ShardError::UnitMismatch { dim, global, unit },
+            ShardMode::Divide => ShardError::NotDivisible {
                 dim,
                 global,
                 divisor: degree,
-            })
+            },
+        })
     }
 
     /// The mode the layout imposes on logical `dim`, without needing a mesh: `Divide` unless a
     /// spec on that dim replicates.
+    ///
+    /// Two replicating specs on one dim are resolved to the *coarser* unit — the weaker promise, in
+    /// the same spirit as [`Self::axis_shard`]: units of 512 are a subset of units of 128, so a
+    /// rank that owns whole 512-units also owns whole 128-units. Two groups that both demand the
+    /// finer unit of a dim they share cannot both be satisfied by an axis slab, and taking the
+    /// coarser one is the only reading that hands every group what it asked for.
     fn mode_of(&self, dim: i64, tensor_rank: i64) -> Result<ShardMode, ShardError> {
         let norm = DimNormalizer::new(tensor_rank)?;
         let target = norm.normalize(dim)?;
@@ -359,7 +378,10 @@ impl ParallelLayout {
         for spec in &self.dims {
             if norm.normalize(spec.dim)? == target {
                 if let ShardMode::Replicate { unit } = spec.mode {
-                    mode = ShardMode::Replicate { unit };
+                    mode = match mode {
+                        ShardMode::Replicate { unit: seen } if seen >= unit => mode,
+                        _ => ShardMode::Replicate { unit },
+                    };
                 }
             }
         }
@@ -385,9 +407,13 @@ impl ParallelLayout {
                     spec.group.degree(mesh).expect("group validated"),
                 ));
                 // A dim sharded twice takes the weaker promise: overlapping slabs are the only
-                // way two groups can both be satisfied when either is undersized.
+                // way two groups can both be satisfied when either is undersized, and of two
+                // units the coarser is the weaker promise (whole 512-units contain whole 128).
                 if let ShardMode::Replicate { unit } = spec.mode {
-                    mode = ShardMode::Replicate { unit };
+                    mode = match mode {
+                        ShardMode::Replicate { unit: seen } if seen >= unit => mode,
+                        _ => ShardMode::Replicate { unit },
+                    };
                 }
             }
         }
@@ -408,11 +434,9 @@ impl ParallelLayout {
             Vec::with_capacity(self.dims.len() + usize::from(self.partial.is_some()));
         for spec in &self.dims {
             match spec.mode {
-                ShardMode::Divide => parts.push(format!(
-                    "shard({}, {})",
-                    spec.dim,
-                    name(mesh, spec.group)
-                )),
+                ShardMode::Divide => {
+                    parts.push(format!("shard({}, {})", spec.dim, name(mesh, spec.group)))
+                }
                 ShardMode::Replicate { unit } => parts.push(format!(
                     "shard_replicated({}, {}, unit={unit})",
                     spec.dim,
@@ -575,10 +599,7 @@ mod tests {
 
         // Two shards over the same group (case F1c's shape).
         let l = ParallelLayout {
-            dims: vec![
-                ShardSpec::shard(0, tp),
-                ShardSpec::shard(1, tp),
-            ],
+            dims: vec![ShardSpec::shard(0, tp), ShardSpec::shard(1, tp)],
             partial: None,
         };
         assert_eq!(l.overlapping_groups(), Some((tp, tp)));
@@ -605,10 +626,7 @@ mod tests {
 
         // The disjoint MoE ep x tp shape has none.
         let l = ParallelLayout {
-            dims: vec![
-                ShardSpec::shard(0, ep),
-                ShardSpec::shard(1, tp),
-            ],
+            dims: vec![ShardSpec::shard(0, ep), ShardSpec::shard(1, tp)],
             partial: None,
         };
         assert_eq!(l.overlapping_groups(), None);

@@ -16,8 +16,10 @@ use rustrain_plan::{
 };
 
 use crate::ModelError;
-use crate::desc::{AxisMode, 
-    AttrLiteral, FORMAT, ModelDesc, NodeDecl, StackEntry, StageDecl, Target, Template, AxisDecl};
+use crate::desc::{
+    AttrLiteral, AxisDecl, AxisMode, FORMAT, ModelDesc, NodeDecl, StackEntry, StageDecl, Target,
+    Template,
+};
 use crate::params::{Params, Value};
 use crate::pattern::is_wildcard_segment;
 use crate::transform::parse_transform;
@@ -63,25 +65,32 @@ pub struct Expanded {
 /// a third mode would fail to compile in this match rather than default to a silent divide.
 /// Input axes are activations: they have no unit, and the object form is refused with a reason
 /// rather than quietly sharded by single elements.
-fn declared_axes_plain(axes: &BTreeMap<String, Vec<AxisDecl>>) -> BTreeMap<String, Vec<DeclaredAxis>> {
-    let mut out = BTreeMap::new();
-    for (dim, axes) in axes {
-        let mut declared = Vec::with_capacity(axes.len());
-        for axis in axes {
-            declared.push(DeclaredAxis {
-                axis: axis.axis().to_string(),
-                mode: match axis.mode() {
-                    AxisMode::Divide => rustrain_plan::ShardMode::Divide,
-                    AxisMode::Replicate => rustrain_plan::ShardMode::Replicate { unit: 1 },
-                },
-            });
-        }
-        out.insert(dim.clone(), declared);
-    }
-    out
+fn declared_axes_plain(
+    axes: &BTreeMap<String, Vec<AxisDecl>>,
+) -> BTreeMap<String, Vec<DeclaredAxis>> {
+    // Input axes are activations: they have no unit (a declared one is refused where the port is
+    // read), so they resolve to unit one and go through the very same mapping as a binding's.
+    let resolved: BTreeMap<String, Vec<ResolvedAxis>> = axes
+        .iter()
+        .map(|(dim, list)| {
+            (
+                dim.clone(),
+                list.iter()
+                    .map(|axis| ResolvedAxis {
+                        axis: axis.axis().to_string(),
+                        mode: axis.mode(),
+                        unit: 1,
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    declared_axes(&resolved)
 }
 
-fn declared_axes(axes: &BTreeMap<String, Vec<ResolvedAxis>>) -> BTreeMap<String, Vec<DeclaredAxis>> {
+fn declared_axes(
+    axes: &BTreeMap<String, Vec<ResolvedAxis>>,
+) -> BTreeMap<String, Vec<DeclaredAxis>> {
     axes.iter()
         .map(|(dim, axes)| {
             (
@@ -91,9 +100,9 @@ fn declared_axes(axes: &BTreeMap<String, Vec<ResolvedAxis>>) -> BTreeMap<String,
                         axis: axis.axis.clone(),
                         mode: match axis.mode {
                             AxisMode::Divide => rustrain_plan::ShardMode::Divide,
-                            AxisMode::Replicate => rustrain_plan::ShardMode::Replicate {
-                                unit: axis.unit,
-                            },
+                            AxisMode::Replicate => {
+                                rustrain_plan::ShardMode::Replicate { unit: axis.unit }
+                            }
                         },
                     })
                     .collect(),
@@ -101,7 +110,6 @@ fn declared_axes(axes: &BTreeMap<String, Vec<ResolvedAxis>>) -> BTreeMap<String,
         })
         .collect()
 }
-
 
 impl Expanded {
     /// The declarations `instantiate` consumes: the `binding` axes by slot name, and the stage
@@ -1162,14 +1170,32 @@ impl<'a> Expander<'a> {
             }
 
             // Resolve every declared axis' unit here, next to `split.sizes`: both name a
-            // parameter or a literal, and both are needed before a slot exists.
-            let mut resolved_axes: BTreeMap<String, BTreeMap<String, Vec<ResolvedAxis>>> =
-                BTreeMap::new();
+            // parameter or a literal, and both are needed before a slot exists. The resolved
+            // targets are a `Vec`, in the order the bindings were read: a slot claimed twice must
+            // stay claimed twice so the conflict is reported, which a map keyed by slot would
+            // quietly merge away.
+            let mut resolved_targets: Vec<(String, BTreeMap<String, Vec<ResolvedAxis>>)> =
+                Vec::with_capacity(targets.len());
             for (slot, axes) in &targets {
                 let mut per_dim: BTreeMap<String, Vec<ResolvedAxis>> = BTreeMap::new();
                 for (dim, declarations) in axes {
                     let mut resolved = Vec::with_capacity(declarations.len());
                     for axis in declarations {
+                        // A unit says how coarse a *replicating* shard is. On a strict shard it has
+                        // no meaning at all, and dropping it (which is what reading the mode alone
+                        // would do) would hand the kernel slabs nobody declared.
+                        if let AxisDecl::Sharded {
+                            mode: AxisMode::Divide,
+                            unit: Some(text),
+                            ..
+                        } = axis
+                        {
+                            return Err(ModelError::Invalid(format!(
+                                "binding {index} (`{}`): axis unit `{text}` is only meaningful \
+                                 with `\"mode\": \"replicate\"`; a strict shard has no unit",
+                                binding.source
+                            )));
+                        }
                         let unit = match axis {
                             AxisDecl::Name(_) | AxisDecl::Sharded { unit: None, .. } => 1,
                             AxisDecl::Sharded {
@@ -1194,12 +1220,9 @@ impl<'a> Expander<'a> {
                     }
                     per_dim.insert(dim.clone(), resolved);
                 }
-                resolved_axes.insert(slot.clone(), per_dim);
+                resolved_targets.push((slot.clone(), per_dim));
             }
-            let targets: Vec<(String, BTreeMap<String, Vec<ResolvedAxis>>)> = targets
-                .iter()
-                .map(|(slot, _)| (slot.clone(), resolved_axes.get(slot).cloned().unwrap_or_default()))
-                .collect();
+            let targets = resolved_targets;
 
             let captures = source_captures(&binding.source);
             let mut slots = Vec::new();

@@ -308,6 +308,101 @@ fn serialization_forms_are_pinned() {
     );
     let back_rep: ParallelLayout = serde_json::from_str(r#"{"dims":[],"partial":null}"#).unwrap();
     assert_eq!(back_rep, rep);
+
+    // A replicating shard's wire form: the mode is the only thing that carries a unit, and the
+    // default omits it — so a plan written before `Replicate` existed still reads back identical.
+    let replicating = ParallelLayout {
+        dims: vec![
+            rustrain_parallel::ShardSpec::shard(0, ep),
+            rustrain_parallel::ShardSpec::replicating(-1, tp, 256),
+        ],
+        partial: None,
+    };
+    let json = serde_json::to_string(&replicating).unwrap();
+    assert_eq!(
+        json,
+        r#"{"dims":[{"dim":0,"group":4},{"dim":-1,"group":1,"mode":{"replicate":{"unit":256}}}],"partial":null}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<ParallelLayout>(&json).unwrap(),
+        replicating
+    );
+    assert_eq!(
+        serde_json::to_string(&rustrain_parallel::ShardSpec::replicating(-1, tp, 1)).unwrap(),
+        r#"{"dim":-1,"group":1,"mode":{"replicate":{"unit":1}}}"#,
+        "a unit of one is still spelled out: only `Divide` is the default"
+    );
+}
+
+/// A spec whose unit cannot tile the axis is a `UnitMismatch`, not a divisibility error: the two
+/// failures read differently to whoever has to fix the declaration.
+#[test]
+fn a_unit_that_cannot_tile_the_axis_is_named_as_such() {
+    use rustrain_parallel::{ShardError, ShardSpec};
+
+    let m = mesh(cfg(4, 1, 1, 1, 1));
+    let tp = axis(&m, "tp");
+    let layout = ParallelLayout {
+        dims: vec![ShardSpec::replicating(1, tp, 3)],
+        partial: None,
+    };
+    assert!(matches!(
+        layout.local_shape(&[4, 512], &m),
+        Err(ShardError::UnitMismatch {
+            dim: 1,
+            global: 512,
+            unit: 3
+        })
+    ));
+    assert!(
+        layout
+            .local_shape(&[4, 512], &m)
+            .unwrap_err()
+            .to_string()
+            .contains("units"),
+        "the message must name units, not a divisor"
+    );
+    // The same dim, declared strictly, is still the divisibility error.
+    let strict = ParallelLayout {
+        dims: vec![ShardSpec::shard(1, tp)],
+        partial: None,
+    };
+    assert!(matches!(
+        strict.local_shape(&[4, 3], &m),
+        Err(ShardError::NotDivisible {
+            dim: 1,
+            global: 3,
+            divisor: 4
+        })
+    ));
+}
+
+/// Two specs on one dim: the weaker promise wins, and of two units the coarser is the weaker one.
+#[test]
+fn two_specs_on_one_dim_take_the_coarser_unit() {
+    use rustrain_parallel::ShardSpec;
+
+    let m = mesh(cfg(4, 2, 1, 1, 1));
+    let tp = axis(&m, "tp");
+    let d2 = axis(&m, "dp");
+    let layout = ParallelLayout {
+        dims: vec![
+            ShardSpec::replicating(-1, tp, 128),
+            ShardSpec::replicating(-1, d2, 512),
+        ],
+        partial: None,
+    };
+    // 1024 elements in units of 512: rank 0 of tp gets [0, 512), which is whole units of 128 too.
+    assert_eq!(layout.slab(1024, -1, 0, 4, 2).unwrap(), (0, 512));
+    assert_eq!(layout.slab(1024, -1, 1, 4, 2).unwrap(), (0, 512));
+    assert_eq!(layout.slab(1024, -1, 2, 4, 2).unwrap(), (512, 512));
+    // One replicating spec on the dim: its own unit is the answer — ceil(8 units / 4) = 2 units,
+    // starting at unit 2. Coarse and fine disagree here, which is the point of pinning it.
+    let single = ParallelLayout {
+        dims: vec![ShardSpec::replicating(-1, tp, 128)],
+        partial: None,
+    };
+    assert_eq!(single.slab(1024, -1, 1, 4, 2).unwrap(), (256, 256));
 }
 
 /// A declared replicating shard: `docs/design/qwen36-text/spec.md` §D6.6. The axis is sharded in
@@ -344,8 +439,10 @@ fn a_replicating_shard_hands_each_rank_the_units_it_needs() {
     );
 
     // Every element belongs to some rank, and no slab cuts a unit in half.
-    let covered: std::collections::BTreeSet<i64> =
-        slabs.iter().flat_map(|(off, len)| *off..*off + *len).collect();
+    let covered: std::collections::BTreeSet<i64> = slabs
+        .iter()
+        .flat_map(|(off, len)| *off..*off + *len)
+        .collect();
     assert_eq!(covered.len(), 1024, "the slabs must cover the axis");
 
     // A unit that does not divide the axis is refused, not rounded: 512 with units of 3.
@@ -367,7 +464,11 @@ fn a_replicating_shard_hands_each_rank_the_units_it_needs() {
     };
     assert!(matches!(
         strict.local_shape(&[4, 2], &m),
-        Err(ShardError::NotDivisible { dim: 1, global: 2, divisor: 4 })
+        Err(ShardError::NotDivisible {
+            dim: 1,
+            global: 2,
+            divisor: 4
+        })
     ));
     let replicating = ParallelLayout {
         dims: vec![ShardSpec::replicating(1, tp, 1)],

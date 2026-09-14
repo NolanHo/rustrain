@@ -431,6 +431,15 @@ pub fn derive(
                 // spec: every rank holds a partial sum, which forces the
                 // all-reduce downstream.
                 (false, [ShardSpec { dim, group, mode }], None) if *dim == 0 => {
+                    // A *replicating* weight on the contraction axis has no rule: every rank
+                    // would hold an overlapping slab and the all-reduce would count the overlap
+                    // twice. Refused rather than guessed.
+                    if !mode.is_divide() {
+                        return Err(DeriveError::UnsupportedWeightLayout {
+                            op: op.to_string(),
+                            layout: format!("{w}"),
+                        });
+                    }
                     ParallelLayout::partial(ReduceOp::Sum, *group)
                 }
                 // Anything else — two shards on the weight, an existing
@@ -476,6 +485,15 @@ pub fn derive(
                     partial: None,
                 },
                 (false, [ShardSpec { dim, group, mode }], None) if *dim == 0 => {
+                    // A *replicating* weight on the contraction axis has no rule: every rank
+                    // would hold an overlapping slab and the all-reduce would count the overlap
+                    // twice. Refused rather than guessed.
+                    if !mode.is_divide() {
+                        return Err(DeriveError::UnsupportedWeightLayout {
+                            op: op.to_string(),
+                            layout: format!("{w}"),
+                        });
+                    }
                     ParallelLayout::partial(ReduceOp::Sum, *group)
                 }
                 _ => {
@@ -532,6 +550,16 @@ pub fn derive(
             // of them over the *same* group are one partial; over *different* groups the
             // result would be a partial over a union of groups the table does not document —
             // refuse rather than drop one.
+            // A *replicating* shard on a contraction dim has no rule either: the sum would count
+            // every overlapped element twice.
+            for contract in [contract_a, contract_b].into_iter().flatten() {
+                if !contract.mode.is_divide() {
+                    return Err(DeriveError::UnsupportedWeightLayout {
+                        op: op.to_string(),
+                        layout: format!("{contract:?}"),
+                    });
+                }
+            }
             let partial = match (contract_a, contract_b) {
                 (Some(sa), Some(sb)) if sa.group != sb.group => {
                     return Err(DeriveError::ContractionGroupsDiffer {
@@ -703,74 +731,81 @@ fn carry_to_output_rank(
         });
     }
     let offset = if trailing { out_rank - rank } else { 0 };
-    // A refold that gives the last axis more axes of its own: a shard on it stays on the outer
-    // piece, and a replicating shard's unit becomes units of that piece.
-    let refold_inner = if !trailing && rank < out_rank {
+    let unmappable = || DeriveError::UnmappableViewShard {
+        op: op.to_string(),
+        operand,
+        layout: format!("{layout}"),
+        rank,
+        out_rank,
+    };
+    // An axis-preserving rank change refolds in row-major order, and there are two directions:
+    //
+    //   * a split (`rank < out_rank`) turns the operand's last axis into axes `rank-1 .. out_rank`,
+    //     so a replicating shard *on that axis* stays on the outer piece while its unit — counted
+    //     in elements of the piece — shrinks by the inner piece. Folding 512 features into
+    //     `[.., 2, 256]` turns a unit of 512 into a unit of 256.
+    //   * a merge (`rank > out_rank`) folds the operand's axes `out_rank-1 ..` into the operand's
+    //     own last axis, so a shard on any of those axes is no longer an axis slab of the output.
+    //
+    // A split that does not line up with the operand's last axis, and a merge of a replicating
+    // shard whose unit would have to be re-sliced, are refused: renaming a distribution is how a
+    // wrong slab reaches a kernel without anyone noticing. Shards on axes the refold does not
+    // touch carry over verbatim in both directions.
+    let split_inner = if !trailing && rank < out_rank {
         match (in_shape, out_shape) {
-            (Some(input), Some(output)) => {
+            (Some(input), Some(output)) if !input.is_empty() => {
                 let extra = (out_rank - rank) as usize;
-                if output.len() < extra || input.is_empty() {
-                    None
-                } else {
-                    let inner: i64 = output[output.len() - extra..].iter().product();
-                    Some(inner.max(1))
+                let folded: i64 = output
+                    .get(output.len().saturating_sub(extra + 1)..)
+                    .unwrap_or(&[])
+                    .iter()
+                    .product();
+                if folded != *input.last().unwrap() {
+                    // The refold does not put the operand's last axis into the output's innermost
+                    // axes, so no unit conversion below can be trusted.
+                    return Err(unmappable());
                 }
+                Some(
+                    output[output.len() - extra..]
+                        .iter()
+                        .product::<i64>()
+                        .max(1),
+                )
             }
             _ => None,
         }
     } else {
         None
     };
-    let dims: Vec<ShardSpec> = layout
-        .dims
-        .iter()
-        .map(|spec| {
-            let mut mapped = ShardSpec {
-                dim: spec.dim + offset,
-                group: spec.group,
-                mode: spec.mode,
-            };
-            // Only the last operand axis is refolded, and only a replicating shard has a unit.
-            if let (Some(inner), ShardMode::Replicate { unit }) = (refold_inner, spec.mode) {
-                if spec.dim == rank - 1 {
-                    if unit % inner == 0 {
-                        mapped.mode = ShardMode::Replicate { unit: unit / inner };
-                    } else {
-                        // The unit is finer than the elements the refold puts inside one output
-                        // element: a whole number of output elements per slab cannot be
-                        // expressed, so this is refused rather than rounded.
-                        mapped.mode = spec.mode;
-                    }
-                }
-            }
-            mapped
-        })
-        .collect();
-    if dims.iter().any(|spec| spec.dim < 0 || spec.dim >= out_rank) {
-        return Err(DeriveError::UnmappableViewShard {
-            op: op.to_string(),
-            operand,
-            layout: format!("{layout}"),
-            rank,
-            out_rank,
-        });
-    }
-    if let Some(inner) = refold_inner {
-        for spec in &layout.dims {
+    let mut dims = Vec::with_capacity(layout.dims.len());
+    for spec in &layout.dims {
+        let mut mapped = ShardSpec {
+            dim: spec.dim + offset,
+            group: spec.group,
+            mode: spec.mode,
+        };
+        if let (Some(inner), ShardMode::Replicate { unit }) = (split_inner, spec.mode) {
             if spec.dim == rank - 1 {
-                if let ShardMode::Replicate { unit } = spec.mode {
-                    if unit % inner != 0 {
-                        return Err(DeriveError::UnmappableViewShard {
-                            op: op.to_string(),
-                            operand,
-                            layout: format!("{layout}"),
-                            rank,
-                            out_rank,
-                        });
-                    }
+                if inner == 0 || unit % inner != 0 {
+                    // The unit is finer than the elements the refold puts inside one output
+                    // element: a whole number of output elements per slab cannot be expressed, so
+                    // this is refused rather than rounded.
+                    return Err(unmappable());
+                }
+                mapped.mode = ShardMode::Replicate { unit: unit / inner };
+            }
+        }
+        if !trailing && rank > out_rank {
+            if let ShardMode::Replicate { .. } = spec.mode {
+                if spec.dim >= out_rank - 1 {
+                    return Err(unmappable());
                 }
             }
         }
+        dims.push(mapped);
+    }
+    if dims.iter().any(|spec| spec.dim < 0 || spec.dim >= out_rank) {
+        return Err(unmappable());
     }
     Ok(ParallelLayout {
         dims,
@@ -1875,6 +1910,111 @@ mod tests {
         }
     }
 
+    /// A *replicating* weight on a contraction dim has no rule anywhere in the table: the
+    /// all-reduce downstream would count every overlapped element twice. `docs/design/qwen36-text/
+    /// spec.md` §D6.6 legalizes replication on the key/value heads, which are not contracted — so
+    /// the refusal has to hold on every rule that contracts, and the legal case has to stay legal.
+    #[test]
+    fn a_replicating_weight_on_a_contraction_axis_is_refused() {
+        let g = tp_mask();
+        let replicating = || ParallelLayout {
+            dims: vec![ShardSpec::replicating(0, g, 4)],
+            partial: None,
+        };
+        let column = || ParallelLayout {
+            dims: vec![ShardSpec::replicating(1, g, 4)],
+            partial: None,
+        };
+        // Row-parallel linear: the weight's dim 0 is the contraction.
+        assert!(matches!(
+            derive(
+                ShardRule::Linear,
+                "linear",
+                &[ParallelLayout::replicate(), replicating()],
+                &[ParallelLayout::replicate()],
+                &[2, 2],
+                &[2],
+                &[],
+                &[],
+            ),
+            Err(DeriveError::UnsupportedWeightLayout { .. })
+        ));
+        // The same weight along the *output* dim is the legal column-parallel case.
+        let out = derive(
+            ShardRule::Linear,
+            "linear",
+            &[ParallelLayout::replicate(), column()],
+            &[ParallelLayout::replicate()],
+            &[2, 2],
+            &[2],
+            &[],
+            &[],
+        )
+        .expect("a replicating output dim needs no collective");
+        assert_eq!(
+            out.outputs[0].dims,
+            vec![ShardSpec::replicating(1, g, 4)],
+            "the linear rule carries the weight's output dim verbatim"
+        );
+
+        // The embedding table's dim 0 is a contraction too (the vocabulary sum).
+        assert!(matches!(
+            derive(
+                ShardRule::Embedding,
+                "embedding",
+                &[replicating(), ParallelLayout::replicate()],
+                &[ParallelLayout::replicate()],
+                &[2, 2],
+                &[2],
+                &[],
+                &[],
+            ),
+            Err(DeriveError::UnsupportedWeightLayout { .. })
+        ));
+        assert_eq!(
+            derive(
+                ShardRule::Embedding,
+                "embedding",
+                &[column(), ParallelLayout::replicate()],
+                &[ParallelLayout::replicate()],
+                &[2, 2],
+                &[2],
+                &[],
+                &[],
+            )
+            .expect("a replicating vocabulary dim is a feature shard")
+            .outputs[0]
+                .dims,
+            // The rule writes `-1`; `canonicalize` stores one spelling per axis.
+            vec![ShardSpec::replicating(1, g, 4)]
+        );
+
+        // MatMul contracts the first operand's last axis and the second's second-to-last; a
+        // replicating shard on either is the same double-count, refused the same way.
+        // Operand A contracts its last axis; operand B contracts its second-to-last.
+        for (a, b) in [
+            (column(), ParallelLayout::replicate()),
+            (ParallelLayout::replicate(), replicating()),
+        ] {
+            assert!(
+                matches!(
+                    derive(
+                        ShardRule::MatMul,
+                        "matmul",
+                        &[a.clone(), b.clone()],
+                        &[ParallelLayout::replicate()],
+                        &[2, 2],
+                        &[2],
+                        &[],
+                        &[],
+                    ),
+                    Err(DeriveError::UnsupportedWeightLayout { .. })
+                ),
+                "a replicating contraction operand must be refused: {a} / {b}"
+            );
+        }
+    }
+
     /// The headline behaviour: a row-parallel linear feeding a replicate slot
     /// must make the compiler insert an all-reduce, and it must be visible in
     /// the plan (contract S-2).
@@ -2409,5 +2549,88 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.dims, vec![ShardSpec::shard(1, tp)]);
+
+        // A merge is the other direction: `[…, 2, 256]` into `[…, 512]` folds the operand's axes
+        // 2 and 3 into the output's last axis, so a shard on either is no longer an axis slab.
+        // Refused, not renamed — a replicating unit of 256 elements of the inner axis is not
+        // 256 elements of the merged one.
+        let inner = ParallelLayout {
+            dims: vec![ShardSpec::replicating(2, tp, 256)],
+            partial: None,
+        };
+        assert!(
+            carry_to_output_rank(
+                &inner,
+                3,
+                2,
+                "reshape",
+                0,
+                false,
+                Some(&[8, 2, 256]),
+                Some(&[8, 512]),
+            )
+            .is_err(),
+            "a unit on a merged axis cannot be re-sliced"
+        );
+        let outer = ParallelLayout {
+            dims: vec![ShardSpec::replicating(0, tp, 8)],
+            partial: None,
+        };
+        let out = carry_to_output_rank(
+            &outer,
+            3,
+            2,
+            "reshape",
+            0,
+            false,
+            Some(&[8, 2, 256]),
+            Some(&[8, 512]),
+        )
+        .unwrap();
+        assert_eq!(
+            out.dims,
+            vec![ShardSpec::replicating(0, tp, 8)],
+            "a shard the refold does not touch carries over verbatim"
+        );
+
+        // A refold whose last piece is not the operand's last axis does not line up: `512 * 128`
+        // into `64 * 4 * 4 * 64` splits axis 0 by a hundred, so neither the axis index nor the
+        // unit of the shard below survives the rename. Refused for every mode, not just a
+        // replicating one — `[512, 128]` into `[256, 256]` is the same lie with `Divide`.
+        let misaligned = ParallelLayout {
+            dims: vec![ShardSpec::replicating(1, tp, 64)],
+            partial: None,
+        };
+        assert!(
+            carry_to_output_rank(
+                &misaligned,
+                2,
+                4,
+                "reshape",
+                0,
+                false,
+                Some(&[512, 128]),
+                Some(&[64, 4, 4, 64]),
+            )
+            .is_err(),
+            "a refold that does not put the operand's last axis innermost is refused"
+        );
+        let misaligned_strict = ParallelLayout {
+            dims: vec![ShardSpec::shard(1, tp)],
+            partial: None,
+        };
+        assert!(
+            carry_to_output_rank(
+                &misaligned_strict,
+                2,
+                4,
+                "reshape",
+                0,
+                false,
+                Some(&[512, 128]),
+                Some(&[64, 4, 4, 64]),
+            )
+            .is_err()
+        );
     }
 }

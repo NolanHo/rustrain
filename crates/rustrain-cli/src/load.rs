@@ -277,17 +277,18 @@ pub(crate) fn load_weights(
                 continue;
             }
             let global = after_segment[d];
-            // The slab comes from the layout, not from `coord * global / degree`: a declared
-            // replicating axis (`tp` with fewer key/value heads than ranks) hands two coordinates
-            // the same slice, and only the layout knows that.
-            let (offset, local) = slot
-                .layout
-                .slab(global, d as i64, coord as i64, degree as i64, rank_dims as i64)
-                .map_err(|error| {
+            // The slab comes from the spec being sliced, not from `coord * global / degree`: a
+            // declared replicating axis (`tp` with fewer key/value heads than ranks) hands two
+            // coordinates the same slice, and only the spec's own mode knows that.
+            let (offset, local) = spec
+                .mode
+                .slab(global, coord as i64, degree as i64)
+                .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "slot `{}`: cannot take rank {rank}'s slab of axis {d} (global {global}, \
-                         degree {degree}): {error}",
-                        slot.name
+                        "slot `{}`: rank {rank} cannot take a slab of axis {d} (global {global}, \
+                         degree {degree}, mode {})",
+                        slot.name,
+                        spec.mode
                     )
                 })?;
             shards.push((d, offset as usize, local as usize));

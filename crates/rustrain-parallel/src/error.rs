@@ -171,6 +171,11 @@ pub enum ShardError {
          compile-time error, not a runtime fallback"
     )]
     NotDivisible { dim: i64, global: i64, divisor: i64 },
+    #[error(
+        "cannot shard dim {dim}: the global size {global} is not a whole number of {unit}-element \
+         units"
+    )]
+    UnitMismatch { dim: i64, global: i64, unit: i64 },
 
     #[error(
         "group mask bit {bit} is out of range: the mesh has {axes} axes, so mask bits \

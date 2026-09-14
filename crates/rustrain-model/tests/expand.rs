@@ -628,4 +628,29 @@ fn an_axis_may_declare_how_its_slabs_relate() {
 
     let strict = declared_with(serde_json::json!(["tp"]));
     assert!(matches!(strict.mode, rustrain_plan::ShardMode::Divide));
+
+    // A unit without `mode: replicate` used to be dropped on the floor: the mode was the only
+    // field read, so the description said "shard me by heads" and the plan sharded by single
+    // elements. It is a description error now, named with the slot it came from.
+    let refused = |axes: serde_json::Value| {
+        let mut desc = tiny();
+        desc.binding
+            .retain(|b| b.slot.as_deref() != Some("layers.*.wo"));
+        desc.binding.push(declaration(axes));
+        expand(&desc, &config()).unwrap_err().to_string()
+    };
+    let message = refused(serde_json::json!([{ "axis": "tp", "unit": "hidden" }]));
+    assert!(
+        message.contains("hidden") && message.contains("replicate"),
+        "the refusal must name the unit and the mode that gives it meaning: {message}"
+    );
+    // The same unit *with* the mode is legal, and so is a unit of zero? No: a unit is a size like
+    // every other, and a size that is not positive is refused where it resolves.
+    let message = refused(serde_json::json!([
+        { "axis": "tp", "mode": "replicate", "unit": "nope" }
+    ]));
+    assert!(
+        message.contains("nope"),
+        "an unresolvable unit is reported by name: {message}"
+    );
 }

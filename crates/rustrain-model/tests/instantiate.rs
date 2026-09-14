@@ -612,6 +612,42 @@ fn declarations_expose_the_binding_axes_by_slot_name() {
     // A slot without declared axes is absent from the map, not an empty entry.
     assert!(!declared.slots.contains_key("input_ids"));
     assert!(!declared.slots.contains_key("layers.3.mlp.gate"));
+
+    // The key/value projections declare a *replicating* unit of one head (`docs/design/
+    // qwen36-text/spec.md` §D6.6). At tp = 4 with two heads, the two readings disagree in a way
+    // nobody can miss: a strict shard would hand each rank 512 / 4 = 128 features — half a head —
+    // while the declared unit hands it one whole 256-feature head, two ranks sharing each.
+    let kv = declared
+        .slots
+        .get("layers.3.self_attn.k_proj")
+        .expect("k_proj declares axes");
+    let feature_axis = kv
+        .get("1")
+        .expect("k_proj shards its feature axis")
+        .first()
+        .expect("one declaration");
+    assert_eq!(feature_axis.axis, "tp");
+    assert!(
+        matches!(
+            feature_axis.mode,
+            rustrain_plan::ShardMode::Replicate { unit: 256 }
+        ),
+        "a quarter of 512 features is half a head; the unit is the head: {:?}",
+        feature_axis.mode
+    );
+
+    // And the plan agrees: the local shape is one head wide, not a quarter of the axis.
+    let m = mesh(4, 1, 1, 1, 1);
+    let plan = instantiated(&m, 0);
+    let slot = plan
+        .slot_id("layers.3.self_attn.k_proj")
+        .expect("k_proj is in the plan");
+    let shape = plan.slot(slot).shape.clone();
+    assert_eq!(
+        *shape.last().expect("rank 2"),
+        256,
+        "tp=4 keeps a whole head per rank: {shape:?}"
+    );
 }
 
 /// The embedding table is a lookup, and a lookup is where sharding needs a *position constant*
