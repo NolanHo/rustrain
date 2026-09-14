@@ -399,7 +399,7 @@ fn plugin_loads_through_the_abi_loader() {
 #[test]
 fn plugin_publishes_the_expected_ops() {
     let p = plugin();
-    assert_eq!(p.abi_version, 1);
+    assert_eq!(p.abi_version, rustrain_abi::ABI_VERSION);
     assert_eq!(
         unsafe { CStr::from_ptr(p.plugin_name) }.to_str().unwrap(),
         "reference"
@@ -463,7 +463,7 @@ fn plugin_publishes_the_expected_ops() {
         assert!(desc.memory.is_some(), "{name}: memory");
         assert!(desc.execute.is_some(), "{name}: execute");
         assert!(desc.last_error.is_some(), "{name}: last_error");
-        assert_eq!(desc.abi_version, 1);
+        assert_eq!(desc.abi_version, rustrain_abi::ABI_VERSION);
         // The expected spec_name (name@variant).
         assert_eq!(variant, "reference.f32", "{name}: variant");
         // Composites must declare an expansion (contract R-4); primitives
@@ -1949,9 +1949,10 @@ fn sdpa_gqa_causal_hand_values() {
     let q = Owned::f32(&[1, 2, 2, 2], vec![1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0]);
     let k = Owned::f32(&[1, 2, 1, 2], vec![1.0, 0.0, 0.0, 1.0]);
     let v = Owned::f32(&[1, 2, 1, 2], vec![1.0, 2.0, 3.0, 4.0]);
+    // The per-head form is declared; the head counts are read from the tensors
+    // (q has 2 heads, k/v 1 — the GQA repeat is 2).
     let attrs = [
-        ai64("num_heads", 2),
-        ai64("num_kv_heads", 1),
+        abool("per_head", true),
         abool("causal", true),
         af64("scale", 1.0),
     ];
@@ -2054,8 +2055,18 @@ fn topk_router_hand_values_and_tie_break() {
     .unwrap();
     assert_eq!(outs[1].i32s, vec![3, 1]);
     let total = p3 + p1;
-    assert_close(outs[0].fdata()[0], p3 / total, 1e-6, "renormalised weight 0");
-    assert_close(outs[0].fdata()[1], p1 / total, 1e-6, "renormalised weight 1");
+    assert_close(
+        outs[0].fdata()[0],
+        p3 / total,
+        1e-6,
+        "renormalised weight 0",
+    );
+    assert_close(
+        outs[0].fdata()[1],
+        p1 / total,
+        1e-6,
+        "renormalised weight 1",
+    );
 }
 
 // ── moe_layer ────────────────────────────────────────────────────────────────
@@ -2974,18 +2985,15 @@ fn infer_produces_documented_shapes_and_dtypes() {
         assert_eq!(d[0].dims(), &[2, 6]);
         assert_eq!(d[1].dims(), &[2, 6]);
 
-        // sdpa GQA, per-head form [.., S, H, D]: the head axis is declared.
+        // sdpa GQA, per-head form [.., S, H, D]: the form is declared, the
+        // head counts come from the tensors (q 2 heads, k/v 1).
         let qg = Owned::f32(&[1, 2, 2, 4], vec![0.0; 16]);
         let kg = Owned::f32(&[1, 2, 1, 4], vec![0.0; 8]);
         let vg = Owned::f32(&[1, 2, 1, 4], vec![0.0; 8]);
         let d = infer_ok(
             op("sdpa"),
             &[&qg.t, &kg.t, &vg.t],
-            &[
-                ai64("num_heads", 2),
-                ai64("num_kv_heads", 1),
-                abool("causal", true),
-            ],
+            &[abool("per_head", true), abool("causal", true)],
             1,
         );
         assert_eq!(d[0].dims(), &[1, 2, 2, 4]);

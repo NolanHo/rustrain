@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use rustrain_abi::loader::{LoadedOp, Plugin};
 use rustrain_abi::{
     RsBackwardKind, RsCollective, RsDeviceKind, RsDtype, RsExpansion, RsOpDesc, RsRequires,
+    RsShardRule,
 };
 use serde::{Deserialize, Serialize};
 
@@ -197,6 +198,13 @@ impl RegisteredOp {
     }
 
     /// Collectives this variant performs internally (contract S-2).
+    /// How this implementation says its sharded distribution propagates. The
+    /// plan's derivation algebra reads it through `shard::ShardRules`; two
+    /// implementations of one operator must agree.
+    pub fn shard(&self) -> RsShardRule {
+        self.descriptor().shard
+    }
+
     pub fn collectives(&self) -> &[RsCollective] {
         let desc = self.descriptor();
         if desc.collectives.is_null() || desc.n_collectives == 0 {

@@ -255,13 +255,13 @@ int32_t delta_execute(rs_ctx*, const rs_tensor* const* in, uint32_t n_in, rs_ten
 }  // namespace
 
 void add_recurrent_ops(std::vector<OpDef>& ops) {
-    ops.push_back(OpDef{"causal_conv1d",
+    ops.push_back(OpDef{"causal_conv1d", RS_SHARD_PASS_THROUGH,
                         "Depthwise causal convolution: out[t, c] = sum_k w[c, 0, k] * "
                         "x[t + k - pad, c] with x[j < 0] = 0 and an optional fused silu. x is "
                         "[.., L, C], the weight is [C, 1, K]. Executed by cuDNN's 1-D "
                         "convolution and cropped back to L.",
                         f32_mask(), RS_AUTODIFF, conv_infer, conv_execute});
-    ops.push_back(OpDef{"gated_delta_rule",
+    ops.push_back(OpDef{"gated_delta_rule", RS_SHARD_PASS_THROUGH,
                         "The GDN recurrence (q, k, v, g, beta) -> [.., S, vh*Dv], state fp32, "
                         "the query scaled by D^-0.5 inside, k_head_dim == v_head_dim and GQA "
                         "by repeat_interleave. This body runs the declared recurrence "

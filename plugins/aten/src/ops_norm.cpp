@@ -213,20 +213,20 @@ int32_t rmsnorm_gated_execute(rs_ctx*, const rs_tensor* const* in, uint32_t n_in
 }  // namespace
 
 void add_norm_ops(std::vector<OpDef>& ops) {
-    ops.push_back(OpDef{"rmsnorm",
+    ops.push_back(OpDef{"rmsnorm", RS_SHARD_ELEMENTWISE,
                         "y = x / sqrt(mean(x^2) + eps) * (w + weight_offset), normalised over "
                         "the last dim; eps (default 1e-5) sits inside the sqrt and the weight "
                         "offset is declared data (the trunk uses 1.0).",
                         f32_mask(), RS_AUTODIFF, rmsnorm_infer, rmsnorm_execute});
-    ops.push_back(OpDef{"layernorm",
+    ops.push_back(OpDef{"layernorm", RS_SHARD_ELEMENTWISE,
                         "y = (x - mean) / sqrt(var + eps) * w + b over the last dim, biased "
                         "variance, eps (default 1e-5) outside the sqrt.",
                         f32_mask(), RS_AUTODIFF, layernorm_infer, layernorm_execute});
-    ops.push_back(OpDef{"l2norm",
+    ops.push_back(OpDef{"l2norm", RS_SHARD_PASS_THROUGH,
                         "y = x / sqrt(sum(x^2, dim) + eps): the SUM of squares with eps inside "
                         "the sqrt, dim (default -1) and eps (default 1e-6).",
                         f32_mask(), RS_AUTODIFF, l2norm_infer, l2norm_execute});
-    ops.push_back(OpDef{"rmsnorm_gated",
+    ops.push_back(OpDef{"rmsnorm_gated", RS_SHARD_PASS_THROUGH,
                         "GDN's output normalisation: the row normalisation, the raw weight and "
                         "silu(gate) in one pass, gate applied after the normalisation.",
                         f32_mask(), RS_AUTODIFF, rmsnorm_gated_infer, rmsnorm_gated_execute});

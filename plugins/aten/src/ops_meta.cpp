@@ -317,28 +317,28 @@ int32_t broadcast_execute(rs_ctx*, const rs_tensor* const* in, uint32_t n_in,
 }  // namespace
 
 void add_meta_ops(std::vector<OpDef>& ops) {
-    ops.push_back(OpDef{"view",
+    ops.push_back(OpDef{"view", RS_SHARD_ELEMENTWISE,
                         "Zero-copy alias: the output descriptor (shape/stride/data) is an exact "
                         "copy of the input and aliases its buffer. No allocation, no copy.",
                         f32_mask(), RS_AUTODIFF, view_infer, view_execute});
-    ops.push_back(OpDef{"reshape",
+    ops.push_back(OpDef{"reshape", RS_SHARD_ELEMENTWISE,
                         "Reinterprets the input's row-major LOGICAL order as 'shape' (one -1 "
                         "allowed). A contiguous input aliases its buffer; a strided one is "
                         "copied into the output slot in logical order.",
                         f32_mask(), RS_AUTODIFF, reshape_infer, reshape_execute});
-    ops.push_back(OpDef{"transpose",
+    ops.push_back(OpDef{"transpose", RS_SHARD_ELEMENTWISE,
                         "Zero-copy view: swaps axes dim0/dim1 (defaults -2/-1), swapping shape "
                         "and strides while aliasing the input buffer.",
                         f32_mask(), RS_AUTODIFF, transpose_infer, transpose_execute});
-    ops.push_back(OpDef{"narrow",
+    ops.push_back(OpDef{"narrow", RS_SHARD_ELEMENTWISE,
                         "Zero-copy view: selects [start, start+length) along 'dim' (default -1) "
                         "with identical strides and an offset data pointer. No copy.",
                         f32_mask(), RS_AUTODIFF, narrow_infer, narrow_execute});
-    ops.push_back(OpDef{"cat",
+    ops.push_back(OpDef{"cat", RS_SHARD_ELEMENTWISE,
                         "Concatenates inputs along 'dim' (default -1). The exception among the "
                         "movement operators: cat copies, because the concatenated buffer is new.",
                         f32_mask(), RS_AUTODIFF, cat_infer, cat_execute});
-    ops.push_back(OpDef{"broadcast",
+    ops.push_back(OpDef{"broadcast", RS_SHARD_ELEMENTWISE,
                         "Zero-copy view: right-aligns the input against the target 'shape' "
                         "attribute; size-1 and new leading dims get stride 0.",
                         f32_mask(), RS_AUTODIFF, broadcast_infer, broadcast_execute});

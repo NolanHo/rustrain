@@ -914,7 +914,7 @@
      "attrs": {
       "shape": [
        512,
-       16,
+       -1,
        128
       ]
      }
@@ -943,7 +943,7 @@
      "attrs": {
       "shape": [
        512,
-       2048
+       -1
       ]
      }
     },
@@ -958,7 +958,7 @@
      "attrs": {
       "shape": [
        512,
-       16,
+       -1,
        128
       ]
      }
@@ -987,7 +987,7 @@
      "attrs": {
       "shape": [
        512,
-       2048
+       -1
       ]
      }
     },
@@ -1019,7 +1019,7 @@
      "attrs": {
       "shape": [
        512,
-       32,
+       -1,
        128
       ]
      }
@@ -1035,7 +1035,7 @@
      "attrs": {
       "shape": [
        512,
-       32,
+       -1,
        128
       ]
      }
@@ -1067,7 +1067,7 @@
      "attrs": {
       "shape": [
        512,
-       4096
+       -1
       ]
      }
     },
@@ -1618,7 +1618,7 @@
      "attrs": {
       "shape": [
        512,
-       16,
+       -1,
        2,
        256
       ]
@@ -1663,7 +1663,7 @@
      "attrs": {
       "shape": [
        512,
-       16,
+       -1,
        256
       ]
      }
@@ -1679,7 +1679,7 @@
      "attrs": {
       "shape": [
        512,
-       16,
+       -1,
        256
       ]
      }
@@ -1705,7 +1705,7 @@
      "attrs": {
       "shape": [
        512,
-       2,
+       -1,
        256
       ]
      }
@@ -1731,7 +1731,7 @@
      "attrs": {
       "shape": [
        512,
-       2,
+       -1,
        256
       ]
      }
@@ -1808,8 +1808,7 @@
      ],
      "attrs": {
       "causal": true,
-      "num_heads": 16,
-      "num_kv_heads": 2
+      "per_head": true
      }
     },
     {
@@ -1848,7 +1847,7 @@
      "attrs": {
       "shape": [
        512,
-       4096
+       -1
       ]
      }
     },
@@ -2543,7 +2542,7 @@
     "0": [
      "ep"
     ],
-    "1": [
+    "2": [
      "tp"
     ]
    }
@@ -2553,7 +2552,7 @@
    "source": "model.language_model.layers.{*}.mlp.shared_expert.gate_proj.weight",
    "transform": [],
    "axes": {
-    "1": [
+    "0": [
      "tp"
     ]
    }
@@ -2563,7 +2562,7 @@
    "source": "model.language_model.layers.{*}.mlp.shared_expert.up_proj.weight",
    "transform": [],
    "axes": {
-    "1": [
+    "0": [
      "tp"
     ]
    }
@@ -2573,7 +2572,7 @@
    "source": "model.language_model.layers.{*}.mlp.shared_expert.down_proj.weight",
    "transform": [],
    "axes": {
-    "0": [
+    "1": [
      "tp"
     ]
    }
@@ -2718,7 +2717,7 @@
     "0": [
      "ep"
     ],
-    "1": [
+    "2": [
      "tp"
     ]
    }
@@ -2728,7 +2727,7 @@
    "source": "mtp.layers.{*}.mlp.shared_expert.gate_proj.weight",
    "transform": [],
    "axes": {
-    "1": [
+    "0": [
      "tp"
     ]
    }
@@ -2738,7 +2737,7 @@
    "source": "mtp.layers.{*}.mlp.shared_expert.up_proj.weight",
    "transform": [],
    "axes": {
-    "1": [
+    "0": [
      "tp"
     ]
    }
@@ -2748,7 +2747,7 @@
    "source": "mtp.layers.{*}.mlp.shared_expert.down_proj.weight",
    "transform": [],
    "axes": {
-    "0": [
+    "1": [
      "tp"
     ]
    }

@@ -203,11 +203,20 @@ impl OpSpec {
                 n_collectives: 0,
                 execute: None,
                 last_error: None,
+                shard: RsShardRule::DECLARED,
             },
             requires: None,
             collectives: Vec::new(),
             expansion: None,
         }
+    }
+
+    /// Declares how this operator's sharded distribution propagates. Required
+    /// for every operator the planner may see: the framework has no name table
+    /// to fall back on (invariant I-5).
+    pub fn shard(mut self, rule: RsShardRule) -> Self {
+        self.desc.shard = rule;
+        self
     }
 
     pub fn doc(mut self, doc: &'static str) -> Self {
@@ -614,12 +623,10 @@ mod tests {
     #[test]
     fn build_publishes_the_declared_op() {
         let plugin = PluginBuilder::new("reference", "1.2.3")
-            .op(
-                OpSpec::new("add", "reference.f32")
-                    .doc("elementwise sum")
-                    .dtypes(&[RsDtype::F32])
-                    .execute(noop_execute),
-            )
+            .op(OpSpec::new("add", "reference.f32")
+                .doc("elementwise sum")
+                .dtypes(&[RsDtype::F32])
+                .execute(noop_execute))
             .build();
 
         assert_eq!(plugin.abi_version, crate::ABI_VERSION);
@@ -661,11 +668,9 @@ mod tests {
     fn build_publishes_a_declared_expansion() {
         let spec = ExpansionSpec::new(2, 1).node("mul", &[0, 1], &[3]);
         let plugin = PluginBuilder::new("t", "0")
-            .op(
-                OpSpec::new("fused", "c")
-                    .execute(noop_execute)
-                    .expansion(spec),
-            )
+            .op(OpSpec::new("fused", "c")
+                .execute(noop_execute)
+                .expansion(spec))
             .build();
 
         // SAFETY: `build()` published one descriptor and leaked it on purpose.
@@ -695,11 +700,9 @@ mod tests {
     #[should_panic(expected = "declares an empty expansion")]
     fn build_rejects_an_empty_expansion() {
         let _ = PluginBuilder::new("t", "0")
-            .op(
-                OpSpec::new("add", "c")
-                    .execute(noop_execute)
-                    .expansion(ExpansionSpec::new(2, 1)),
-            )
+            .op(OpSpec::new("add", "c")
+                .execute(noop_execute)
+                .expansion(ExpansionSpec::new(2, 1)))
             .build();
     }
 
@@ -707,11 +710,9 @@ mod tests {
     #[should_panic(expected = "EXPLICIT backward without a backward op name")]
     fn build_rejects_explicit_backward_without_an_op_name() {
         let _ = PluginBuilder::new("t", "0")
-            .op(
-                OpSpec::new("add", "c")
-                    .execute(noop_execute)
-                    .backward(RsBackwardKind::EXPLICIT),
-            )
+            .op(OpSpec::new("add", "c")
+                .execute(noop_execute)
+                .backward(RsBackwardKind::EXPLICIT))
             .build();
     }
 
@@ -734,12 +735,10 @@ mod tests {
             );
 
         let plugin = PluginBuilder::new("attrs", "0.1.0")
-            .op(
-                OpSpec::new("fused", "test.f32")
-                    .dtypes(&[RsDtype::F32])
-                    .execute(noop_execute)
-                    .expansion(expansion),
-            )
+            .op(OpSpec::new("fused", "test.f32")
+                .dtypes(&[RsDtype::F32])
+                .execute(noop_execute)
+                .expansion(expansion))
             .build();
 
         let desc = unsafe { &**plugin.ops };
@@ -761,7 +760,9 @@ mod tests {
         let kind = read(&nodes[0], "kind").expect("kind on the reduce node");
         assert_eq!(kind.kind, RsAttrKind::STR);
         assert_eq!(
-            unsafe { std::ffi::CStr::from_ptr(kind.str) }.to_str().unwrap(),
+            unsafe { std::ffi::CStr::from_ptr(kind.str) }
+                .to_str()
+                .unwrap(),
             "sum"
         );
 

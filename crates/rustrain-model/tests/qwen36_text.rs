@@ -187,9 +187,13 @@ fn the_q_gate_split_is_a_graph_fact_not_a_load_time_split() {
         .iter()
         .find(|node| node.op.name == "reshape" && node.inputs.contains(&view))
         .expect("交错布局没有被 reshape 成 [seq, heads, 2, head_dim]");
+    // The head dim is spelled `-1`, not `16`: the description is topology-free, and a literal
+    // head count would be wrong the moment the head axis is sharded (a tp=2 rank holds 8 of
+    // them). `-1` resolves against the local element count, so the same description is right at
+    // every degree — and a wrong spelling is a hard error, never a silently mis-shaped tensor.
     assert_eq!(
         reshape.attrs.i64s("shape"),
-        Some([512, 16, 2, 256].as_slice())
+        Some([512, -1, 2, 256].as_slice())
     );
     assert_eq!(name_of(reshape.outputs[0]), "layers.3.qgh");
 
@@ -221,8 +225,8 @@ fn the_q_gate_split_is_a_graph_fact_not_a_load_time_split() {
             .unwrap_or_else(|| panic!("{target} 的半边没有被 reshape 成 per-head"));
         assert_eq!(
             reshape.attrs.i64s("shape"),
-            Some([512, 16, 256].as_slice()),
-            "{target}"
+            Some([512, -1, 256].as_slice()),
+            "{target}: the head axis is `-1`, so a tp rank's local head count resolves from the tensor"
         );
         assert_eq!(name_of(reshape.outputs[0]), target);
         assert_eq!(plan.slot(id(target)).shape, vec![512, 16, 256]);
@@ -279,8 +283,8 @@ fn the_gdn_l2norm_is_per_head_and_the_router_moe_contract_is_de_fused() {
             .unwrap_or_else(|| panic!("{flat} 没有被 reshape 成 per-head"));
         assert_eq!(
             reshape.attrs.i64s("shape"),
-            Some([512, 16, 128].as_slice()),
-            "{flat}"
+            Some([512, -1, 128].as_slice()),
+            "{flat}: the head axis is `-1` so the shape stays true under sharding"
         );
         assert_eq!(name_of(reshape.outputs[0]), headed);
         assert_eq!(plan.slot(id(headed)).shape, vec![512, 16, 128]);
@@ -304,8 +308,8 @@ fn the_gdn_l2norm_is_per_head_and_the_router_moe_contract_is_de_fused() {
             .unwrap_or_else(|| panic!("{normed} 没有被 reshape 回扁平形式"));
         assert_eq!(
             flat_back.attrs.i64s("shape"),
-            Some([512, 2048].as_slice()),
-            "{normed}"
+            Some([512, -1].as_slice()),
+            "{normed}: flattening back keeps whatever the local head count is"
         );
         assert_eq!(name_of(flat_back.outputs[0]), out);
         assert_eq!(plan.slot(id(out)).shape, vec![512, 2048]);

@@ -33,6 +33,12 @@ pub enum DeriveError {
     UnsupportedWeightLayout { op: String, layout: String },
 
     #[error(
+        "cannot derive sharding for `{op}`: it declares the pass-through rule, whose outputs \
+         follow input 0, but the node has no inputs"
+    )]
+    PassThroughWithoutInput { op: String },
+
+    #[error(
         "cannot derive sharding for `{op}`: operand {index} layout {layout} has no rule; \
          expected replicate or a single shard, never a partial or several shards"
     )]
@@ -116,33 +122,132 @@ pub enum ShardRule {
     /// The operator's distribution is not inferable; the plan's declared
     /// layouts are authoritative and only explicit conversions are inserted.
     Declared,
+    /// Every output inherits **input 0**'s distribution; the other inputs keep
+    /// theirs.
+    ///
+    /// For operators that act per element along the sharded axis without
+    /// requiring their other operands to agree with it: a channel-wise causal
+    /// convolution whose declared weight splits on the channel axis, an
+    /// attention whose queries are split while keys/values may be replicated.
+    /// [`ShardRule::Elementwise`] cannot express either — it demands one shared
+    /// distribution across every operand, which is false for the weight next to
+    /// a split activation.
+    PassThrough,
 }
 
-/// Classifies a primitive by name. Unknown names are [`ShardRule::Declared`],
-/// which is the conservative choice: the framework will not invent distribution
-/// semantics for an operator it does not understand.
+/// Where a node's shard rule comes from.
 ///
-/// An operator added to the vocabulary without a rule here does not fail — it
-/// silently falls to `Declared`, which means its distribution is taken from the
-/// plan rather than derived. That is safe but means no collective is ever
-/// inserted around it, so the vocabulary and this table have to move together.
-pub fn rule_for(op: &str) -> ShardRule {
-    match op {
-        "elementwise_unary" | "elementwise_binary" | "compare" | "softmax" | "rmsnorm"
-        | "layernorm" | "rope" | "quantize" | "dequantize" | "amax_update" | "view" | "reshape"
-        | "transpose" | "narrow" | "cat" | "broadcast" | "gather" | "scatter" | "cross_entropy" => {
-            ShardRule::Elementwise
+/// The framework owns the derivation *algebra* (the [`ShardRule`] kinds and
+/// [`derive`]); **which kind an operator uses is the operator's own
+/// declaration** (`RsOpDesc::shard`, ABI v2). Production code answers from the
+/// operator registry — `impl ShardRules for Registry` below — while tests and
+/// synthetic plans answer from [`RuleTable`].
+///
+/// There is deliberately no fallback: an operator whose providers declare
+/// nothing, or two variants that disagree, is an error. Classifying by name
+/// (`rule_for`, deleted in ABI v2) is invariant I-5's forbidden pattern — it
+/// turned "support an operator the framework has not heard of" into "recompile
+/// the framework", and its silent `Declared` default is what let `tp > 1` fall
+/// apart on the first operator the table did not list.
+pub trait ShardRules {
+    /// The rule the operator declares. `Err` names what is missing, so the
+    /// caller reports it against the node it was asked about.
+    fn rule(&self, op: &str) -> Result<ShardRule, String>;
+}
+
+/// Maps the ABI's declared rule onto the algebra, refusing discriminants the
+/// framework does not know rather than guessing [`ShardRule::Declared`].
+fn rule_from_abi(
+    raw: rustrain_abi::ffi::RsShardRule,
+    op: &str,
+    who: &str,
+) -> Result<ShardRule, String> {
+    match raw.raw() {
+        0 => Ok(ShardRule::Declared),
+        1 => Ok(ShardRule::Elementwise),
+        2 => Ok(ShardRule::Linear),
+        3 => Ok(ShardRule::Embedding),
+        4 => Ok(ShardRule::MatMul),
+        5 => Ok(ShardRule::PassThrough),
+        other => Err(format!(
+            "{who} declares sharding rule {other} for `{op}`, which this framework does not know; \
+             a rule the planner cannot evaluate is an error, never a silent `Declared`"
+        )),
+    }
+}
+
+/// The shard rules of every registered operator, read from the descriptors.
+///
+/// Two implementations of one operator must declare the same rule: the rule is
+/// a property of the operator's math, not of the code that runs it. A
+/// disagreement would make the plan depend on which variant the recipe picked,
+/// so it is reported and never resolved by choosing one.
+impl ShardRules for rustrain_ops::Registry {
+    fn rule(&self, op: &str) -> Result<ShardRule, String> {
+        let candidates = self.candidates(op);
+        if candidates.is_empty() {
+            return Err(format!(
+                "no registered implementation of `{op}`; an operator's sharding rule comes from \
+                 the plugin that provides it, so a plan cannot be derived without one"
+            ));
         }
-        // A lookup **is** a linear over its table: the ids select rows of `w`, so a table sharded on
-        // its vocabulary axis owes exactly what a row-parallel linear owes (a partial sum over the
-        // group, materialized by an all-reduce) and one sharded on its embedding axis owes a
-        // column-parallel output. Classifying it as `Elementwise` asked for the *activation's*
-        // layout instead, which turns the declared shard on the table into a conflict. The kernel's
-        // operand order is `(w, ids)` — the weight first — so the rule is `Embedding`, not `Linear`.
-        "linear" => ShardRule::Linear,
-        "embedding" => ShardRule::Embedding,
-        "matmul" | "bmm" => ShardRule::MatMul,
-        _ => ShardRule::Declared,
+        let mut decided: Option<(ShardRule, String)> = None;
+        for candidate in candidates {
+            let who = candidate.plugin_identity();
+            let rule = rule_from_abi(candidate.shard(), op, &who)?;
+            match &decided {
+                Some((first, holder)) if *first != rule => {
+                    return Err(format!(
+                        "implementations of `{op}` disagree about its sharding rule: {holder} \
+                         declares {first:?}, {who} declares {rule:?}; the rule belongs to the \
+                         operator, not to the variant"
+                    ));
+                }
+                Some(_) => {}
+                None => decided = Some((rule, who)),
+            }
+        }
+        Ok(decided.expect("the candidate list is not empty").0)
+    }
+}
+
+/// A rule table built by hand: for plans whose operators are synthetic (tests,
+/// tooling) and for plans that resolve no registry at all.
+#[derive(Clone, Debug, Default)]
+pub struct RuleTable {
+    rules: std::collections::BTreeMap<String, ShardRule>,
+    fallback: Option<ShardRule>,
+}
+
+impl RuleTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Declares `op`'s rule.
+    pub fn set(mut self, op: impl Into<String>, rule: ShardRule) -> Self {
+        self.rules.insert(op.into(), rule);
+        self
+    }
+
+    /// Answers every name with `rule` — for plans whose nodes are placeholders.
+    /// A test that wants the production behaviour must build the registry
+    /// instead: this never sees a descriptor.
+    pub fn every(rule: ShardRule) -> Self {
+        Self {
+            rules: Default::default(),
+            fallback: Some(rule),
+        }
+    }
+}
+
+impl ShardRules for RuleTable {
+    fn rule(&self, op: &str) -> Result<ShardRule, String> {
+        self.rules
+            .get(op)
+            .copied()
+            .or(self.fallback)
+            .ok_or_else(|| format!("no sharding rule is declared for `{op}` in this table"))
     }
 }
 
@@ -465,6 +570,21 @@ pub fn derive(
                 .map(|(layout, &rank)| canonicalize(layout, rank))
                 .collect(),
         },
+
+        ShardRule::PassThrough => {
+            // The operands keep exactly what they hold (no conversion is ever
+            // asked of them); the outputs are whatever input 0 holds. The
+            // extents differ between input and output by design — a layout
+            // records (dim, group), and the local shape comes from the plan —
+            // so "follows" is a statement about the distribution, not the size.
+            let first = inputs
+                .first()
+                .ok_or_else(|| DeriveError::PassThroughWithoutInput { op: op.to_string() })?;
+            DerivedShards {
+                required_inputs: inputs.clone(),
+                outputs: vec![first.clone(); declared_outputs.len()],
+            }
+        }
     };
 
     // One spelling leaves the function too: every answer is resolved against
@@ -688,7 +808,7 @@ pub(crate) fn canonicalize(layout: &ParallelLayout, rank: i64) -> ParallelLayout
     resolved
 }
 
-pub fn propagate(plan: &Plan) -> Result<ShardPropagation, PlanError> {
+pub fn propagate(plan: &Plan, rules: &dyn ShardRules) -> Result<ShardPropagation, PlanError> {
     // The mask vocabulary is only meaningful next to the mesh that produced
     // it, and a plan stores the fingerprint, not the mesh (invariant I-6):
     // resolve it here, and let a fingerprint that does not describe a valid
@@ -737,7 +857,13 @@ pub fn propagate(plan: &Plan) -> Result<ShardPropagation, PlanError> {
         if intrinsic::is_intrinsic(&n.op.name) {
             continue; // already explicit; its declared layout is authoritative
         }
-        let rule = rule_for(&n.op.name);
+        let rule = rules
+            .rule(&n.op.name)
+            .map_err(|reason| PlanError::ShardRuleUndeclared {
+                node: id,
+                op: n.op.name.clone(),
+                reason,
+            })?;
 
         // Feed the rule what the operands actually hold, not what the plan
         // promised. Using the declared layouts here was the bug that made a
@@ -1148,8 +1274,23 @@ mod tests {
     use super::*;
     use crate::PlanBuilder;
     use rustrain_abi::ffi::RsDtype;
-    use rustrain_ops::Phase;
+    use rustrain_ops::{Phase, Registry};
     use rustrain_parallel::{Mesh, ParallelConfig, PartialSpec};
+
+    /// The rules every test walks with: the ones the built-in reference
+    /// provider declares, exactly as production reads them.
+    fn rules() -> Registry {
+        let mut registry = Registry::new();
+        // SAFETY: the built-in descriptors are leaked by `PluginBuilder`, so
+        // they live as long as the process.
+        let builtin =
+            unsafe { rustrain_abi::Plugin::from_static(rustrain_kernels::plugin(), "<built-in>") }
+                .expect("the built-in reference provider is ABI-valid");
+        registry
+            .add_plugin(builtin)
+            .expect("registering the built-in provider");
+        registry
+    }
 
     /// The canonical five axes with `tp = 2`; `tp` is the first axis of
     /// [`Mesh::from_config`], so its mask is bit 0.
@@ -1623,7 +1764,7 @@ mod tests {
         );
         let plan = b.build().unwrap();
 
-        let prop = propagate(&plan).unwrap();
+        let prop = propagate(&plan, &rules()).unwrap();
         assert_eq!(prop.inserted.len(), 1, "expected exactly one all-reduce");
         let ins = &prop.inserted[0];
         assert_eq!(ins.op, intrinsic::ALL_REDUCE);
@@ -1687,7 +1828,7 @@ mod tests {
         );
         let plan = b.build().unwrap();
 
-        let err = propagate(&plan).unwrap_err();
+        let err = propagate(&plan, &rules()).unwrap_err();
         match err {
             PlanError::LayoutConflict { held, .. } => {
                 assert!(
@@ -1779,7 +1920,7 @@ mod tests {
             ParallelLayout::shard(0, ep),
         );
 
-        let err = propagate(&plan).unwrap_err();
+        let err = propagate(&plan, &rules()).unwrap_err();
         match err {
             PlanError::LayoutConflict { held, .. } => {
                 assert!(
@@ -1810,7 +1951,7 @@ mod tests {
             },
         );
 
-        let err = propagate(&plan).unwrap_err();
+        let err = propagate(&plan, &rules()).unwrap_err();
         match err {
             PlanError::Shard {
                 source: ShardError::OverlappingGroups { a, b, .. },
@@ -1838,7 +1979,7 @@ mod tests {
             },
         );
 
-        let err = propagate(&plan).unwrap_err();
+        let err = propagate(&plan, &rules()).unwrap_err();
         match err {
             PlanError::LayoutConflict { held, .. } => {
                 assert!(
@@ -1869,7 +2010,7 @@ mod tests {
             ParallelLayout::shard(0, tp),
         );
 
-        let err = propagate(&plan).unwrap_err();
+        let err = propagate(&plan, &rules()).unwrap_err();
         match err {
             PlanError::Shard {
                 source: ShardError::OverlappingGroups { a, b, .. },
@@ -1898,7 +2039,7 @@ mod tests {
             ParallelLayout::shard(0, tp),
         );
 
-        let err = propagate(&plan).unwrap_err();
+        let err = propagate(&plan, &rules()).unwrap_err();
         match err {
             PlanError::Shard {
                 source: ShardError::PartialCompletionDropsShard { .. },
@@ -1919,7 +2060,7 @@ mod tests {
             ParallelLayout::shard(0, tp),
         );
 
-        let prop = propagate(&plan).unwrap();
+        let prop = propagate(&plan, &rules()).unwrap();
         assert_eq!(prop.inserted.len(), 1);
         assert_eq!(prop.inserted[0].op, intrinsic::REDUCE_SCATTER);
         assert_eq!(
@@ -1968,7 +2109,7 @@ mod tests {
         );
         let plan = b.build().unwrap();
 
-        let prop = propagate(&plan).unwrap();
+        let prop = propagate(&plan, &rules()).unwrap();
         assert_eq!(prop.inserted.len(), 1, "one conversion, materialised once");
         let ins = &prop.inserted[0];
         assert_eq!(ins.op, intrinsic::ALL_REDUCE);
@@ -2017,7 +2158,7 @@ mod tests {
         );
         let plan = b.build().unwrap();
 
-        let err = propagate(&plan).unwrap_err();
+        let err = propagate(&plan, &rules()).unwrap_err();
         match err {
             PlanError::GroupUnavailable { node, op, group } => {
                 assert_eq!(
@@ -2063,7 +2204,7 @@ mod tests {
         // tp has degree 1, so the mask names a size-1 group: the row-parallel
         // partial still collapses through an all-reduce (over that size-1
         // group) rather than being rejected.
-        let prop = propagate(&plan).unwrap();
+        let prop = propagate(&plan, &rules()).unwrap();
         assert_eq!(prop.inserted.len(), 1);
         assert_eq!(prop.inserted[0].op, intrinsic::ALL_REDUCE);
     }

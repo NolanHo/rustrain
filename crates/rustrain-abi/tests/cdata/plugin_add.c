@@ -29,7 +29,7 @@ _Static_assert(sizeof(rs_expansion_node) == 48, "rs_expansion_node layout");
 _Static_assert(sizeof(rs_expansion) == 32, "rs_expansion layout");
 _Static_assert(sizeof(rs_services) == 56, "rs_services layout");
 _Static_assert(sizeof(rs_ctx) == 16, "rs_ctx layout");
-_Static_assert(sizeof(rs_op_desc) == 184, "rs_op_desc layout");
+_Static_assert(sizeof(rs_op_desc) == 192, "rs_op_desc layout (v2: 184 + the appended shard field)");
 /*
  * 48, not 56: rs_plugin is 4 + 4 + 8 + 8 + 4 + 4 + 8 + 8 with every member in
  * its natural slot. There is no padding hole at any offset, and the header has
@@ -43,6 +43,7 @@ _Static_assert(offsetof(rs_op_desc, doc) == 32, "rs_op_desc.doc offset");
 _Static_assert(offsetof(rs_op_desc, numerics) == 48, "rs_op_desc.numerics offset");
 _Static_assert(offsetof(rs_op_desc, infer) == 96, "rs_op_desc.infer offset");
 _Static_assert(offsetof(rs_op_desc, execute) == 168, "rs_op_desc.execute offset");
+_Static_assert(offsetof(rs_op_desc, shard) == 184, "rs_op_desc.shard offset (appended in v2)");
 _Static_assert(offsetof(rs_expansion_node, outputs) == 32, "rs_expansion_node.outputs offset");
 _Static_assert(offsetof(rs_services, log) == 48, "rs_services.log offset");
 
@@ -141,6 +142,7 @@ static const rs_op_desc add_desc = {
     .collectives = NULL,
     .n_collectives = 0,
     .execute = add_execute,
+    .shard = RS_SHARD_ELEMENTWISE,
     .last_error = add_last_error,
 };
 

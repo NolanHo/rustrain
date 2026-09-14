@@ -10,7 +10,7 @@
 //! 2. **Layouts**: a declared slot gets one [`ShardSpec`] per `(dim, axis)` it names — a dim
 //!    declared with several axes gets them as separate specs, which is what makes `ep × tp`
 //!    expressible. Every other slot's layout is derived from those by the same rule table
-//!    [`crate::shard::propagate`] walks with ([`crate::shard::rule_for`] +
+//!    [`crate::shard::propagate`] walks with ([`crate::shard::ShardRules`] +
 //!    [`crate::shard::derive`]); there is no second rule table.
 //! 3. **Shapes**: `ParallelLayout::local_shape` on every kept slot. Non-divisibility is the
 //!    hard [`rustrain_parallel::ShardError::NotDivisible`], reported per slot so the caller
@@ -33,7 +33,7 @@ use rustrain_parallel::{GroupMask, Mesh, ParallelLayout, ShardSpec};
 
 use crate::PlanError;
 use crate::ir::{NodeId, Plan, PlanNode, Slot, SlotId, SlotKind};
-use crate::shard::{canonicalize, derive, rule_for};
+use crate::shard::{ShardRules, canonicalize, derive};
 
 /// The description's declarations, carried from `expand` to [`instantiate`] as **input**.
 ///
@@ -69,13 +69,19 @@ pub struct InstanceStage {
 ///   instance declares no stage or a stage the pipeline degree cannot address;
 /// - [`PlanError::UnknownDeclaredSlot`] / [`PlanError::BadDeclaredDim`] /
 ///   [`PlanError::UnknownAxis`] for a broken declaration;
-/// - [`PlanError::ShardDerivation`] when the rule table cannot derive a node's distribution;
+/// - [`PlanError::ShardRuleUndeclared`] when a node's operator declares no usable rule;
+/// - [`PlanError::ShardDerivation`] when the rule cannot derive a node's distribution;
 /// - [`PlanError::Instantiate`] when a layout does not divide into a local shape.
+///
+/// `rules` is where the operators' declared shard rules come from: the registry
+/// in production, a [`crate::shard::RuleTable`] for synthetic plans. The
+/// declaration is data — this function never matches on an operator name.
 pub fn instantiate(
     plan: &Plan,
     declared: &DeclaredAxes,
     mesh: &Mesh,
     rank: usize,
+    rules: &dyn ShardRules,
 ) -> Result<Plan, PlanError> {
     let world_size = mesh.world_size();
     if rank >= world_size {
@@ -179,7 +185,13 @@ pub fn instantiate(
         .map(|s| canonicalize(&s.layout, s.shape.len() as i64))
         .collect();
     for (i, node) in plan.nodes.iter().enumerate() {
-        let rule = rule_for(&node.op.name);
+        let rule = rules
+            .rule(&node.op.name)
+            .map_err(|reason| PlanError::ShardRuleUndeclared {
+                node: NodeId(i),
+                op: node.op.name.clone(),
+                reason,
+            })?;
         let eff_in: Vec<ParallelLayout> =
             node.inputs.iter().map(|s| effective[s.0].clone()).collect();
         let input_ranks: Vec<i64> = node
@@ -383,6 +395,7 @@ pub fn instantiate_stages(
     plan: &Plan,
     declared: &DeclaredAxes,
     mesh: &Mesh,
+    rules: &dyn ShardRules,
 ) -> Vec<StageInstantiation> {
     let pp_axis = mesh.index_of("pp");
     let pp_degree = pp_axis.and_then(|axis| mesh.degree(axis)).unwrap_or(1);
@@ -393,7 +406,7 @@ pub fn instantiate_stages(
             StageInstantiation {
                 stage,
                 rank,
-                result: instantiate(plan, declared, mesh, rank),
+                result: instantiate(plan, declared, mesh, rank, rules),
             }
         })
         .collect()

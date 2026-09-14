@@ -194,7 +194,7 @@ int32_t moe_execute(rs_ctx*, const rs_tensor* const* in, uint32_t n_in, rs_tenso
 }  // namespace
 
 void add_moe_ops(std::vector<OpDef>& ops) {
-    ops.push_back(OpDef{"moe_layer",
+    ops.push_back(OpDef{"moe_layer", RS_SHARD_PASS_THROUGH,
                         "Qwen3.6's sparse MoE layer as one operator: ten inputs (h, routing "
                         "weights and indices from topk_router, the DE-FUSED expert gate/up/down "
                         "projections and the shared expert), dropless routing, per-token sum "

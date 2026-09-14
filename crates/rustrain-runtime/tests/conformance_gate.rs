@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rustrain_abi::Plugin;
 use rustrain_abi::author::{OpSpec, PluginBuilder};
 use rustrain_abi::ffi::{
-    RsAttrs, RsCtx, RsDtype, RsMemReq, RsNumerics, RsPlugin, RsTensor,
+    RsAttrs, RsCtx, RsDtype, RsMemReq, RsNumerics, RsPlugin, RsShardRule, RsTensor,
 };
 use rustrain_ops::{Phase, Recipe, Registry, TargetEnv};
 use rustrain_runtime::conformance::{Check, Harness, REFERENCE_VARIANT, default_cases};
@@ -42,7 +42,11 @@ unsafe extern "C" fn subtract_execute(
         let b = &*(*inputs.add(1));
         let out = &mut **outputs;
         let n = a.dims().iter().product::<i64>().max(0) as usize;
-        let (pa, pb, po) = (a.data as *const f32, b.data as *const f32, out.data as *mut f32);
+        let (pa, pb, po) = (
+            a.data as *const f32,
+            b.data as *const f32,
+            out.data as *mut f32,
+        );
         for i in 0..n {
             *po.add(i) = *pa.add(i) - *pb.add(i);
         }
@@ -69,7 +73,11 @@ unsafe extern "C" fn drifting_execute(
         let b = &*(*inputs.add(1));
         let out = &mut **outputs;
         let n = a.dims().iter().product::<i64>().max(0) as usize;
-        let (pa, pb, po) = (a.data as *const f32, b.data as *const f32, out.data as *mut f32);
+        let (pa, pb, po) = (
+            a.data as *const f32,
+            b.data as *const f32,
+            out.data as *mut f32,
+        );
         for i in 0..n {
             *po.add(i) = *pa.add(i) + *pb.add(i) + drift;
         }
@@ -127,24 +135,22 @@ fn broken_plugin() -> &'static RsPlugin {
     static PLUGIN: OnceLock<&'static RsPlugin> = OnceLock::new();
     PLUGIN.get_or_init(|| {
         PluginBuilder::new("synthetic", "0.1.0")
-            .op(
-                OpSpec::new("elementwise_binary", WRONG_VARIANT)
-                    .doc("computes a - b regardless of the requested kind: deliberately wrong")
-                    .dtypes(&[RsDtype::F32])
-                    .numerics(numerics())
-                    .execute(subtract_execute)
-                    .infer(binary_infer)
-                    .memory(zero_memory),
-            )
-            .op(
-                OpSpec::new("elementwise_binary", NONDETERMINISTIC_VARIANT)
-                    .doc("correct, but adds a different constant on every call")
-                    .dtypes(&[RsDtype::F32])
-                    .numerics(numerics())
-                    .execute(drifting_execute)
-                    .infer(binary_infer)
-                    .memory(zero_memory),
-            )
+            .op(OpSpec::new("elementwise_binary", WRONG_VARIANT)
+                .shard(RsShardRule::ELEMENTWISE)
+                .doc("computes a - b regardless of the requested kind: deliberately wrong")
+                .dtypes(&[RsDtype::F32])
+                .numerics(numerics())
+                .execute(subtract_execute)
+                .infer(binary_infer)
+                .memory(zero_memory))
+            .op(OpSpec::new("elementwise_binary", NONDETERMINISTIC_VARIANT)
+                .shard(RsShardRule::ELEMENTWISE)
+                .doc("correct, but adds a different constant on every call")
+                .dtypes(&[RsDtype::F32])
+                .numerics(numerics())
+                .execute(drifting_execute)
+                .infer(binary_infer)
+                .memory(zero_memory))
             .build()
     })
 }

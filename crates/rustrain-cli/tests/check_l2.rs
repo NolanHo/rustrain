@@ -542,26 +542,48 @@ fn a_misspelled_ignore_pattern_does_not_silently_uncover_a_tensor() {
     );
 }
 
-/// C2's ruling: an unresolved implementation is a `Skip`, and the exit code is decided by `Fail`
-/// alone. The fixture uses `nonexistent_op`, which no provider publishes, so the whole run must
-/// still exit 0 and say what is missing.
+/// The boundary C2 draws, sharpened by ABI v2: an operator **no provider
+/// publishes** has no declared sharding rule, so the plan's layouts cannot be
+/// derived at all — `l1.instantiate` fails and names it. (C2's `Skip` covers
+/// the other case: an operator a provider *does* publish but that cannot run
+/// here — wrong dtype, device or sm — where the plan is fine and only this
+/// machine is limited.) The report still carries both facts, and the run exits
+/// non-zero because a description naming an operator nobody defines is a
+/// description error, not a host limitation.
 #[test]
-fn an_unregistered_operator_is_a_reasoned_skip_not_a_fail() {
+fn an_operator_no_provider_publishes_fails_instantiation_naming_it() {
     let run = check(
         &fixture_model("unregistered-op"),
         &fixture_checkpoint("unregistered-op"),
     );
-    run.expect_success();
+    run.expect_readable_failure();
 
     let doc = run.json();
-    assert_zero_counters(&doc, &run);
-
     let items = check_items(&doc);
+    let instantiate = items
+        .iter()
+        .find(|i| i.name == "l1.instantiate")
+        .unwrap_or_else(|| panic!("no `l1.instantiate` item\n{}", describe(&items)));
+    assert_eq!(
+        instantiate.status,
+        Status::Fail,
+        "an operator no provider publishes must fail instantiation, not {}\n{}",
+        instantiate.status.label(),
+        describe(&items)
+    );
+    assert!(
+        instantiate.reason.contains("nonexistent_op"),
+        "the failure must name the operator it could not derive: {}\n{}",
+        instantiate.reason,
+        describe(&items)
+    );
+    // The availability item still answers "what is missing" — it is the item
+    // that exists for exactly this question.
     let availability = availability_item(&items);
     assert_eq!(
         availability.status,
         Status::Skip,
-        "implementation availability must be Skip, not {}\n{}",
+        "implementation availability must stay Skip, not {}\n{}",
         availability.status.label(),
         describe(&items)
     );
@@ -575,8 +597,7 @@ fn an_unregistered_operator_is_a_reasoned_skip_not_a_fail() {
     }
     assert!(
         items_text(&items).contains("nonexistent_op"),
-        "the skip must answer \"what is missing\": the unresolved operator `nonexistent_op` must \
-         be named\n{}",
+        "the report must name the unresolved operator `nonexistent_op`\n{}",
         describe(&items)
     );
 }

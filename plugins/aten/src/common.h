@@ -358,6 +358,11 @@ using MemoryFn = int32_t (*)(const rs_tensor* const* io, uint32_t n_io, const rs
 
 struct OpDef {
     const char* name;
+    /// How this operator's sharded distribution propagates (ABI v2). Declared
+    /// per operator, never looked up by name in the framework: two variants of
+    /// one operator must agree, and the framework reports a disagreement
+    /// instead of picking a winner.
+    rs_shard_rule shard;
     const char* doc;
     uint32_t dtype_mask;
     rs_backward_kind backward;

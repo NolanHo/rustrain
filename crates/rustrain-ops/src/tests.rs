@@ -198,6 +198,7 @@ impl Spec {
             n_collectives: 0,
             execute: Some(fake_execute),
             last_error: None,
+            shard: rustrain_abi::ffi::RsShardRule::DECLARED,
         }))
     }
 }

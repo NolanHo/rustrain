@@ -291,7 +291,7 @@ impl<'a> Compiler<'a> {
             .to_mesh()
             .map_err(|source| PlanError::Mesh { source })?;
 
-        let propagation = shard::propagate(plan)?;
+        let propagation = shard::propagate(plan, self.registry)?;
         let plan = propagation.plan;
 
         // Pass 1: resolve everything first. The memory pass has to ask each
@@ -541,11 +541,19 @@ impl<'a> Compiler<'a> {
             )
         };
         if status != 0 {
+            // `last_error` is the ABI's error channel and must be read back
+            // immediately: a bare status number tells nobody which shape the
+            // implementation rejected. The context carries no services — a
+            // plugin whose error reporting needs them is outside the contract,
+            // and every provider here ignores it.
+            let message = last_error_message(op).unwrap_or_else(|| {
+                format!("{} returned {status} without a message", op.spec_name())
+            });
             return Err(PlanError::InferFailed {
                 node: id,
                 op: op.spec_name(),
                 status,
-                message: format!("{} returned {status}", op.spec_name()),
+                message,
             });
         }
 
@@ -925,6 +933,36 @@ fn compute_digest(
 /// The layout a slot ended up with, for diagnostics and tests.
 pub fn slot_layout(plan: &Plan, id: SlotId) -> &ParallelLayout {
     &plan.slot(id).layout
+}
+
+/// The message an implementation recorded for the failure it just returned.
+///
+/// A non-zero status is only half of the error channel: the ABI pairs it with
+/// `last_error`, and dropping the text leaves the caller with "returned 1" and
+/// no way to tell a wrong shape from a wrong dtype. Read immediately — the
+/// provider owns the buffer until its next call.
+fn last_error_message(op: &rustrain_ops::RegisteredOp) -> Option<String> {
+    let last_error = op.desc().last_error?;
+    let mut ctx = rustrain_abi::ffi::RsCtx {
+        user: std::ptr::null_mut(),
+        svc: std::ptr::null(),
+    };
+    // SAFETY: the descriptor is live (the resolved op holds its plugin) and the
+    // context is a plain POD the plugin only reads.
+    let message = unsafe { last_error(&mut ctx) };
+    if message.is_null() {
+        return None;
+    }
+    // SAFETY: a non-null `last_error` return is a NUL-terminated string valid
+    // until the provider's next call, and it is read here and copied.
+    let text = unsafe { std::ffi::CStr::from_ptr(message) }
+        .to_string_lossy()
+        .into_owned();
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 #[cfg(test)]

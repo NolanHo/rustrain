@@ -100,7 +100,8 @@ fn a_row_parallel_declared_shard_yields_partial_then_all_reduce() {
     let mesh = tp_mesh();
     let tp = tp_mask(&mesh);
 
-    let instantiated = instantiate(&global, &declared, &mesh, 0).expect("instantiate");
+    let instantiated =
+        instantiate(&global, &declared, &mesh, 0, &reference_registry()).expect("instantiate");
 
     // The column-parallel shard propagates to the up-projection's output: sharded features.
     let h_id = instantiated.slot_id("h").expect("h survives");
@@ -167,7 +168,7 @@ fn a_rank_outside_the_mesh_is_reported() {
         slots: BTreeMap::new(),
         instances: Vec::new(),
     };
-    match instantiate(&global, &declared, &mesh, 2).unwrap_err() {
+    match instantiate(&global, &declared, &mesh, 2, &reference_registry()).unwrap_err() {
         PlanError::RankOutOfRange { rank, world_size } => {
             assert_eq!(rank, 2);
             assert_eq!(world_size, 2);
@@ -202,7 +203,7 @@ fn a_declaration_naming_an_unknown_slot_is_reported() {
         )]),
         instances: Vec::new(),
     };
-    match instantiate(&global, &declared, &tp_mesh(), 0).unwrap_err() {
+    match instantiate(&global, &declared, &tp_mesh(), 0, &reference_registry()).unwrap_err() {
         PlanError::UnknownDeclaredSlot { slot } => assert_eq!(slot, "no.such.slot"),
         other => panic!("expected UnknownDeclaredSlot, got {other:?}"),
     }
@@ -238,7 +239,7 @@ fn a_stage_outside_the_pipeline_degree_is_reported() {
         pipeline: 2,
         ..Default::default()
     });
-    match instantiate(&global, &declared, &mesh, 0).unwrap_err() {
+    match instantiate(&global, &declared, &mesh, 0, &reference_registry()).unwrap_err() {
         PlanError::StageOutOfRange { prefix, stage, pp } => {
             assert_eq!(prefix, "act");
             assert_eq!(stage, 5);
@@ -278,7 +279,7 @@ fn pp_above_one_without_an_instance_stage_is_reported() {
         pipeline: 2,
         ..Default::default()
     });
-    match instantiate(&global, &declared, &mesh, 0).unwrap_err() {
+    match instantiate(&global, &declared, &mesh, 0, &reference_registry()).unwrap_err() {
         PlanError::MissingStage { pp, .. } => assert_eq!(pp, 2),
         other => panic!("expected MissingStage, got {other:?}"),
     }
@@ -319,7 +320,8 @@ fn a_matmul_keeps_the_batch_shard_and_the_output_shard_in_the_local_shape() {
     };
     let tp = GroupMask::single(mesh.index_of("tp").unwrap()).unwrap();
     let ep = GroupMask::single(mesh.index_of("ep").unwrap()).unwrap();
-    let instantiated = instantiate(&global, &declared, &mesh, 0).expect("instantiate");
+    let instantiated =
+        instantiate(&global, &declared, &mesh, 0, &reference_registry()).expect("instantiate");
 
     let y = instantiated.slot_id("y").expect("y survives");
     assert_eq!(
@@ -369,7 +371,8 @@ fn a_rank_growing_broadcast_shards_the_output_feature_axis() {
         instances: Vec::new(),
     };
     let tp = GroupMask::single(mesh.index_of("tp").unwrap()).unwrap();
-    let instantiated = instantiate(&global, &declared, &mesh, 0).expect("instantiate");
+    let instantiated =
+        instantiate(&global, &declared, &mesh, 0, &reference_registry()).expect("instantiate");
     let y = instantiated.slot_id("y").expect("y survives");
     assert_eq!(
         instantiated.slot(y).layout,
@@ -446,7 +449,7 @@ fn a_stage_one_only_non_divisible_shard_is_reported_per_stage() {
         ..Default::default()
     });
 
-    let results = instantiate_stages(&global, &declared, &mesh);
+    let results = instantiate_stages(&global, &declared, &mesh, &reference_registry());
     assert_eq!(results.len(), 2, "one representative rank per pp stage");
     let stage0 = &results[0];
     assert_eq!(stage0.stage, 0);
@@ -486,7 +489,7 @@ fn a_stage_with_no_instances_instantiates_to_an_empty_plan() {
         ..Default::default()
     });
 
-    let results = instantiate_stages(&global, &declared, &mesh);
+    let results = instantiate_stages(&global, &declared, &mesh, &reference_registry());
     assert_eq!(results.len(), 2);
     assert!(
         results[0]
@@ -568,7 +571,8 @@ fn the_real_qwen36_reshape_chain_instantiates_with_heads_split() {
         instances: Vec::new(),
     };
     let tp = GroupMask::single(mesh.index_of("tp").unwrap()).unwrap();
-    let instantiated = instantiate(&global, &declared, &mesh, 0).expect("instantiate");
+    let instantiated =
+        instantiate(&global, &declared, &mesh, 0, &reference_registry()).expect("instantiate");
 
     let qgh = instantiated.slot_id("qgh").expect("qgh survives");
     assert_eq!(

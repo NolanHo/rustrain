@@ -431,8 +431,20 @@ fn run_rank(
         .expand()
         .context("the description did not expand into a runnable plan")?;
 
-    let mut plan = rustrain_plan::instantiate(&expanded.plan, &expanded.declarations(), mesh, rank)
-        .with_context(|| format!("instantiating rank {rank} of the mesh"))?;
+    // The providers come first: an operator's shard rule is its own declaration
+    // (ABI v2), so `instantiate` reads them from the registry rather than from a
+    // framework-side name table (invariant I-5).
+    let registry = crate::load_registry(plugins).context("loading the operator providers")?;
+    let recipe = crate::load_recipe(recipe_path).context("loading the recipe")?;
+
+    let mut plan = rustrain_plan::instantiate(
+        &expanded.plan,
+        &expanded.declarations(),
+        mesh,
+        rank,
+        &registry,
+    )
+    .with_context(|| format!("instantiating rank {rank} of the mesh"))?;
 
     // The input the runner feeds: the description declares exactly one external input — the token
     // stream. A description with more inputs cannot be fed by `run`, which understands tokens and
@@ -512,8 +524,6 @@ fn run_rank(
     let loaded_count = loaded.len();
 
     // ---- compile against the configured providers ------------------------
-    let registry = crate::load_registry(plugins).context("loading the operator providers")?;
-    let recipe = crate::load_recipe(recipe_path).context("loading the recipe")?;
     // The compile target's device follows the allocator: a CUDA device means
     // CUDA variants resolve and the memory plan aligns slot buffers for the
     // device; the default stays exactly `TargetEnv::default()` (CPU).
@@ -1472,9 +1482,15 @@ mod tests {
         let model = rustrain_model::Model::load(&dir).expect("load");
         let expanded = model.expand().expect("expand");
         let mesh = Mesh::from_config(&ParallelConfig::default());
-        let mut plan =
-            rustrain_plan::instantiate(&expanded.plan, &expanded.declarations(), &mesh, 0)
-                .expect("instantiate rank 0");
+        let registry = crate::load_registry(&[]).expect("the built-in registry");
+        let mut plan = rustrain_plan::instantiate(
+            &expanded.plan,
+            &expanded.declarations(),
+            &mesh,
+            0,
+            &registry,
+        )
+        .expect("instantiate rank 0");
         widen_to_f32(&mut plan);
 
         let outputs = model.desc.outputs.as_ref().expect("outputs declared");
@@ -1521,7 +1537,7 @@ mod tests {
         );
 
         let nodes_after = plan.nodes.len();
-        let registry = crate::load_registry(&[]).expect("registry");
+        let registry = crate::load_registry(&[]).expect("the built-in registry");
         let recipe = crate::load_recipe(None).expect("recipe");
         let compiled =
             rustrain_plan::Compiler::new(&registry, &recipe, rustrain_ops::TargetEnv::default())
@@ -1533,8 +1549,73 @@ mod tests {
             "every node and every inserted collective is a step"
         );
         // The declared tp/ep sharding on degree-1 axes still reconciles through identity
-        // collectives at world size 1; the exact count is the check gate's 53.
-        assert_eq!(compiled.inserted.len(), 53);
+        // collectives at world size 1. The count moved from 53 to 42 when the operators started
+        // declaring their shard rules (ABI v2): the model-specific operators are `pass_through`
+        // instead of "unknown, therefore no derivation", so eleven layouts (one per full-attention
+        // layer's attention output) now agree with their producers by construction rather than
+        // through an identity conversion. The exact count is pinned by the check gate too.
+        assert_eq!(compiled.inserted.len(), 42);
+    }
+
+    /// The same surgery at `tp = 2`: this is the regression for the ABI v2 rule
+    /// declarations. Before them the framework classified operators by name, the
+    /// seven model-specific operators were "unknown, therefore no derivation",
+    /// their outputs stayed replicated while their inputs were split, and
+    /// compilation refused the plan — so `tp > 1` was never executable on this
+    /// model. Now every operator declares its rule and the plan compiles.
+    #[test]
+    fn the_real_plan_compiles_after_the_runner_surgery_at_tp_two() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../rustrain-model/tests/fixtures/qwen36-text");
+        let model = rustrain_model::Model::load(&dir).expect("load");
+        let expanded = model.expand().expect("expand");
+        let mesh = Mesh::from_config(&ParallelConfig {
+            tensor: 2,
+            ..Default::default()
+        });
+        let registry = crate::load_registry(&[]).expect("the built-in registry");
+        let mut plan = rustrain_plan::instantiate(
+            &expanded.plan,
+            &expanded.declarations(),
+            &mesh,
+            0,
+            &registry,
+        )
+        .expect("rank 0 instantiates at tp=2");
+        widen_to_f32(&mut plan);
+        let outputs = model.desc.outputs.as_ref().expect("outputs declared");
+        keep_hidden_states(&mut plan, &outputs.hidden).expect("keeper");
+        complete_logits(&mut plan, &outputs.logits).expect("logits completion");
+
+        let recipe = crate::load_recipe(None).expect("recipe");
+        let compiled =
+            rustrain_plan::Compiler::new(&registry, &recipe, rustrain_ops::TargetEnv::default())
+                .compile(&plan)
+                .unwrap_or_else(|e| panic!("the real plan must compile at tp=2: {e}"));
+
+        // The split really reaches the activations: the local head count halves
+        // and the vocabulary is cut in two.
+        let qr = compiled
+            .plan
+            .slot_id("layers.0.q")
+            .expect("the layer-0 q activation is in the plan");
+        assert_eq!(
+            compiled.plan.slot(qr).shape,
+            vec![512, 1024],
+            "a tp=2 q projection holds half the model's 2048 channels"
+        );
+        assert!(
+            compiled
+                .inserted
+                .iter()
+                .any(|c| c.op == "intrinsic.all_reduce"),
+            "the row-parallel halves owe an all-reduce: {:?}",
+            compiled
+                .inserted
+                .iter()
+                .map(|c| (c.op, c.group))
+                .collect::<Vec<_>>()
+        );
     }
 
     /// The comparison script's fixed probe must parse to exactly its eight ids.

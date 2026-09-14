@@ -11,6 +11,21 @@ use rustrain_parallel::{GroupMask, Mesh, ParallelConfig, ShardError};
 use rustrain_plan::shard::propagate;
 use rustrain_plan::{PlanError, SlotKind, instantiate};
 
+/// The registry the CLI builds: the built-in reference provider, which is
+/// where every operator's sharding rule lives (ABI v2, invariant I-5).
+fn reference_registry() -> rustrain_ops::Registry {
+    let mut registry = rustrain_ops::Registry::new();
+    // SAFETY: the built-in descriptors are leaked by `PluginBuilder`, so they
+    // live as long as the process.
+    let builtin =
+        unsafe { rustrain_abi::Plugin::from_static(rustrain_kernels::plugin(), "<built-in>") }
+            .expect("the built-in reference provider is ABI-valid");
+    registry
+        .add_plugin(builtin)
+        .expect("the built-in provider registers");
+    registry
+}
+
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen36-text")
 }
@@ -32,8 +47,14 @@ fn mesh(tp: usize, cp: usize, ep: usize, dp: usize, pp: usize) -> Mesh {
 /// Instantiate the real description on `rank`.
 fn instantiated(mesh: &Mesh, rank: usize) -> rustrain_plan::Plan {
     let expanded = expanded();
-    instantiate(&expanded.plan, &expanded.declarations(), mesh, rank)
-        .unwrap_or_else(|e| panic!("instantiate must succeed: {e}"))
+    instantiate(
+        &expanded.plan,
+        &expanded.declarations(),
+        mesh,
+        rank,
+        &reference_registry(),
+    )
+    .unwrap_or_else(|e| panic!("instantiate must succeed: {e}"))
 }
 
 /// The instance a node belongs to: the longest declared prefix the trace path starts with
@@ -249,21 +270,24 @@ fn the_real_shape_join_resolves_declared_axes_end_to_end() {
     );
 
     // The down projection in the operator's own `[E, H, I]` orientation, ep on the experts and
-    // tp on the output-hidden axis.
+    // tp on the **contraction** axis: a down projection is row parallel, so the axis that splits
+    // is `I` (the last), not `H` (the output). Splitting `H` would leave the rank holding part of
+    // the result instead of part of the sum — the shape would still divide, and the network would
+    // still run, so only a numeric comparison would notice.
     let down = plan
         .slot_id("layers.3.mlp.experts.down_proj")
         .expect("layer 3 is on stage 0");
     let down_slot = plan.slot(down);
     assert_eq!(
         down_slot.shape,
-        vec![64, 1024, 512],
-        "down_proj [256, 2048, 512] over axes {{0: ep, 1: tp}} must localize to [64, 1024, 512]"
+        vec![64, 2048, 256],
+        "down_proj [256, 2048, 512] over axes {{0: ep, 2: tp}} must localize to [64, 2048, 256]"
     );
     assert_eq!(
         down_slot.layout.dims,
         vec![
             rustrain_parallel::ShardSpec { dim: 0, group: ep },
-            rustrain_parallel::ShardSpec { dim: 1, group: tp },
+            rustrain_parallel::ShardSpec { dim: 2, group: tp },
         ]
     );
 
@@ -299,7 +323,14 @@ fn the_real_shape_join_resolves_declared_axes_end_to_end() {
 fn non_divisible_shard_is_a_named_implementation_free_failure() {
     let expanded = expanded();
     let m = mesh(3, 1, 1, 1, 1);
-    let err = instantiate(&expanded.plan, &expanded.declarations(), &m, 0).unwrap_err();
+    let err = instantiate(
+        &expanded.plan,
+        &expanded.declarations(),
+        &m,
+        0,
+        &reference_registry(),
+    )
+    .unwrap_err();
 
     match &err {
         PlanError::Instantiate {
@@ -344,7 +375,7 @@ fn an_axis_the_mesh_does_not_have_names_the_axis_and_slot() {
         .expect("dim 0 is declared")[0] = "vpp".to_string();
 
     let m = mesh(2, 1, 1, 1, 1); // the canonical five axes; no `vpp`
-    let err = instantiate(&expanded.plan, &declared, &m, 0).unwrap_err();
+    let err = instantiate(&expanded.plan, &declared, &m, 0, &reference_registry()).unwrap_err();
     match err {
         PlanError::UnknownAxis {
             slot, dim, axis, ..
@@ -363,8 +394,14 @@ fn an_axis_the_mesh_does_not_have_names_the_axis_and_slot() {
 fn tp_one_is_a_legal_size_one_group() {
     let expanded = expanded();
     let m = mesh(1, 1, 1, 1, 1);
-    let plan = instantiate(&expanded.plan, &expanded.declarations(), &m, 0)
-        .expect("tp = 1 must instantiate");
+    let plan = instantiate(
+        &expanded.plan,
+        &expanded.declarations(),
+        &m,
+        0,
+        &reference_registry(),
+    )
+    .expect("tp = 1 must instantiate");
 
     let tp = m.index_of("tp").unwrap();
     let mut over_tp = 0usize;
@@ -410,7 +447,7 @@ fn pp_above_one_without_a_declared_stage_names_the_entry() {
         }
     }
     let m = mesh(1, 1, 1, 1, 2);
-    let err = instantiate(&expanded.plan, &declared, &m, 0).unwrap_err();
+    let err = instantiate(&expanded.plan, &declared, &m, 0, &reference_registry()).unwrap_err();
     match err {
         PlanError::MissingStage { prefix, pp } => {
             assert_eq!(prefix, "lm_head");
@@ -504,6 +541,7 @@ fn declared_stages_travel_through_declarations() {
         &declared,
         &m,
         1,
+        &reference_registry(),
     )
     .unwrap();
     let kept: Vec<String> = plan
@@ -595,7 +633,8 @@ fn a_vocabulary_sharded_embedding_compiles_and_owes_an_all_reduce() {
 
     // The propagation pass must be able to express that layout's conversion: it is the compile step
     // that failed before the rule table learned this op.
-    let propagation = propagate(&plan).expect("the instantiated plan must propagate");
+    let propagation =
+        propagate(&plan, &reference_registry()).expect("the instantiated plan must propagate");
     assert!(
         propagation
             .inserted
@@ -613,8 +652,13 @@ fn a_vocabulary_sharded_embedding_compiles_and_owes_an_all_reduce() {
 /// D4 acceptance: the whole real path on the five-axis acceptance mesh `tp=2, cp=2, ep=4, dp=2,
 /// pp=2`, rank 0 and the last rank.
 ///
-/// Rank 0 (stage 0) instantiates **and** propagates: 26 collectives, the first of them the
-/// all-reduce that fulfils `embed.y`'s partial over `tp`. The last rank (stage 1) instantiates too
+/// Rank 0 (stage 0) instantiates **and** propagates: the inserted collectives fulfilling its
+/// partials (the first of them the all-reduce that fulfils `embed.y`'s partial over `tp`). The
+/// count moved from 26 to 21 when the operators started declaring their shard rules (ABI v2):
+/// the seven model-specific operators are `pass_through` rather than "unknown, therefore no
+/// derivation", so layouts that used to reconcile through an identity conversion now agree by
+/// construction. A count that moves with a rule *declaration* is the point of moving the rules
+/// out of the framework. The last rank (stage 1) instantiates too
 /// — shapes and layouts are a function of the global plan, only the node set is the rank's stage.
 ///
 /// What stage 1 cannot do yet is propagate, and the refusal is pinned here on purpose: `embed.y`
@@ -632,10 +676,11 @@ fn the_real_description_instantiates_and_propagates_on_the_acceptance_mesh() {
 
     // Rank 0: instantiate and propagate, with the embedding's all-reduce first.
     let rank0 = instantiated(&m, 0);
-    let propagation = propagate(&rank0).expect("rank 0 must propagate at the acceptance mesh");
+    let propagation = propagate(&rank0, &reference_registry())
+        .expect("rank 0 must propagate at the acceptance mesh");
     assert_eq!(
         propagation.inserted.len(),
-        26,
+        21,
         "rank 0 inserts the embedding's all-reduce, one per layer's row-parallel projection and \
          one gather per full-attention layer's gate: {:?}",
         propagation
@@ -669,7 +714,8 @@ fn the_real_description_instantiates_and_propagates_on_the_acceptance_mesh() {
 
     // The seam refusal: the stage-1 input holds the partial, and the conversion's owner is on
     // stage 0 — see the doc comment above for why this is a D5 decision, not a D4 bug.
-    let err = propagate(&rank_last).expect_err("stage 1 cannot propagate until the seam lands");
+    let err = propagate(&rank_last, &reference_registry())
+        .expect_err("stage 1 cannot propagate until the seam lands");
     match err {
         PlanError::LayoutConflict { held, .. } => {
             assert!(

@@ -911,6 +911,12 @@ fn check(args: CheckArgs) -> Result<()> {
             )
         });
 
+    // The providers load before instantiation: an operator's sharding rule is
+    // its own declaration (ABI v2, invariant I-5), so deriving the plan's
+    // layouts reads the registry instead of a framework-side name table.
+    let registry = load_registry(&[]).context("loading the operator providers")?;
+    let recipe = load_recipe(None)?;
+
     let mut report = CheckReport {
         model: model_dir.display().to_string(),
         checkpoint: checkpoint.as_ref().map(|path| path.display().to_string()),
@@ -1051,7 +1057,12 @@ fn check(args: CheckArgs) -> Result<()> {
     // partial before the seam, or hand it over) is D5's, and every propagation reason says so.
     match (&expanded, mesh.as_ref()) {
         (Some((_, plan)), Some(mesh)) => {
-            let stages = rustrain_plan::instantiate_stages(&plan.plan, &plan.declarations(), mesh);
+            let stages = rustrain_plan::instantiate_stages(
+                &plan.plan,
+                &plan.declarations(),
+                mesh,
+                &registry,
+            );
             let mut failures: Vec<String> = Vec::new();
             let mut empty: Vec<usize> = Vec::new();
             let mut stage_counts: Vec<String> = Vec::new();
@@ -1143,7 +1154,7 @@ fn check(args: CheckArgs) -> Result<()> {
                     ),
                     stage_counts,
                 ));
-                match rustrain_plan::shard::propagate(&stage_zero) {
+                match rustrain_plan::shard::propagate(&stage_zero, &registry) {
                     Err(e) => {
                         report.checks.push(CheckItem::fail(
                             "l1.layout_propagation",
@@ -1217,8 +1228,6 @@ fn check(args: CheckArgs) -> Result<()> {
     // ---- L1: implementation availability (never a `fail`, always a reason) --
     match &expanded {
         Some((_, plan)) => {
-            let registry = load_registry(&[])?;
-            let recipe = load_recipe(None)?;
             report.checks.push(implementation_availability(
                 &plan.plan,
                 &registry,
@@ -1367,9 +1376,12 @@ fn implementation_availability(
         ID,
         Verdict::Skip,
         format!(
-            "{nodes} of {} node(s) have no implementation on this host: {listed}. An operator no \
-             loaded plugin publishes is a missing primitive, not a plan defect, so C2 makes it a \
-             skip and the exit code stays 0",
+            "{nodes} of {} node(s) have no implementation on this host: {listed}. Availability is \
+             about this host, not about the plan, so C2 makes it a skip: the exit code is decided \
+             by `Fail` alone, and an operator a plugin *does* publish but that cannot run here \
+             leaves the plan intact. An operator *no* plugin publishes is a different matter — \
+             nothing declares its sharding rule, so `l1.instantiate` reports the operator it could \
+             not derive and the run fails there, not here",
             plan.nodes.len()
         ),
         details,

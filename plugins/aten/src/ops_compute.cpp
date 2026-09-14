@@ -777,23 +777,30 @@ bool sdpa_plan(const rs_tensor* q, const rs_tensor* k, const rs_tensor* v, const
         fail(std::string(op) + ": q, k and v must have the same rank >= 2");
         return false;
     }
-    bool headed = find_attr(attrs, "num_heads", RS_ATTR_I64) != nullptr;
+    // The per-head *form* is declared; the head *counts* come from the input
+    // tensors. An absolute count cannot survive sharding: the plan hands this
+    // node the rank's local slice, so a declared global count would contradict
+    // the tensor it describes.
+    bool headed = bool_or(attrs, "per_head", false);
     plan->headed = headed;
     if (headed) {
         if (q->rank < 3) {
             fail(std::string(op) + ": the per-head form needs rank >= 3");
             return false;
         }
-        plan->heads = 1;
-        attr_i64(attrs, "num_heads", &plan->heads);
-        plan->kv_heads = plan->heads;
-        attr_i64(attrs, "num_kv_heads", &plan->kv_heads);
+        plan->heads = q->shape[q->rank - 2];
+        plan->kv_heads = k->shape[k->rank - 2];
         plan->s = q->shape[q->rank - 3];
         plan->head_dim = q->shape[q->rank - 1];
         plan->t = k->shape[k->rank - 3];
         plan->value_dim = v->shape[v->rank - 1];
-        if (plan->heads % plan->kv_heads != 0) {
-            fail(std::string(op) + ": num_heads must be a multiple of num_kv_heads");
+        if (plan->heads < 1 || plan->kv_heads < 1 || plan->heads % plan->kv_heads != 0) {
+            fail(std::string(op) + ": the query head axis must be a positive multiple of the " +
+                 "key/value head axis (counts come from the tensors, never from an attribute)");
+            return false;
+        }
+        if (v->shape[v->rank - 2] != plan->kv_heads) {
+            fail(std::string(op) + ": k and v must carry the same key/value head count");
             return false;
         }
         plan->scale = f64_or(attrs, "scale", 1.0 / std::sqrt(static_cast<double>(plan->head_dim)));
@@ -1129,31 +1136,31 @@ int32_t ce_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const* ou
 }  // namespace
 
 void add_compute_ops(std::vector<OpDef>& ops) {
-    ops.push_back(OpDef{"matmul",
+    ops.push_back(OpDef{"matmul", RS_SHARD_MATMUL,
                         "C = A@B, f32 accumulate; 'transpose_b' (default false) computes A @ "
                         "B^T with B as [N, K]. The attribute is declared, never inferred.",
                         f32_mask(), RS_AUTODIFF, matmul_infer, matmul_execute});
-    ops.push_back(OpDef{"linear",
+    ops.push_back(OpDef{"linear", RS_SHARD_LINEAR,
                         "y = x @ w (+ b): w is [K, N] (output features last), x is [..., K], "
                         "bias is [N], y is [..., N].",
                         f32_mask(), RS_AUTODIFF, linear_infer, linear_execute});
-    ops.push_back(OpDef{"bmm",
+    ops.push_back(OpDef{"bmm", RS_SHARD_MATMUL,
                         "Batched matmul over identical batch dims, with the same optional "
                         "'transpose_b' convention as matmul.",
                         f32_mask(), RS_AUTODIFF, bmm_infer, bmm_execute});
-    ops.push_back(OpDef{"elementwise_unary",
+    ops.push_back(OpDef{"elementwise_unary", RS_SHARD_ELEMENTWISE,
                         "Applies the required 'kind' attribute elementwise (silu, gelu, "
                         "sigmoid, tanh, relu, exp, log, neg, sqrt, rsqrt, softplus, "
                         "negative_exp and the five *_grad kinds), with the reference's exact "
                         "formulas: silu = x/(1+e^-x), softplus = ln(1+e^x) with the identity "
                         "above 20, gelu = the tanh approximation.",
                         f32_mask(), RS_AUTODIFF, unary_infer, unary_execute});
-    ops.push_back(OpDef{"elementwise_binary",
+    ops.push_back(OpDef{"elementwise_binary", RS_SHARD_ELEMENTWISE,
                         "Applies the required 'kind' attribute (add, sub, mul, div, maximum, "
                         "pow) with right-aligned broadcasting; a single input plus the scalar "
                         "'rhs' attribute is the same operation against a constant.",
                         f32_mask(), RS_AUTODIFF, binary_infer, binary_execute});
-    ops.push_back(OpDef{"compare",
+    ops.push_back(OpDef{"compare", RS_SHARD_ELEMENTWISE,
                         "Elementwise comparison to an f32 mask (1.0 where it holds, 0.0 "
                         "elsewhere). Every comparison involving NaN yields 0.0, 'ne' "
                         "included.",
@@ -1182,12 +1189,12 @@ void add_compute_ops(std::vector<OpDef>& ops) {
                             });
                         },
                         compare_execute});
-    ops.push_back(OpDef{"reduce",
+    ops.push_back(OpDef{"reduce", RS_SHARD_DECLARED,
                         "Reduces along 'axis' with 'kind' (sum, mean, max, amax); no axis "
                         "reduces everything to a scalar, and 'keepdim' keeps the reduced "
                         "dims as size 1.",
                         f32_mask(), RS_AUTODIFF, reduce_infer, reduce_execute});
-    ops.push_back(OpDef{"softmax",
+    ops.push_back(OpDef{"softmax", RS_SHARD_ELEMENTWISE,
                         "Stable softmax of x*'scale' over 'axis' (default -1), shape "
                         "preserved.",
                         f32_mask(), RS_AUTODIFF,
@@ -1212,39 +1219,39 @@ void add_compute_ops(std::vector<OpDef>& ops) {
                             });
                         },
                         softmax_execute});
-    ops.push_back(OpDef{"embedding",
+    ops.push_back(OpDef{"embedding", RS_SHARD_EMBEDDING,
                         "out = w[indices]: weight [V, D], indices i32/i64 of any rank, output "
                         "indices.shape + [D]. Negative indices are rejected.",
                         (1u << RS_F32) | (1u << RS_I32) | (1u << RS_I64), RS_AUTODIFF,
                         embedding_infer, embedding_execute});
-    ops.push_back(OpDef{"gather",
+    ops.push_back(OpDef{"gather", RS_SHARD_ELEMENTWISE,
                         "Torch-gather convention along 'axis' (default -1); the output takes "
                         "the indices' shape and negative indices are rejected.",
                         (1u << RS_F32) | (1u << RS_I32) | (1u << RS_I64), RS_AUTODIFF,
                         gather_infer, gather_execute});
-    ops.push_back(OpDef{"scatter",
+    ops.push_back(OpDef{"scatter", RS_SHARD_ELEMENTWISE,
                         "Copy of x with values written at the indices along 'axis' (default "
                         "-1); 'reduce' selects assign or add.",
                         (1u << RS_F32) | (1u << RS_I32) | (1u << RS_I64), RS_AUTODIFF,
                         scatter_infer, scatter_execute});
-    ops.push_back(OpDef{"sdpa",
+    ops.push_back(OpDef{"sdpa", RS_SHARD_PASS_THROUGH,
                         "o = softmax(q @ k^T * scale + mask) @ v, per-head form with "
                         "'num_heads'/'num_kv_heads' (GQA) or the legacy flat form; 'causal' "
                         "masks j > i and an optional additive mask is added before the "
                         "softmax. Executed by ATen's fused kernels.",
                         (1u << RS_F32), RS_AUTODIFF, sdpa_infer, sdpa_execute});
-    ops.push_back(OpDef{"rope",
+    ops.push_back(OpDef{"rope", RS_SHARD_ELEMENTWISE,
                         "Rotary embedding of two operands at once: half-split pairs (i, i+h) "
                         "over the first 'rotary_dim' dims of the last axis, positions along "
                         "axis 0, inv_freq[j] = theta^(-2j/rotary_dim).",
                         (1u << RS_F32) | (1u << RS_I32) | (1u << RS_I64), RS_AUTODIFF,
                         rope_infer, rope_execute});
-    ops.push_back(OpDef{"topk_router",
+    ops.push_back(OpDef{"topk_router", RS_SHARD_PASS_THROUGH,
                         "(weights, indices) = top-k of softmax(logits [N, E]) per row, with "
                         "'top_k' and 'norm_topk_prob'. Ties break toward the lower expert "
                         "index; indices are i32.",
                         f32_mask(), RS_AUTODIFF, topk_infer, topk_execute});
-    ops.push_back(OpDef{"cross_entropy",
+    ops.push_back(OpDef{"cross_entropy", RS_SHARD_ELEMENTWISE,
                         "Mean cross-entropy of logits [N, C] against targets [N], computed in "
                         "the stable log-sum-exp form.",
                         (1u << RS_F32) | (1u << RS_I32) | (1u << RS_I64), RS_NONDIFF, ce_infer,

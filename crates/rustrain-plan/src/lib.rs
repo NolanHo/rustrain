@@ -128,6 +128,13 @@ pub enum PlanError {
         source: ShardError,
     },
 
+    #[error("node {node:?} ({op}) declares no usable sharding rule: {reason}")]
+    ShardRuleUndeclared {
+        node: NodeId,
+        op: String,
+        reason: String,
+    },
+
     #[error("no sharding rule applies to node {node:?}: {source}")]
     ShardDerivation {
         node: NodeId,

@@ -542,6 +542,43 @@ pub struct RsCtx {
     pub svc: *const RsServices,
 }
 
+c_enum! {
+    /// How a sharded distribution propagates through this operator.
+    ///
+    /// The framework owns the derivation *algebra* (a handful of rule kinds,
+    /// `rustrain-plan::shard`); which kind an operator uses is the operator's
+    /// own declaration, not a name the framework looks up. Without this field
+    /// the framework had to match operator names (`shard::rule_for`), so an
+    /// operator it had never heard of silently derived nothing — its sharded
+    /// inputs met a replicated output and compilation refused a plan that was
+    /// perfectly expressible. That is invariant I-5: a rule by name turns T2
+    /// into T3.
+    RsShardRule: i32 {
+        /// No derivation: the node's inputs and outputs keep the layouts their
+        /// slots already carry. The right answer for operators whose
+        /// distribution is data (routing) or declared elsewhere.
+        DECLARED = 0;
+        /// Every input must share one distribution; every output has it. The
+        /// elementwise / index / normalisation family.
+        ELEMENTWISE = 1;
+        /// `out = x @ w^T`: the weight's output dim splits the output
+        /// (column parallel), its contraction dim splits a partial sum.
+        LINEAR = 2;
+        /// `out = w[ids]`: `Linear` with the operands swapped in the kernel's
+        /// argument order (weight first).
+        EMBEDDING = 3;
+        /// `c @ a @ b`: contraction on `a`'s last and `b`'s second-to-last dim.
+        MATMUL = 4;
+        /// Every output inherits **input 0**'s distribution; the other inputs
+        /// keep theirs. For operators that act per element along the sharded
+        /// axis without requiring their other operands to agree — a
+        /// channel-wise convolution whose declared weight splits on the
+        /// channel axis, an attention whose keys/values may be replicated
+        /// while the queries are split.
+        PASS_THROUGH = 5;
+    }
+}
+
 /// The operator descriptor a plugin publishes. Mirrors `rs_op_desc`.
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -561,6 +598,10 @@ pub struct RsOpDesc {
     pub n_collectives: u32,
     pub execute: Option<RsExecuteFn>,
     pub last_error: Option<RsLastErrorFn>,
+    /// Appended for ABI v2 (fields are only ever appended). A plugin built
+    /// against the v1 header has a shorter descriptor and is rejected by
+    /// `struct_size`/`abi_version` before this field is read.
+    pub shard: RsShardRule,
 }
 
 /// The plugin header. Mirrors `rs_plugin`.
@@ -626,7 +667,9 @@ mod tests {
         assert_eq!(size_of::<RsExpansion>(), 32);
         assert_eq!(size_of::<RsServices>(), 56);
         assert_eq!(size_of::<RsCtx>(), 16);
-        assert_eq!(size_of::<RsOpDesc>(), 184);
+        // 184 (v1) + the v2 `shard` field: 4 bytes of payload plus 4 of tail
+        // padding, since the struct's alignment is 8.
+        assert_eq!(size_of::<RsOpDesc>(), 192);
         // 8 fields: 4 + 4 + 8 + 8 + 4 + 4 + 8 + 8. (56 is impossible for the
         // frozen header; `rs_plugin` has no field that could pad it to 56.)
         assert_eq!(size_of::<RsPlugin>(), 48);
@@ -642,6 +685,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(RsOpDesc, numerics), 48);
         assert_eq!(std::mem::offset_of!(RsOpDesc, infer), 96);
         assert_eq!(std::mem::offset_of!(RsOpDesc, execute), 168);
+        assert_eq!(std::mem::offset_of!(RsOpDesc, shard), 184);
         assert_eq!(std::mem::offset_of!(RsExpansionNode, outputs), 32);
         assert_eq!(std::mem::offset_of!(RsServices, log), 48);
     }

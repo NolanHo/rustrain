@@ -22,7 +22,7 @@ pub use loader::{LoadedOp, Plugin};
 
 /// ABI version understood by this build. A plugin reporting anything else is
 /// rejected at load time (contract C-2).
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 /// Name of the single symbol a plugin must export (contract C-1).
 pub const PLUGIN_SYMBOL: &[u8] = b"rustrain_plugin_v1\0";

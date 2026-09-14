@@ -22,7 +22,7 @@
 extern "C" {
 #endif
 
-#define RUSTRAIN_ABI_VERSION 1u
+#define RUSTRAIN_ABI_VERSION 2u
 #define RS_MAX_RANK 8u
 #define RS_MAX_RESERVED 4u
 
@@ -42,6 +42,21 @@ typedef enum {
     RS_EXPLICIT = 1,  /* has a registered backward op (see backward_op) */
     RS_NONDIFF  = 2   /* not differentiable (optimizer, quantize, ...) */
 } rs_backward_kind;
+
+/*
+ * How a sharded distribution propagates through the operator. The framework
+ * owns the derivation algebra; the operator declares which kind it uses, so a
+ * new operator never needs a framework-side name table (invariant I-5).
+ * Appended in v2, with the `shard` field at the end of rs_op_desc.
+ */
+typedef enum {
+    RS_SHARD_DECLARED = 0,      /* no derivation; slots keep their layouts */
+    RS_SHARD_ELEMENTWISE = 1,   /* one shared distribution on every operand */
+    RS_SHARD_LINEAR = 2,        /* out = x @ w^T */
+    RS_SHARD_EMBEDDING = 3,     /* out = w[ids] */
+    RS_SHARD_MATMUL = 4,        /* batched contraction */
+    RS_SHARD_PASS_THROUGH = 5   /* outputs inherit input 0, others keep theirs */
+} rs_shard_rule;
 
 typedef enum {
     RS_Q_NONE = 0, RS_Q_PER_TENSOR = 1, RS_Q_PER_TOKEN = 2, RS_Q_PER_BLOCK = 3
@@ -228,6 +243,11 @@ typedef struct {
                        const rs_attrs* attrs);
 
     const char* (*last_error)(rs_ctx* ctx);
+
+    /* v2: how this operator's sharded distribution propagates. Appended, so a
+     * v1 descriptor is shorter and is rejected by struct_size before this
+     * field is read. Declare it — the framework has no name table (I-5). */
+    rs_shard_rule       shard;
 } rs_op_desc;
 
 typedef struct {

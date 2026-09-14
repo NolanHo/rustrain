@@ -43,7 +43,7 @@ use std::sync::OnceLock;
 use rustrain_abi::author::{OpSpec, PluginBuilder};
 use rustrain_abi::ffi::{
     RsBackwardKind, RsCollective, RsCollectiveKind, RsDtype, RsExecuteFn, RsGroupKind, RsInferFn,
-    RsNumerics, RsPlugin,
+    RsNumerics, RsPlugin, RsShardRule,
 };
 
 use crate::op::composite::{
@@ -83,6 +83,7 @@ const FP8: &[RsDtype] = &[RsDtype::F32, RsDtype::F8E4M3, RsDtype::F8E5M2];
 /// `memory` slots always present.
 fn spec(
     name: &'static str,
+    shard: RsShardRule,
     doc: &'static str,
     dtypes: &'static [RsDtype],
     backward: RsBackwardKind,
@@ -90,6 +91,7 @@ fn spec(
     exec: RsExecuteFn,
 ) -> OpSpec {
     OpSpec::new(name, VARIANT)
+        .shard(shard)
         .doc(doc)
         .dtypes(dtypes)
         .numerics(RsNumerics {
@@ -156,7 +158,7 @@ const GATHER_DOC: &str = "Torch-gather convention: indices (i32/i64) have the sa
 
 const SCATTER_DOC: &str = "Copy of x, then out[..., indices[k], ...] = values[..., k, ...] along 'axis' (default -1), k ascending. values has x's shape with the axis dim equal to K. 'reduce' ('assign' | 'add', default 'assign'): assign is the existing semantics — duplicate indices: the last writer (largest k) wins; add accumulates duplicates instead, and because accumulation runs in the fixed ascending-k order, two runs are bitwise identical. Deterministic and documented either way.";
 
-const SDPA_DOC: &str = "Scaled-dot-product attention with GQA: o = softmax(q @ k^T * scale + mask) @ v. Two declared input forms: with 'num_heads' declared, the inputs are per-head — q [.., S, num_heads, D], k/v [.., T, num_kv_heads, D/Dv] (S at the third-to-last axis, the plan's sequence-first layout); without it, the legacy flat form q [.., S, D], k [.., T, D], v [.., T, Dv] (one head). Identical batch dims; S and T may differ. 'num_heads' (i64, default 1) and 'num_kv_heads' (i64, default = num_heads; num_heads must be a multiple) declare the head split; each kv head serves num_heads/num_kv_heads query heads (the KV repeat the design refuses to add as a primitive). 'causal' (bool, default false) masks j > i to -inf. 'scale' (f64) is explicit when given; when absent the declared convention applies: 1/sqrt(head_dim) when num_heads is declared, and the legacy default 1.0 otherwise — the old flat form keeps its old default, and the declared expansion's softmax node uses the same default, so fused == expansion stays checkable. The output is [.., S, num_heads, Dv] (headed) or [.., S, Dv] (flat). Optional 4th input: an additive mask (f32) broadcastable to [.., S, T], added to the scores BEFORE the softmax (0.0 = attend, -inf masks a position — the HF attention_mask convention). Expansion: bmm(q, k, transpose_b=true) -> softmax -> bmm(p, v) — valid for the legacy flat form (num_heads = num_kv_heads = 1); GQA/causal cases cannot be replayed from the primitive vocabulary, which is exactly why the fused body exists.";
+const SDPA_DOC: &str = "Scaled-dot-product attention with GQA: o = softmax(q @ k^T * scale + mask) @ v. Two declared input forms: with 'per_head' (bool, default false) the inputs are per-head — q [.., S, H, D], k/v [.., T, Hkv, D/Dv] (S at the third-to-last axis, the plan's sequence-first layout); without it, the legacy flat form q [.., S, D], k [.., T, D], v [.., T, Dv] (one head). Identical batch dims; S and T may differ. The head counts are READ FROM THE TENSORS' OWN AXES, never from an attribute: the plan hands this node the rank's local slice, so a declared global count would contradict the tensor it describes (a sharded q has fewer heads than the model). Each kv head serves H / Hkv query heads — the KV repeat the design refuses to add as a primitive — and H must be a positive multiple of Hkv. 'causal' (bool, default false) masks j > i to -inf. 'scale' (f64) is explicit when given; when absent the declared convention applies: 1/sqrt(head_dim) in the per-head form, and the legacy default 1.0 otherwise — the old flat form keeps its old default, and the declared expansion's softmax node uses the same default, so fused == expansion stays checkable. The output is [.., S, H, Dv] (per-head) or [.., S, Dv] (flat). Optional 4th input: an additive mask (f32) broadcastable to [.., S, T], added to the scores BEFORE the softmax (0.0 = attend, -inf masks a position — the HF attention_mask convention). Expansion: bmm(q, k, transpose_b=true) -> softmax -> bmm(p, v) — valid for the legacy flat form (one head); GQA/causal cases cannot be replayed from the primitive vocabulary, which is exactly why the fused body exists.";
 
 const CE_DOC: &str = "Mean cross-entropy loss of logits [N, C] against targets (i32/i64, [N]): mean_n(logsumexp_n - logits[n, t_n]). The fused body uses the stable log-sum-exp form, finite even for extreme logits (e.g. [1000, -1000, 0] -> 1000); the declared expansion is the naive -mean(log(softmax)) composition (softmax -> log -> reshape(targets,[-1,1]) -> gather(axis=-1) -> neg -> reduce mean), which agrees within tolerance wherever the naive form is well-conditioned.";
 
@@ -178,6 +180,7 @@ fn build_plugin() -> &'static RsPlugin {
     PluginBuilder::new("reference", env!("CARGO_PKG_VERSION"))
         .op(spec(
             "view",
+            RsShardRule::ELEMENTWISE,
             VIEW_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -186,6 +189,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "reshape",
+            RsShardRule::ELEMENTWISE,
             RESHAPE_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -194,6 +198,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "transpose",
+            RsShardRule::ELEMENTWISE,
             TRANSPOSE_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -202,6 +207,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "narrow",
+            RsShardRule::ELEMENTWISE,
             NARROW_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -210,6 +216,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "cat",
+            RsShardRule::ELEMENTWISE,
             CAT_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -218,6 +225,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "broadcast",
+            RsShardRule::ELEMENTWISE,
             BROADCAST_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -226,6 +234,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "matmul",
+            RsShardRule::MATMUL,
             MATMUL_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -234,6 +243,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "linear",
+            RsShardRule::LINEAR,
             LINEAR_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -242,6 +252,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "bmm",
+            RsShardRule::MATMUL,
             BMM_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -250,6 +261,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "elementwise_unary",
+            RsShardRule::ELEMENTWISE,
             UNARY_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -258,6 +270,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "elementwise_binary",
+            RsShardRule::ELEMENTWISE,
             BINARY_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -266,6 +279,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "compare",
+            RsShardRule::ELEMENTWISE,
             COMPARE_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -274,6 +288,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "reduce",
+            RsShardRule::DECLARED,
             REDUCE_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -282,6 +297,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "softmax",
+            RsShardRule::ELEMENTWISE,
             SOFTMAX_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -290,6 +306,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "rmsnorm",
+            RsShardRule::ELEMENTWISE,
             RMSNORM_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -298,6 +315,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "layernorm",
+            RsShardRule::ELEMENTWISE,
             LAYERNORM_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -306,6 +324,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "rope",
+            RsShardRule::ELEMENTWISE,
             ROPE_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -314,6 +333,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "quantize",
+            RsShardRule::ELEMENTWISE,
             QUANTIZE_DOC,
             F32,
             RsBackwardKind::NONDIFF,
@@ -322,6 +342,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "dequantize",
+            RsShardRule::ELEMENTWISE,
             DEQUANTIZE_DOC,
             FP8,
             RsBackwardKind::NONDIFF,
@@ -330,6 +351,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "amax_update",
+            RsShardRule::ELEMENTWISE,
             AMAX_DOC,
             F32,
             RsBackwardKind::NONDIFF,
@@ -338,6 +360,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "embedding",
+            RsShardRule::EMBEDDING,
             EMBEDDING_DOC,
             F32_IDX,
             RsBackwardKind::AUTODIFF,
@@ -346,6 +369,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "gather",
+            RsShardRule::ELEMENTWISE,
             GATHER_DOC,
             F32_IDX,
             RsBackwardKind::AUTODIFF,
@@ -354,6 +378,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "scatter",
+            RsShardRule::ELEMENTWISE,
             SCATTER_DOC,
             F32_IDX,
             RsBackwardKind::AUTODIFF,
@@ -362,6 +387,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "sdpa",
+            RsShardRule::PASS_THROUGH,
             SDPA_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -374,6 +400,7 @@ fn build_plugin() -> &'static RsPlugin {
         .expansion(sdpa_expansion()))
         .op(spec(
             "cross_entropy",
+            RsShardRule::ELEMENTWISE,
             CE_DOC,
             F32_IDX,
             RsBackwardKind::AUTODIFF,
@@ -383,6 +410,7 @@ fn build_plugin() -> &'static RsPlugin {
         .expansion(cross_entropy_expansion()))
         .op(spec(
             "adamw",
+            RsShardRule::DECLARED,
             ADAMW_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -392,6 +420,7 @@ fn build_plugin() -> &'static RsPlugin {
         .expansion(adamw_expansion()))
         .op(spec(
             "topk_router",
+            RsShardRule::PASS_THROUGH,
             TOPK_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -401,6 +430,7 @@ fn build_plugin() -> &'static RsPlugin {
         .expansion(topk_expansion()))
         .op(spec(
             "l2norm",
+            RsShardRule::PASS_THROUGH,
             L2NORM_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -409,6 +439,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "rmsnorm_gated",
+            RsShardRule::PASS_THROUGH,
             RMSNORM_GATED_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -417,6 +448,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "causal_conv1d",
+            RsShardRule::PASS_THROUGH,
             CAUSAL_CONV1D_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -425,6 +457,7 @@ fn build_plugin() -> &'static RsPlugin {
         ))
         .op(spec(
             "gated_delta_rule",
+            RsShardRule::PASS_THROUGH,
             GATED_DELTA_RULE_DOC,
             F32,
             RsBackwardKind::AUTODIFF,
@@ -446,6 +479,7 @@ fn build_plugin() -> &'static RsPlugin {
         }))
         .op(spec(
             "moe_layer",
+            RsShardRule::PASS_THROUGH,
             MOE_LAYER_DOC,
             F32_IDX,
             RsBackwardKind::AUTODIFF,

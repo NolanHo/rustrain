@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 use rustrain_abi::Plugin;
 use rustrain_abi::author::{OpSpec, PluginBuilder};
 use rustrain_abi::ffi::{
-    RsAttrKind, RsAttrs, RsCtx, RsDeviceKind, RsDtype, RsMemReq, RsPlugin, RsTensor,
+    RsAttrKind, RsAttrs, RsCtx, RsDeviceKind, RsDtype, RsMemReq, RsPlugin, RsShardRule, RsTensor,
 };
 use rustrain_ops::{Phase, Recipe, Registry, TargetEnv};
 use rustrain_parallel::{GroupMask, Mesh, ParallelConfig, ParallelLayout, ReduceOp};
@@ -164,12 +164,14 @@ fn test_plugin() -> &'static RsPlugin {
     PLUGIN.get_or_init(|| {
         PluginBuilder::new("test", "0.1.0")
             .op(OpSpec::new("scale", "test.f32")
+                .shard(RsShardRule::ELEMENTWISE)
                 .doc("out = in * factor")
                 .dtypes(&[RsDtype::F32])
                 .execute(scale_execute)
                 .infer(scale_infer)
                 .memory(zero_memory))
             .op(OpSpec::new("linear", "test.f32")
+                .shard(RsShardRule::LINEAR)
                 .doc("stand-in for a tensor-parallel linear")
                 .dtypes(&[RsDtype::F32])
                 .execute(linear_execute)

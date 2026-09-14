@@ -68,6 +68,7 @@ Tables build() {
         desc.id.name = def.name;
         desc.id.variant = VARIANT;
         desc.id.version = 1;
+        desc.shard = def.shard;
         desc.doc = def.doc;
         desc.requires = &req;
         desc.numerics = num;

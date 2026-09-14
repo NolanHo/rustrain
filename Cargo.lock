@@ -535,6 +535,8 @@ name = "rustrain-model"
 version = "0.2.0"
 dependencies = [
  "rustrain-abi",
+ "rustrain-kernels",
+ "rustrain-ops",
  "rustrain-parallel",
  "rustrain-plan",
  "serde",

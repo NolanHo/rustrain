@@ -14,3 +14,11 @@ rustrain-plan.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+# Dev-only: these tests instantiate the real description, and an operator's
+# sharding rule is its own declaration (ABI v2), so the plan is derived against
+# the built-in reference provider's descriptors. It never enters the crate's
+# normal dependency closure (invariant I-1).
+[dev-dependencies]
+rustrain-kernels.workspace = true
+rustrain-ops.workspace = true

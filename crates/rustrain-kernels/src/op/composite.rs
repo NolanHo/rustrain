@@ -100,10 +100,15 @@ fn sdpa_plan(
             v.rank
         ));
     }
-    let headed = attr_i64(a, "num_heads").is_some();
-    // GQA is declared, never inferred. The headed form carries the heads on
-    // the second-to-last axis (validated against the declaration); the
-    // legacy flat form is the same math with a single head.
+    let headed = attr_bool(a, "per_head").unwrap_or(false);
+    // The per-head *form* is declared; the head *counts* are read from the
+    // tensors' own axes. An absolute count cannot survive sharding: the plan
+    // hands this node the rank's local slice, so a declared global head count
+    // would contradict the tensor it is supposed to describe. GQA grouping is
+    // therefore q_heads / kv_heads (validated divisible), which is exactly the
+    // model's grouping whenever the shard splits both head axes proportionally
+    // — and is the reason tp > 2 against 2 kv heads needs KV replication
+    // (qwen36-5d-example.md §4).
     let (batch_axes, s, hq, d) = if headed {
         if rank < 3 {
             return Err(fail!(
@@ -125,21 +130,14 @@ fn sdpa_plan(
             q.shape[rank - 1] as usize,
         )
     };
-    let num_heads = attr_i64(a, "num_heads").unwrap_or(1);
-    if num_heads < 1 {
-        return Err(fail!(op, "sdpa 'num_heads' ({num_heads}) must be >= 1"));
-    }
-    if headed && hq != num_heads as usize {
+    let num_heads = hq as i64;
+    let num_kv = if headed { k.shape[rank - 2] } else { 1 };
+    if num_heads < 1 || num_kv < 1 || num_heads % num_kv != 0 {
         return Err(fail!(
             op,
-            "sdpa q head axis is {hq} but 'num_heads' declares {num_heads} — the heads are              declared, never inferred"
-        ));
-    }
-    let num_kv = attr_i64(a, "num_kv_heads").unwrap_or(num_heads);
-    if num_kv < 1 || num_heads % num_kv != 0 {
-        return Err(fail!(
-            op,
-            "sdpa 'num_kv_heads' ({num_kv}) must divide 'num_heads' ({num_heads})"
+            "sdpa head axes: q has {num_heads} head(s), k has {num_kv}; the query heads must be a \
+             positive multiple of the key/value heads (GQA) — the counts come from the input \
+             tensors, never from an attribute"
         ));
     }
     for dd in 0..batch_axes {
@@ -166,13 +164,7 @@ fn sdpa_plan(
             v.dims()
         ));
     }
-    if headed && (k.shape[rank - 2] as usize) != num_kv as usize {
-        return Err(fail!(
-            op,
-            "sdpa k head axis is {} but 'num_kv_heads' declares {num_kv}",
-            k.shape[rank - 2]
-        ));
-    }
+
     if kd != d {
         return Err(fail!(op, "sdpa k head dim ({kd}) must equal q's ({d})"));
     }
@@ -184,14 +176,15 @@ fn sdpa_plan(
     if v_heads != num_kv as usize {
         return Err(fail!(
             op,
-            "sdpa v head axis is {v_heads} but 'num_kv_heads' declares {num_kv}"
+            "sdpa v head axis is {v_heads} but k's is {num_kv}: the per-head form requires k and \
+             v to carry the same key/value head count"
         ));
     }
     // The declared scale convention: explicit `scale` wins; absent, the
-    // headed form (num_heads declared) defaults to 1/sqrt(head_dim) and the
-    // legacy flat form keeps its pre-D5 default of 1.0 — additive with the
-    // old behaviour as the default, and the declared expansion's softmax
-    // node still matches the legacy path.
+    // per-head form defaults to 1/sqrt(head_dim) and the legacy flat form
+    // keeps its pre-D5 default of 1.0 — additive with the old behaviour as the
+    // default, and the declared expansion's softmax node still matches the
+    // legacy path.
     let scale = match attr_f64(a, "scale") {
         Some(s) => s as f32,
         None if headed => 1.0 / (d as f32).sqrt(),
