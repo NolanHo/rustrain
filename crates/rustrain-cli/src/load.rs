@@ -85,12 +85,12 @@ struct Sink {
     seen: Vec<bool>,
     slots: usize,
     bytes: u64,
-    /// Elements written into each slot. A streamed weight arrives in pieces, so "the slot was
-    /// seen" is no longer enough to prove it was *filled*: a lost, duplicated or misplaced chunk
-    /// would leave a gap or an overlap that no other check would notice (a zeroed region of a
-    /// weight is a plausible-looking tensor). This counter is the structural check — one number
-    /// per slot, compared against the slot's length at the end of the load.
+    /// Elements written into each slot, and *where*: a streamed weight arrives in pieces, so "the
+    /// slot was seen" no longer proves it was filled. A count alone catches a lost or duplicated
+    /// chunk but not a misplaced one (right total, wrong offset) nor two chunks swapped between
+    /// equal-shaped slots; the ranges catch all four, because they have to tile the slot exactly.
     written: Vec<u64>,
+    ranges: Vec<Vec<(usize, usize)>>,
 }
 
 /// One weight slot's data — or a slice of it — ready to write into the executor.
@@ -392,6 +392,7 @@ pub(crate) fn load_weights(
     let mut sink = Sink {
         seen: vec![false; plan.slots.len()],
         written: vec![0u64; plan.slots.len()],
+        ranges: vec![Vec::new(); plan.slots.len()],
         ..Sink::default()
     };
     let mut write_busy = Duration::ZERO;
@@ -481,6 +482,7 @@ pub(crate) fn load_weights(
             };
             sink.bytes += (weight.values.len() * 4) as u64;
             sink.written[weight.slot.0] += weight.values.len() as u64;
+            sink.ranges[weight.slot.0].push((weight.element_offset, weight.values.len()));
             // A streamed weight arrives as several chunks; the slot is counted once, when its
             // first chunk lands, and `seen` is simply idempotent.
             if !sink.seen[weight.slot.0] {
@@ -554,8 +556,9 @@ pub(crate) fn load_weights(
                 slot.name
             );
         }
-        // Every element exactly once. A streamed weight is written in pieces, and this is what
-        // makes "in pieces" as verifiable as "in one go" used to be.
+        // Every element exactly once, *in the right place*. A streamed weight is written in
+        // pieces, and this is what makes "in pieces" as verifiable as "in one go" used to be: the
+        // ranges must tile `[0, len)` with no gap, no overlap and no shift.
         let expected: u64 = slot.shape.iter().map(|axis| *axis as u64).product();
         if sink.written[index] != expected {
             bail!(
@@ -564,6 +567,20 @@ pub(crate) fn load_weights(
                 slot.name,
                 sink.written[index]
             );
+        }
+        let mut ranges = sink.ranges[index].clone();
+        ranges.sort_unstable();
+        let mut next = 0usize;
+        for (offset, len) in ranges {
+            if offset != next {
+                bail!(
+                    "weight slot `{}` of the rank-{rank} plan has a hole or an overlap at \
+                     element {next} (the next chunk starts at {offset}); the weights of a streamed \
+                     load are written range by range and have to tile the slot",
+                    slot.name
+                );
+            }
+            next += len;
         }
     }
 
@@ -898,6 +915,26 @@ fn strides_of(shape: &[i64]) -> Vec<i64> {
     strides
 }
 
+/// The chunks a member's outer axis is streamed in: `(start row, row count)` pairs that tile
+/// `[0, rows)` exactly, in order.
+///
+/// Extracted from the streaming loop so the tiling property can be tested on its own: the loop
+/// walks these pairs, and every element of the member has to be covered exactly once.
+fn chunk_plan(rows: i64, row_elements: usize) -> Vec<(i64, usize)> {
+    if rows <= 0 {
+        return Vec::new();
+    }
+    let rows_per_chunk = (CHUNK_BYTES / 4 / row_elements.max(1)).max(1);
+    let mut plan = Vec::new();
+    let mut row = 0i64;
+    while row < rows {
+        let take = (rows - row).min(rows_per_chunk as i64) as usize;
+        plan.push((row, take));
+        row += take as i64;
+    }
+    plan
+}
+
 /// Reads one checkpoint tensor's bytes and cuts every member's slot out of them.
 fn load_group(
     group: &Group,
@@ -1056,10 +1093,12 @@ fn load_group(
             .skip(1)
             .map(|(_, _, len)| *len as usize)
             .product();
-        let rows_per_chunk = (CHUNK_BYTES / 4 / row_elements.max(1)).max(1);
-        let mut row = 0i64;
-        while row < rows {
-            let take = (rows - row).min(rows_per_chunk as i64) as usize;
+        for (row, take) in chunk_plan(rows, row_elements) {
+            // A member can be large enough that a failure elsewhere should stop it mid-way: the
+            // flag is checked per chunk, not only per member.
+            if abort.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(stats);
+            }
             let fill_started = Instant::now();
             let mut values = pool
                 .lock()
@@ -1089,7 +1128,6 @@ fn load_group(
             {
                 return Ok(stats);
             }
-            row += take as i64;
         }
     }
     Ok(stats)
@@ -1720,6 +1758,73 @@ mod tests {
         let delivered = rx.try_recv().expect("the member still arrives");
         assert_eq!(delivered.slot, SlotId(0));
         assert!(delivered.values.is_empty());
+    }
+
+    /// The chunk plan is the whole partition of a member's outer axis: in order, no gap, no
+    /// overlap, and exactly the member's rows in total. The streaming loop walks it, so a hole here
+    /// would leave a zeroed region of a weight that nothing else would notice.
+    #[test]
+    fn the_chunk_plan_tiles_the_member_exactly() {
+        for (rows, row_elements) in [
+            (1i64, 1usize),
+            (7, 512),
+            (2048, 2048),
+            (256, 262_144), // a MoE expert tensor at tp=4: 8 rows per chunk
+            (3, 8 << 20),   // bigger than a whole chunk: one row at a time
+        ] {
+            let plan = chunk_plan(rows, row_elements);
+            let mut next = 0i64;
+            for (start, take) in &plan {
+                assert_eq!(*start, next, "chunks must tile in order: {plan:?}");
+                assert!(*take >= 1, "a chunk holds at least one row: {plan:?}");
+                next += *take as i64;
+            }
+            assert_eq!(next, rows, "the plan covers every row: {plan:?}");
+            // A member of one element still gets one chunk; an empty one gets none (the empty
+            // tensor path delivers that member explicitly).
+            assert_eq!(plan.is_empty(), rows <= 0);
+        }
+        assert_eq!(
+            chunk_plan(1, 1),
+            vec![(0, 1)],
+            "a scalar member is one single-element chunk"
+        );
+        assert_eq!(
+            chunk_plan(3, 8 << 20),
+            vec![(0, 1), (1, 1), (2, 1)],
+            "a row bigger than the chunk budget streams one row at a time, never zero"
+        );
+    }
+
+    /// Splitting a member into chunks must not change a single element: the concatenation of
+    /// `fill_chunk_into` over the plan equals `fill` on the same map. This is the only test that
+    /// exercises the `start * step[0]` advance, and it uses a transposed, sliced map so the stride
+    /// of the outer axis is not 1.
+    #[test]
+    fn chunked_fill_concatenates_to_the_whole_fill() {
+        let source = [4i64, 6, 3];
+        let values: Vec<f32> = (0..72).map(|i| i as f32 * 0.25 - 3.0).collect();
+        let bytes = bf16_bytes(&values);
+        let strides = strides_of(&source);
+
+        let mut cuts = Cuts::identity(&source);
+        cuts.transpose(0, 2); // the outer axis now strides by 3
+        cuts.narrow(2, 1, 2, "test").unwrap();
+        let shapes = cuts.shape();
+        let rows = shapes[0];
+        let row_elements: usize = shapes[1..].iter().map(|d| *d as usize).product();
+
+        let whole = cuts.fill(&bytes, "bf16", &strides, 0).unwrap();
+        let mut streamed = Vec::new();
+        for (start, take) in chunk_plan(rows, row_elements) {
+            let mut chunk = Vec::new();
+            cuts.fill_chunk_into(&mut chunk, &bytes, "bf16", &strides, 0, start, take)
+                .unwrap();
+            assert_eq!(chunk.len(), take * row_elements, "a chunk is whole rows");
+            streamed.extend_from_slice(&chunk);
+        }
+        assert_eq!(whole.len(), streamed.len());
+        assert_eq!(streamed, whole, "chunked == whole, element for element");
     }
 
     /// A zero-length cut has no source span (`start + len - 1`) and its runs would address an empty

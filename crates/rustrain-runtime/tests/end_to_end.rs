@@ -238,6 +238,20 @@ fn compiled_plan_executes_and_produces_the_expected_numbers() {
     .unwrap();
 
     ex.write_f32(x, &[1.0, 2.0, 3.0, 4.0]).unwrap();
+    // A partial write lands exactly where it says, and leaves the rest of the slot alone: this is
+    // what the streamed checkpoint loader relies on for every weight it moves.
+    ex.write_f32_at(x, 1, &[7.0, 8.0]).unwrap();
+    assert_eq!(ex.read_f32(x).unwrap(), vec![1.0, 7.0, 8.0, 4.0]);
+    assert!(
+        ex.write_f32_at(x, 3, &[9.0, 9.0]).is_err(),
+        "a write past the end of the slot is refused, not truncated"
+    );
+    assert!(
+        ex.write_f32_at(x, usize::MAX, &[9.0]).is_err(),
+        "an offset that cannot be added to is refused rather than wrapping"
+    );
+    // Restore the input the rest of the test expects.
+    ex.write_f32(x, &[1.0, 2.0, 3.0, 4.0]).unwrap();
     let stats = ex.run().unwrap();
     assert_eq!(stats.ops, 1);
     assert_eq!(stats.collectives, 0);

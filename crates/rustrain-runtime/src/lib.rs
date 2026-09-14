@@ -53,6 +53,17 @@ pub enum RuntimeError {
         actual: usize,
     },
 
+    /// A byte-range write was asked for a slot whose buffer is a strided view.
+    #[error(
+        "slot `{slot:?}` ({name}) is not densely laid out (strides {strides:?}), so a write at a \
+         byte offset would land in the wrong elements"
+    )]
+    NotDense {
+        slot: SlotId,
+        name: String,
+        strides: Vec<i64>,
+    },
+
     #[error("slot {slot:?} ({name}) is {dtype}, not f32")]
     NotF32 {
         slot: SlotId,
@@ -550,7 +561,7 @@ impl Executor {
                 actual: data.len(),
             });
         }
-        let ptr = self.data_ptr(id)?;
+        let ptr = self.dense_ptr(id)?;
         let bytes = std::mem::size_of_val(data) as u64;
         // SAFETY: `data` holds exactly `expected` f32 (checked above), so the
         // byte view covers exactly `bytes`.
@@ -588,7 +599,7 @@ impl Executor {
                 actual: end,
             });
         }
-        let ptr = self.data_ptr(id)?;
+        let ptr = self.dense_ptr(id)?;
         let bytes = std::mem::size_of_val(data) as u64;
         // SAFETY: `data` holds `data.len()` f32, so the byte view covers exactly `bytes`; the
         // destination is `element_offset` f32 past the slot's start, and the check above proves the
@@ -702,6 +713,31 @@ impl Executor {
             });
         }
         Ok(())
+    }
+
+    /// The slot's data pointer, **only when the slot is densely laid out**.
+    ///
+    /// A host write addresses the slot by byte offset from its base pointer, which is only the
+    /// element at that offset when the buffer is canonical row-major — and a view operator
+    /// (`transpose`, an inner-axis `narrow`, `broadcast`) leaves the slot describing a different
+    /// stride arrangement. Writing anyway lands in the wrong elements *silently*, because the
+    /// shape still checks out; the whole-slot writer has the same assumption, so both go through
+    /// here.
+    fn dense_ptr(&self, id: SlotId) -> Result<*mut c_void, RuntimeError> {
+        let buf = self
+            .buffers
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .ok_or(RuntimeError::NullData { slot: id })?;
+        if !is_dense(buf) {
+            let rank = (buf.rank as usize).min(buf.shape.len());
+            return Err(RuntimeError::NotDense {
+                slot: id,
+                name: self.plan.plan.slot(id).name.clone(),
+                strides: buf.strides[..rank].to_vec(),
+            });
+        }
+        Ok(buf.ptr)
     }
 
     fn data_ptr(&self, id: SlotId) -> Result<*mut c_void, RuntimeError> {
