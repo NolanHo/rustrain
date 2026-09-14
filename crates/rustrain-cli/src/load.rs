@@ -32,11 +32,10 @@ use crate::{
 pub(crate) struct LoadStats {
     /// Bytes actually handed to `read` (this is what `checkpoint_bytes_read` means).
     pub bytes_read: u64,
-    /// Bytes a *single* read per tensor would have needed, counted over the pairing's tensor
-    /// names independently of how the loader groups them. It equals `bytes_read` today (the
-    /// pairing gives a tensor one transform, so grouping by `(tensor, transform)` cannot split
-    /// one), and the two would differ the moment a vocabulary allowed the same tensor in two
-    /// groups — which is exactly what makes this a measurement rather than a restatement.
+    /// Bytes a *single full read* per tensor would have needed, counted over the pairing's tensor
+    /// names independently of how the loader groups and narrows them. A rank that needs every
+    /// tensor — world 1 — reads exactly this; on a sharded mesh `bytes_read` is smaller by the
+    /// slices the other ranks own.
     pub bytes_distinct: u64,
     pub tensors_read: usize,
     /// How many `read` calls the narrowed reads took, for the days the window is not enough.
@@ -743,6 +742,10 @@ fn load_group(
             shape_text(&group.shape)
         );
     }
+    if numel == 0 {
+        // A tensor with a zero-length axis holds nothing to read, whatever the members ask for.
+        return Ok(stats);
+    }
     let mut planned: Vec<Cuts> = Vec::with_capacity(group.members.len());
     for member in &group.members {
         planned.push(member_cuts(group, member, rank)?);
@@ -1418,6 +1421,39 @@ mod tests {
         }
         naive.sort_unstable();
         assert_eq!(from_runs, naive);
+
+        // A transpose *and* a partial axis: the innermost partial axis is a different source axis
+        // after the swap, so the run length must follow the source strides, not the result order.
+        let mut swapped_partial = Cuts::identity(&dims);
+        swapped_partial.transpose(0, 2);
+        swapped_partial.narrow(2, 1, 2, "test").unwrap();
+        let window = swapped_partial.source_span(&strides);
+        let runs = swapped_partial.runs(&dims, &strides, 1024, window);
+        let mut from_runs: Vec<i64> = runs
+            .iter()
+            .flat_map(|(start, len)| *start..*start + *len)
+            .collect();
+        from_runs.sort_unstable();
+        let mut naive: Vec<i64> = Vec::new();
+        for a in 1..3 {
+            for b in 0..6 {
+                for c in 0..5 {
+                    naive.push(a * 30 + b * 5 + c);
+                }
+            }
+        }
+        naive.sort_unstable();
+        assert_eq!(from_runs, naive, "the runs must follow the source strides");
+
+        // A cut that starts at zero but keeps less than the axis is still a partial axis.
+        let mut prefix = Cuts::identity(&dims);
+        prefix.narrow(1, 0, 2, "test").unwrap();
+        assert_eq!(
+            prefix
+                .runs(&dims, &strides, 1024, prefix.source_span(&strides))
+                .len(),
+            3
+        );
 
         // Past the cap the caller gets the covering window: more bytes, never fewer.
         let capped = both.runs(&dims, &strides, 2, window);

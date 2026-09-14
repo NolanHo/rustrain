@@ -566,7 +566,7 @@ hidden **与改动前逐位相同**（`np.array_equal` → True，`max|d| 0.0`�
 "同样的 f32 值怎么进 slot"，不决定值本身；这条判据把"只改了搬字节的方式"钉死。
 
 **回写是最后的大头（改完才看见）**：world=1 的加载墙钟 22.6 s 里，调用线程在 `write_f32` 里真正花掉
-**18.9 s**（142 GB pageable 源 → ~7.8 GB/s）；tp=2 因为每个 rank 只写自己那半（67 GiB f32），回写
+**18.3 s**（142 GB pageable 源 → ~7.8 GB/s）；tp=2 因为每个 rank 只写自己那半（67 GiB f32），回写
 10.0 s、加载墙钟 12.5 s —— 两个数同量级，也就是说**瓶颈是那次内存拷贝**，不是布局运算，也不是磁盘。下一步很明确：`cudaHostAlloc` 的 pinned 暂存 + 分批
 `cudaMemcpyAsync`（pageable 拷贝要过一次内部暂存，pinned 能到 20+ GB/s），或按 slot 对齐后合并成大块。
 
@@ -587,7 +587,7 @@ hidden **与改动前逐位相同**（`np.array_equal` → True，`max|d| 0.0`�
   说明没有张量落在 fallback 上，剩下的差距不在加载器。
 - 数值不变：tp=2 的 dump 与加载器重写前**逐位相同**（`array_equal`，digest 不变），sweep 判据不变。
 
-**本次没做的（诚实记录）**：① `pinned` 暂存（pageable 的 `cuMemcpyHtoD` 约 7.8 GB/s，回写 18.9 s 是加载里
+**本次没做的（诚实记录）**：① `pinned` 暂存（pageable 的 `cuMemcpyHtoD` 约 7.8 GB/s，回写 18.3 s 是加载里
 最大的一段，且在 tp=2 上已经和 fill 同量级）；② 冷缓存时单流读只有 ~160 MB/s（16 worker 已经并行，但
 checkpoint 不在 page cache 时仍是主要成本之一）；③ 更高度数（tp=8 / ep）受益更大，但那些配置本身还在
 D6 的阻断项里（见下）。

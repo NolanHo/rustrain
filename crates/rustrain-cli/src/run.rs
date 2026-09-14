@@ -905,9 +905,9 @@ fn run_rank(
         "weight_slots": loaded_count,
         "weight_bytes": rank_weight_bytes,
         "checkpoint_bytes_read": checkpoint_bytes,
-        // The phases the load splits into. `bytes_distinct` is what one read per tensor would
-        // need; it equals `bytes_read` today (the pairing gives a tensor one transform) and the
-        // two would part company if one tensor could feed two groups.
+        // The phases the load splits into. `bytes_distinct` is what a full read of every tensor
+        // this rank binds would cost; `bytes_read` is what it actually read. They are equal at
+        // world 1 and `bytes_read` is smaller on a sharded mesh, by the slices other ranks own.
         "checkpoint_load": {
             "bytes_read": load.stats.bytes_read,
             "bytes_distinct": load.stats.bytes_distinct,
