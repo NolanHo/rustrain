@@ -291,12 +291,22 @@ fn the_real_shape_join_resolves_declared_axes_end_to_end() {
         ]
     );
 
-    // The same declared axes divide the embedding table on its own axis.
+    // The embedding table is **replicated**, and that is a decision with a reason: a
+    // vocab-sharded lookup would need each rank to offset its ids by `rank * local_vocab` and
+    // mask the ones outside its range, and that position constant is not implemented. Without it
+    // a sharded table silently looks up the wrong rows (the all-reduce that reconstructs the
+    // activation then sums one rank's correct lookup with another's wrong one), so the table
+    // stays whole until the constant lands.
     let embed = plan.slot_id("embed.w").expect("embed is on stage 0");
     assert_eq!(
         plan.slot(embed).shape,
-        vec![124160, 2048],
-        "embed.w [248320, 2048] over {{0: tp}} must localize to [124160, 2048]"
+        vec![248320, 2048],
+        "embed.w is replicated: [248320, 2048] at every degree"
+    );
+    assert!(
+        plan.slot(embed).layout.is_replicated(),
+        "and its layout says so: {:?}",
+        plan.slot(embed).layout
     );
 
     // Stage 1 (rank 63 = pp coordinate 1) instantiates too: its MoE layers localize identically
@@ -317,8 +327,9 @@ fn the_real_shape_join_resolves_declared_axes_end_to_end() {
 /// size / divisor — raised by `instantiate`, which never touches the registry, so it fires
 /// even where no implementation exists.
 ///
-/// With `tp = 3` the very first declared slot already violates it: `embed.w` shards dim 0
-/// (`vocab = 248320`) and `248320 % 3 != 0`.
+/// With `tp = 3` the first declared slot violates it: `linear_attn.in_proj_qkv.q` shards dim 1
+/// (`2048` output channels) and `2048 % 3 != 0`. (It used to be the embedding table until its
+/// vocabulary shard was withdrawn — see the replication note in the shape-join test.)
 #[test]
 fn non_divisible_shard_is_a_named_implementation_free_failure() {
     let expanded = expanded();
@@ -342,11 +353,11 @@ fn non_divisible_shard_is_a_named_implementation_free_failure() {
                     divisor,
                 },
         } => {
-            assert_eq!(*dim, 0, "the failure is on the vocab axis");
-            assert_eq!(*global, 248320, "the global size is the vocab size");
+            assert_eq!(*dim, 1, "the failure is on the output-channel axis");
+            assert_eq!(*global, 2048, "the global size is the projection's width");
             assert_eq!(*divisor, 3, "the divisor is the tp degree");
             assert!(
-                slot.contains("embed"),
+                slot.contains("in_proj_qkv.q"),
                 "the error names the slot, which names the constraint: {slot}"
             );
         }
@@ -355,8 +366,8 @@ fn non_divisible_shard_is_a_named_implementation_free_failure() {
 
     // The message carries all three numbers: the caller reads the constraint off it.
     let text = err.to_string();
-    assert!(text.contains("dim 0"), "{text}");
-    assert!(text.contains("248320"), "{text}");
+    assert!(text.contains("dim 1"), "{text}");
+    assert!(text.contains("2048"), "{text}");
     assert!(text.contains("3"), "{text}");
 }
 
@@ -369,10 +380,10 @@ fn an_axis_the_mesh_does_not_have_names_the_axis_and_slot() {
     let mut declared = expanded.declarations();
     declared
         .slots
-        .get_mut("embed.w")
-        .expect("embed.w declares axes")
-        .get_mut("0")
-        .expect("dim 0 is declared")[0] = "vpp".to_string();
+        .get_mut("lm_head.w")
+        .expect("lm_head.w declares axes")
+        .get_mut("1")
+        .expect("dim 1 is declared")[0] = "vpp".to_string();
 
     let m = mesh(2, 1, 1, 1, 1); // the canonical five axes; no `vpp`
     let err = instantiate(&expanded.plan, &declared, &m, 0, &reference_registry()).unwrap_err();
@@ -380,8 +391,8 @@ fn an_axis_the_mesh_does_not_have_names_the_axis_and_slot() {
         PlanError::UnknownAxis {
             slot, dim, axis, ..
         } => {
-            assert_eq!(slot, "embed.w");
-            assert_eq!(dim, "0");
+            assert_eq!(slot, "lm_head.w");
+            assert_eq!(dim, "1");
             assert_eq!(axis, "vpp");
         }
         other => panic!("expected UnknownAxis naming axis and slot, got {other:?}"),
@@ -598,49 +609,51 @@ fn declarations_expose_the_binding_axes_by_slot_name() {
     assert!(!declared.slots.contains_key("layers.3.mlp.gate"));
 }
 
-/// D4 acceptance prerequisite: an instantiated **real** plan must compile, and the vocabulary-sharded
-/// embedding table is where that first showed a hole.
+/// The embedding table is a lookup, and a lookup is where sharding needs a *position constant*
+/// rather than a collective.
 ///
-/// `embed.w` is declared `{0: tp}` — the vocabulary axis. A lookup is a linear over its table (the
-/// ids select rows), so the same rule that makes a row-parallel `linear` owe a `partial(sum, tp)`
-/// applies here: each rank can only contribute the ids whose rows it owns, and the full activation
-/// is the sum over the group. The rule table therefore classified `embedding` as `Elementwise`,
-/// which asks for the *activation's* layout (replicate for ids) and makes the declared shard on the
-/// table an unconvertible conflict.
+/// `out[s] = W[ids[s]]`: with `W` split along its rows, rank `r` owns rows
+/// `[r * local_vocab, (r + 1) * local_vocab)` — so it must look up `ids[s] - r * local_vocab` and
+/// contribute nothing for ids outside its range. Without that offset the rank looks up the wrong
+/// token (rank 1 reading a global id `t` gets row `local_vocab + t`) and the `all_reduce` that
+/// reconstructs the activation sums one rank's correct lookup with another's wrong one — a
+/// *silent* wrong embedding, which is why the description replicates the table instead
+/// (`docs/design/model-description.md` §4.2 4a keeps the constant on the open list).
 ///
-/// This test drives the whole path — description → instantiate → compile — and asserts both halves:
-/// the instantiated `embed.y` is a `partial(sum, tp)`, and `compile` materializes it with an
-/// `all_reduce` over `tp`.
+/// This test pins the current truth at `tp = 2`: the table is replicated, the activation is
+/// replicated, and no collective is owed.
 #[test]
-fn a_vocabulary_sharded_embedding_compiles_and_owes_an_all_reduce() {
-    use rustrain_parallel::{GroupMask, ReduceOp};
-
+fn the_embedding_table_is_replicated_because_a_sharded_lookup_needs_its_row_offset() {
     let mesh = mesh(2, 1, 1, 1, 1);
     let plan = instantiated(&mesh, 0);
 
-    let tp = GroupMask::single(mesh.index_of("tp").expect("canonical mesh has tp")).unwrap();
-    let embed_y = plan
-        .slots
-        .iter()
-        .find(|slot| slot.name == "embed.y")
-        .expect("the embedding activation slot");
+    let table = plan.slot_id("embed.w").expect("the table slot");
     assert_eq!(
-        embed_y.layout.partial.as_ref().map(|p| (p.op, p.group)),
-        Some((ReduceOp::Sum, tp)),
-        "a vocab-sharded embedding owes a partial sum over tp, not a conflict: {:?}",
+        plan.slot(table).shape,
+        vec![248320, 2048],
+        "the whole table, on every rank"
+    );
+    assert!(plan.slot(table).layout.is_replicated());
+
+    let embed_y_id = plan
+        .slot_id("embed.y")
+        .expect("the embedding activation slot");
+    let embed_y = plan.slot(embed_y_id);
+    assert!(
+        embed_y.layout.partial.is_none(),
+        "a replicated lookup owes no sum: {:?}",
         embed_y.layout
     );
-
-    // The propagation pass must be able to express that layout's conversion: it is the compile step
-    // that failed before the rule table learned this op.
     let propagation =
         propagate(&plan, &reference_registry()).expect("the instantiated plan must propagate");
+    // Other parts of the plan do owe reductions over tp (the row-parallel projections), so the
+    // claim is about the *embedding path*: no inserted collective consumes the lookup's output.
     assert!(
-        propagation
+        !propagation
             .inserted
             .iter()
-            .any(|c| c.op == "intrinsic.all_reduce" && c.group == tp),
-        "propagate must insert the all_reduce that fulfils the embedding's partial: {:?}",
+            .any(|c| c.consumed_slot == embed_y_id),
+        "the embedding activation must not be reconciled by a collective: {:?}",
         propagation
             .inserted
             .iter()
@@ -653,12 +666,14 @@ fn a_vocabulary_sharded_embedding_compiles_and_owes_an_all_reduce() {
 /// pp=2`, rank 0 and the last rank.
 ///
 /// Rank 0 (stage 0) instantiates **and** propagates: the inserted collectives fulfilling its
-/// partials (the first of them the all-reduce that fulfils `embed.y`'s partial over `tp`). The
-/// count moved from 26 to 21 when the operators started declaring their shard rules (ABI v2):
-/// the seven model-specific operators are `pass_through` rather than "unknown, therefore no
-/// derivation", so layouts that used to reconcile through an identity conversion now agree by
-/// construction. A count that moves with a rule *declaration* is the point of moving the rules
-/// out of the framework. The last rank (stage 1) instantiates too
+/// partials. The count moved 26 -> 21 when the operators started declaring their shard rules
+/// (ABI v2: the seven model-specific operators are `pass_through` rather than "unknown, therefore
+/// no derivation", so layouts that used to reconcile through an identity conversion now agree by
+/// construction), and 21 -> 20 when the embedding table stopped being vocab-sharded.
+///
+/// This walk is the *layout* walk alone: the declared-collective pass belongs to `Compiler`, so a
+/// declared reduction (the MoE's, worth one all-reduce per MoE layer) is not in these 20 — and the
+/// compiler's count is larger for exactly that reason. The last rank (stage 1) instantiates too
 /// — shapes and layouts are a function of the global plan, only the node set is the rank's stage.
 ///
 /// What stage 1 cannot do yet is propagate, and the refusal is pinned here on purpose: `embed.y`
@@ -680,7 +695,7 @@ fn the_real_description_instantiates_and_propagates_on_the_acceptance_mesh() {
         .expect("rank 0 must propagate at the acceptance mesh");
     assert_eq!(
         propagation.inserted.len(),
-        21,
+        20,
         "rank 0 inserts the embedding's all-reduce, one per layer's row-parallel projection and \
          one gather per full-attention layer's gate: {:?}",
         propagation
@@ -712,17 +727,10 @@ fn the_real_description_instantiates_and_propagates_on_the_acceptance_mesh() {
         "embed.y crosses the seam as a plan input"
     );
 
-    // The seam refusal: the stage-1 input holds the partial, and the conversion's owner is on
-    // stage 0 — see the doc comment above for why this is a D5 decision, not a D4 bug.
-    let err = propagate(&rank_last, &reference_registry())
-        .expect_err("stage 1 cannot propagate until the seam lands");
-    match err {
-        PlanError::LayoutConflict { held, .. } => {
-            assert!(
-                held.contains("on a model input, which no node can convert"),
-                "the refusal must name the seam problem: {held}"
-            );
-        }
-        other => panic!("expected the seam layout conflict, got {other:?}"),
-    }
+    // Both stages propagate. The seam refusal this test used to pin was `embed.y` crossing the
+    // boundary as a `partial(sum, tp)`: with the vocabulary shard withdrawn the input is
+    // replicated, so nothing partial crosses here — and the cross-stage decision (who owns the
+    // conversion when something *does*) is still open, which is why `run --pp > 1` is refused.
+    propagate(&rank_last, &reference_registry())
+        .expect("stage 1 propagates once nothing partial crosses the seam");
 }

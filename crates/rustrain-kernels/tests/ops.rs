@@ -2165,22 +2165,29 @@ fn moe_layer_hand_values() {
 }
 
 #[test]
-fn moe_layer_declares_the_dispatch_and_combine_all_to_alls() {
-    // The two all_to_all({tp, ep}) collectives are declared, not derivable:
-    // the routing is data (op-vocabulary §4), so the planner learns them only
-    // from this descriptor. dispatch = the h input (io index 0), combine =
-    // the output (io index 10, at offset n_inputs).
+fn moe_layer_declares_the_routing_and_the_tp_reduction() {
+    // Three declarations, none of them derivable from the operands:
+    // * two all_to_all({tp, ep}) — dispatch (the h input, io index 0) and
+    //   combine (the output, io index 10 at offset n_inputs), both data-routing;
+    // * one all_reduce(tp) on the output — the down projection's contraction
+    //   dim (I) is what a tp split cuts, so each rank's output is a partial sum
+    //   over tp. The planner turns *this* one into layout arithmetic: the tensor
+    //   becomes partial(sum, tp) and the walk splices the reduction where a
+    //   consumer first needs a replicated value.
     let o = op("moe_layer");
-    assert_eq!(o.n_collectives, 2);
+    assert_eq!(o.n_collectives, 3);
     assert!(!o.collectives.is_null());
     let cols = unsafe { slice::from_raw_parts(o.collectives, o.n_collectives as usize) };
     let tp_ep = RsGroupKind::from_raw(RsGroupKind::TP.raw() | RsGroupKind::EP.raw());
-    for (i, c) in cols.iter().enumerate() {
+    for (i, c) in cols.iter().take(2).enumerate() {
         assert_eq!(c.kind, RsCollectiveKind::ALL_TO_ALL, "collective {i} kind");
         assert_eq!(c.group, tp_ep, "collective {i} group must be {{tp, ep}}");
     }
     assert_eq!(cols[0].tensor_index, 0, "dispatch sends the h input");
     assert_eq!(cols[1].tensor_index, 10, "combine assembles the output");
+    assert_eq!(cols[2].kind, RsCollectiveKind::ALL_REDUCE, "the reduction");
+    assert_eq!(cols[2].group, RsGroupKind::TP, "the reduction is over tp");
+    assert_eq!(cols[2].tensor_index, 10, "the reduction sums the output");
 }
 
 #[test]

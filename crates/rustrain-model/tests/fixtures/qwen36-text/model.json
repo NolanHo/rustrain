@@ -2256,12 +2256,7 @@
  "binding": [
   {
    "slot": "embed.w",
-   "source": "model.language_model.embed_tokens.weight",
-   "axes": {
-    "0": [
-     "tp"
-    ]
-   }
+   "source": "model.language_model.embed_tokens.weight"
   },
   {
    "slot": "norm.w",

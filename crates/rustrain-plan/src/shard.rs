@@ -580,9 +580,25 @@ pub fn derive(
             let first = inputs
                 .first()
                 .ok_or_else(|| DeriveError::PassThroughWithoutInput { op: op.to_string() })?;
+            // The shards follow input 0; a **partial** declared on an output
+            // stays, because it states something the operands cannot: an
+            // operator whose math sums over a split dim (a fused MoE) declares
+            // it, and that declaration is what makes its completion land at the
+            // consumer instead of nowhere.
+            let outputs = declared_outputs
+                .iter()
+                .zip(output_ranks)
+                .map(|(declared, &rank)| {
+                    let mut out = canonicalize(first, rank);
+                    if declared.partial.is_some() {
+                        out.partial = declared.partial;
+                    }
+                    out
+                })
+                .collect();
             DerivedShards {
                 required_inputs: inputs.clone(),
-                outputs: vec![first.clone(); declared_outputs.len()],
+                outputs,
             }
         }
     };

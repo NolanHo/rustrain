@@ -1165,9 +1165,46 @@ fn check(args: CheckArgs) -> Result<()> {
                     ),
                     stage_counts,
                 ));
-                match rustrain_plan::shard::propagate(stage_zero, &registry) {
-                    Err(e) => {
-                        report.checks.push(CheckItem::fail(
+                // The declared collectives are applied here exactly as the compiler applies
+                // them: a propagation that did not see the MoE's declared partial sum would
+                // report a smaller collective count than `l1.compile`, and the smaller number
+                // is the one that would look reassuring.
+                let compiler =
+                    rustrain_plan::Compiler::new(&registry, &recipe, TargetEnv::default());
+                // The declaration pass resolves operators, so it must see the plan at the dtype
+                // being checked — the same one `l1.compile` will see.
+                let declared =
+                    compiler.declared_collectives(&at_checked_dtype(stage_zero, override_dtype));
+                // The declaration pass resolves operators, so it can hit the same host limit the
+                // availability item reports: at a dtype nothing implements, the three
+                // propagation items cannot run and say so instead of blaming the plan. A
+                // declaration the planner cannot express is a different matter — that is a
+                // refusal about the plan, and it fails here.
+                let unresolved = matches!(declared, Err(rustrain_plan::PlanError::Resolve { .. }));
+                let propagation = match declared {
+                    Ok((plan, _)) => rustrain_plan::shard::propagate(&plan, &registry),
+                    Err(error) => Err(error),
+                };
+                if unresolved {
+                    for id in [
+                        "l1.layout_propagation",
+                        "l1.partial_fulfillment",
+                        "l1.collective_axes",
+                    ] {
+                        report.checks.push(CheckItem::skip(
+                            id,
+                            format!(
+                                "not evaluated: forward propagation resolves the operators that \
+                                 declare communication, and nothing available on this host \
+                                 implements them at this dtype — see \
+                                 `l1.implementation_availability`; {PROPAGATION_SCOPE}"
+                            ),
+                        ));
+                    }
+                } else {
+                    match propagation {
+                        Err(e) => {
+                            report.checks.push(CheckItem::fail(
                             "l1.layout_propagation",
                             format!(
                                 "sharding does not propagate on the stage-0 (rank 0) plan: {e}; \
@@ -1175,28 +1212,29 @@ fn check(args: CheckArgs) -> Result<()> {
                             ),
                             Vec::new(),
                         ));
-                        for id in ["l1.partial_fulfillment", "l1.collective_axes"] {
-                            report.checks.push(CheckItem::skip(
-                                id,
-                                format!(
-                                    "not evaluated: layout propagation did not succeed on the \
+                            for id in ["l1.partial_fulfillment", "l1.collective_axes"] {
+                                report.checks.push(CheckItem::skip(
+                                    id,
+                                    format!(
+                                        "not evaluated: layout propagation did not succeed on the \
                                      stage-0 (rank 0) plan; {PROPAGATION_SCOPE}"
-                                ),
-                            ));
+                                    ),
+                                ));
+                            }
                         }
-                    }
-                    Ok(propagation) => {
-                        report.checks.push(CheckItem::pass(
-                            "l1.layout_propagation",
-                            format!(
-                                "sharding propagated on the stage-0 (rank 0) plan: {} \
+                        Ok(propagation) => {
+                            report.checks.push(CheckItem::pass(
+                                "l1.layout_propagation",
+                                format!(
+                                    "sharding propagated on the stage-0 (rank 0) plan: {} \
                                  collective(s) inserted to reconcile declared and derived \
                                  layouts; {PROPAGATION_SCOPE}",
-                                propagation.inserted.len()
-                            ),
-                        ));
-                        report.checks.push(partial_fulfillment(&propagation));
-                        report.checks.push(collective_axes(&propagation, mesh));
+                                    propagation.inserted.len()
+                                ),
+                            ));
+                            report.checks.push(partial_fulfillment(&propagation));
+                            report.checks.push(collective_axes(&propagation, mesh));
+                        }
                     }
                 }
             }
@@ -1232,17 +1270,7 @@ fn check(args: CheckArgs) -> Result<()> {
         }
     }
 
-    // `--dtype` is an L1 input (C6): the compile items must ask the operators about the precision
-    // being *checked*, not about the one the description happens to declare. Without this a
-    // `--dtype f32` run on a bf16 description compiles a bf16 plan, the f32-only reference provider
-    // refuses it, and the report would call the host's limits a plan defect.
-    let checked_stage_zero = stage_zero.map(|plan| {
-        let mut plan = plan;
-        for slot in &mut plan.slots {
-            slot.dtype = checked_dtype(slot.dtype, override_dtype);
-        }
-        plan
-    });
+    let checked_stage_zero = stage_zero.map(|plan| at_checked_dtype(&plan, override_dtype));
     report.checks.extend(compile_dependent_l1_checks(
         expanded.is_some(),
         checked_stage_zero.as_ref(),
@@ -1556,6 +1584,22 @@ fn collective_axes(propagation: &rustrain_plan::shard::ShardPropagation, mesh: &
     )
 }
 
+/// The plan as the dtype being **checked** sees it (C6): `--dtype` is an L1 input, so the checks
+/// that resolve or compile must ask the operators about that precision rather than about the one
+/// the description happens to declare. Without this a `--dtype f32` run on a bf16 description
+/// compiles a bf16 plan, the f32-only reference provider refuses it, and the report would blame
+/// the plan for the host's limits.
+fn at_checked_dtype(
+    plan: &rustrain_plan::Plan,
+    override_dtype: Option<RsDtype>,
+) -> rustrain_plan::Plan {
+    let mut plan = plan.clone();
+    for slot in &mut plan.slots {
+        slot.dtype = checked_dtype(slot.dtype, override_dtype);
+    }
+    plan
+}
+
 /// C2's three compile-dependent L1 sub-checks, run for real: the stage-0 plan goes through
 /// `Plan::compile` — resolution, shape inference, layout propagation's collectives, and the memory
 /// plan — and each item reports one part of what that pass proves.
@@ -1629,16 +1673,34 @@ fn compile_dependent_l1_checks(
                     Vec::new(),
                 )
             };
-            let compile = CheckItem::pass(
-                "l1.compile",
-                format!(
-                    "the stage-0 (rank 0) plan compiles: {} step(s), {} inserted collective(s), \
-                     digest {}",
-                    compiled.steps.len(),
-                    compiled.inserted.len(),
-                    compiled.digest
-                ),
-            );
+            let compile = if compiled.warnings.is_empty() {
+                CheckItem::pass(
+                    "l1.compile",
+                    format!(
+                        "the stage-0 (rank 0) plan compiles: {} step(s), {} inserted collective(s), \
+                         digest {}",
+                        compiled.steps.len(),
+                        compiled.inserted.len(),
+                        compiled.digest
+                    ),
+                )
+            } else {
+                // A plan that carries notes is still a plan; hiding them would make the
+                // count the only thing a reader sees. The budget warning and the
+                // declaration notes both live here.
+                CheckItem::pass_with_details(
+                    "l1.compile",
+                    format!(
+                        "the stage-0 (rank 0) plan compiles with {} note(s): {} step(s), {} \
+                         inserted collective(s), digest {}",
+                        compiled.warnings.len(),
+                        compiled.steps.len(),
+                        compiled.inserted.len(),
+                        compiled.digest
+                    ),
+                    compiled.warnings.clone(),
+                )
+            };
             vec![compile, shapes, allocation]
         }
         Err(rustrain_plan::PlanError::Resolve { node, ref op, .. }) => {

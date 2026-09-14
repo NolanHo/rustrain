@@ -8,9 +8,9 @@
 
 use serde::Serialize;
 
-use rustrain_abi::ffi::{RsDeviceKind, RsNumerics, RsTensor};
+use rustrain_abi::ffi::{RsCollectiveKind, RsDeviceKind, RsGroupKind, RsNumerics, RsTensor};
 use rustrain_ops::{Phase, Recipe, RegisteredOp, Registry, ResolveRequest, TargetEnv};
-use rustrain_parallel::{GroupMask, MeshFingerprint, ParallelLayout, ReduceOp};
+use rustrain_parallel::{GroupMask, Mesh, MeshFingerprint, ParallelLayout, ReduceOp};
 
 use crate::PlanError;
 use crate::attrs::{AbiAttrs, AttrValue};
@@ -265,6 +265,185 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// Applies the operators' declared collectives to a plan and hands back the
+    /// notes.
+    ///
+    /// Public because a gate that walks the plan for its own reasons (`check`'s
+    /// propagation item) must walk the **same** plan the compiler will: two
+    /// passes that disagree about which tensors are partial would report two
+    /// different collective counts for one plan, and the smaller one would be
+    /// the reassuring one.
+    pub fn declared_collectives(&self, plan: &Plan) -> Result<(Plan, Vec<String>), PlanError> {
+        let mesh = plan
+            .meta
+            .mesh
+            .to_mesh()
+            .map_err(|source| PlanError::Mesh { source })?;
+        self.apply_declared_collectives(plan, &mesh)
+    }
+
+    /// Turns the operators' **declared** collectives into plan facts.
+    ///
+    /// An operator whose math is not visible in its operands declares the
+    /// communication it owes — `moe_layer` is the case that matters: its two
+    /// expert projections split the intermediate dim, so its output is a
+    /// *partial sum* over that group, and nothing in the incoming layouts says
+    /// so. The planner's job is to make the declaration true.
+    ///
+    /// * `ALL_REDUCE` over a group: the tensor the declaration points at
+    ///   becomes `partial(sum, group)`. The declaration says *what* is partial;
+    ///   the layout algebra still decides *where* the completion lands, because
+    ///   the reduction is owed at the first consumer that needs a replicated
+    ///   value. Declaring the partial and letting the walk place the collective
+    ///   is the whole point: two mechanisms that both emit all-reduces would
+    ///   disagree eventually.
+    /// * anything else — the routing `ALL_TO_ALL`, a `CP` state gather — has no
+    ///   expression in the layout algebra yet, so a group with more than one
+    ///   rank is **refused by name**. A group of one is inert by definition
+    ///   (there is nothing to redistribute), and expert parallelism of one is
+    ///   exactly that case: with no expert sharding there is nothing to route.
+    ///
+    /// Resolution runs here as well as in pass 1; a node's implementation is a
+    /// pure function of the plan and the environment, so asking twice costs a
+    /// lookup and keeps the two passes from needing different plans.
+    fn apply_declared_collectives(
+        &self,
+        plan: &Plan,
+        mesh: &Mesh,
+    ) -> Result<(Plan, Vec<String>), PlanError> {
+        let mut out = plan.clone();
+        // Notes are aggregated: 41 MoE layers declaring the same two routings
+        // are one fact about the plan, not 82 lines about the plan.
+        let mut notes: std::collections::BTreeMap<String, (usize, usize)> =
+            std::collections::BTreeMap::new();
+        for (i, node) in plan.nodes.iter().enumerate() {
+            if intrinsic::is_intrinsic(&node.op.name) {
+                continue;
+            }
+            let (op, _) = self.resolve_node(NodeId(i), plan, node)?;
+            for declaration in op.collectives() {
+                let group = group_mask(mesh, declaration.group);
+                let degree = group
+                    .degree(mesh)
+                    .map_err(|error| PlanError::DeclaredCollective {
+                        node: NodeId(i),
+                        op: node.op.name.clone(),
+                        reason: format!("group {group} is not a group of this mesh: {error}"),
+                    })?;
+                if degree == 1 {
+                    continue;
+                }
+                let n_inputs = node.inputs.len();
+                let index = declaration.tensor_index as usize;
+                let is_output = index >= n_inputs;
+                let slot = if is_output {
+                    node.outputs.get(index - n_inputs).copied().ok_or_else(|| {
+                        PlanError::DeclaredCollective {
+                            node: NodeId(i),
+                            op: node.op.name.clone(),
+                            reason: format!(
+                                "the declaration points at tensor {} of an operator with {} \
+                                 input(s) and {} output(s)",
+                                declaration.tensor_index,
+                                n_inputs,
+                                node.outputs.len()
+                            ),
+                        }
+                    })?
+                } else {
+                    node.inputs[index]
+                };
+                match declaration.kind {
+                    RsCollectiveKind::ALL_REDUCE => {
+                        if !is_output {
+                            return Err(PlanError::DeclaredCollective {
+                                node: NodeId(i),
+                                op: node.op.name.clone(),
+                                reason: format!(
+                                    "an ALL_REDUCE declaration points at input {}, but a reduction \
+                                     produces a value: declare it on the output whose sum it is",
+                                    declaration.tensor_index
+                                ),
+                            });
+                        }
+                        let slot_mut = out.slot_mut(slot);
+                        if let Some(existing) = &slot_mut.layout.partial {
+                            return Err(PlanError::DeclaredCollective {
+                                node: NodeId(i),
+                                op: node.op.name.clone(),
+                                reason: format!(
+                                    "slot `{}` already carries {existing:?} and the operator \
+                                     also declares an all-reduce over {group}; one tensor cannot \
+                                     be two partial sums",
+                                    slot_mut.name
+                                ),
+                            });
+                        }
+                        slot_mut.layout.partial = Some(rustrain_parallel::PartialSpec {
+                            op: ReduceOp::Sum,
+                            group,
+                        });
+                    }
+                    other => {
+                        // Routing over a group whose expert-parallel part is a
+                        // single rank has nothing to route: `ep = 1` means no
+                        // expert is distributed, the hidden state every route
+                        // reads is replicated, and the intermediate dim's split
+                        // is the `ALL_REDUCE` above. That is an evaluation of
+                        // the declaration, not a relaxation of it — but the
+                        // note records the reasoning, because "the operator
+                        // declared a collective and the plan has none" is
+                        // exactly the sentence an auditor should find.
+                        let expert_degree =
+                            group_mask(mesh, RsGroupKind::EP).degree(mesh).unwrap_or(1);
+                        if other.raw() == 4 && expert_degree == 1 {
+                            let key = format!(
+                                "{} declares expert routing (all_to_all) over {} on tensor {}: the \
+                                 ep axis has degree 1, so no expert is distributed and the routing \
+                                 is the identity — skipped rather than spliced",
+                                node.op.name,
+                                declaration.kind.raw(),
+                                declaration.tensor_index
+                            );
+                            let entry = notes.entry(key).or_insert((0, i));
+                            entry.0 += 1;
+                            continue;
+                        }
+                        // Expert routing is the one refusal with a name of its
+                        // own, because it is the case that will come back: the
+                        // declaration is right, the planner is incomplete.
+                        let what = match other.raw() {
+                            4 => "expert-parallel routing (all_to_all dispatch/combine)",
+                            1 => "a cross-rank all_gather",
+                            2 => "a cross-rank reduce_scatter",
+                            3 => "a point-to-point exchange",
+                            _ => "a collective this framework does not know",
+                        };
+                        return Err(PlanError::DeclaredCollective {
+                            node: NodeId(i),
+                            op: node.op.name.clone(),
+                            reason: format!(
+                                "the operator declares {what} over {} on tensor {}, and the \
+                                 planner has no expression for it yet; the plan would be missing \
+                                 communication the operator's math owes, so it is refused rather \
+                                 than run",
+                                declaration.kind.raw(),
+                                declaration.tensor_index
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        // One line per distinct declaration, with how many nodes made it and
+        // the first of them as the example.
+        let notes = notes
+            .into_iter()
+            .map(|(what, (count, first))| format!("{count} node(s) (first {first}): {what}"))
+            .collect();
+        Ok((out, notes))
+    }
+
     /// Declares which memory strategies the runtime can actually execute.
     pub fn capabilities(mut self, caps: crate::memory::RuntimeCapabilities) -> Self {
         self.caps = caps;
@@ -291,7 +470,12 @@ impl<'a> Compiler<'a> {
             .to_mesh()
             .map_err(|source| PlanError::Mesh { source })?;
 
-        let propagation = shard::propagate(plan, self.registry)?;
+        // Pass 0: the operators' **declared** collectives become plan facts
+        // before the layout walk runs, because the walk is what turns them into
+        // spliced communication.
+        let (plan, declaration_notes) = self.apply_declared_collectives(plan, &mesh)?;
+
+        let propagation = shard::propagate(&plan, self.registry)?;
         let plan = propagation.plan;
 
         // Pass 1: resolve everything first. The memory pass has to ask each
@@ -335,7 +519,7 @@ impl<'a> Compiler<'a> {
             self.caps,
             align_bytes,
         )?;
-        let mut warnings: Vec<String> = Vec::new();
+        let mut warnings: Vec<String> = declaration_notes;
         if let Err(over) = memory::enforce_budget(&memory, &plan) {
             warnings.push(over.to_string());
         }
@@ -933,6 +1117,30 @@ fn compute_digest(
 /// The layout a slot ended up with, for diagnostics and tests.
 pub fn slot_layout(plan: &Plan, id: SlotId) -> &ParallelLayout {
     &plan.slot(id).layout
+}
+
+/// A declared collective's group, as the mesh's axis bits.
+///
+/// `RsGroupKind` names the framework's own axes (`tp`/`cp`/`ep`/`dp` — the same
+/// names the CLI flags and the description's bindings use), so the translation
+/// is a lookup by name and an axis the mesh does not have simply contributes
+/// nothing (a degree-1 axis is not a distribution).
+fn group_mask(mesh: &Mesh, group: RsGroupKind) -> GroupMask {
+    let mut bits = 0u32;
+    for (kind, name) in [
+        (RsGroupKind::TP, "tp"),
+        (RsGroupKind::CP, "cp"),
+        (RsGroupKind::EP, "ep"),
+        (RsGroupKind::DP, "dp"),
+    ] {
+        if group.raw() & kind.raw() == 0 {
+            continue;
+        }
+        if let Some(axis) = mesh.index_of(name) {
+            bits |= 1 << axis;
+        }
+    }
+    GroupMask::from_bits(bits)
 }
 
 /// The message an implementation recorded for the failure it just returned.

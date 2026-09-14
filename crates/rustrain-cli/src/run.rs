@@ -1803,12 +1803,14 @@ mod tests {
             "every node and every inserted collective is a step"
         );
         // The declared tp/ep sharding on degree-1 axes still reconciles through identity
-        // collectives at world size 1. The count moved from 53 to 42 when the operators started
-        // declaring their shard rules (ABI v2): the model-specific operators are `pass_through`
-        // instead of "unknown, therefore no derivation", so eleven layouts (one per full-attention
-        // layer's attention output) now agree with their producers by construction rather than
-        // through an identity conversion. The exact count is pinned by the check gate too.
-        assert_eq!(compiled.inserted.len(), 42);
+        // collectives at world size 1. The count moved 53 -> 42 when the operators started
+        // declaring their shard rules (ABI v2: the model-specific operators are `pass_through`
+        // instead of "unknown, therefore no derivation", so eleven layouts now agree with their
+        // producers by construction), and 42 -> 41 when the embedding table stopped being
+        // vocab-sharded: a sharded lookup needs its rows offset by rank, that position constant is
+        // not implemented, and replicating the table is exact at every degree. The exact count is
+        // pinned by the check gate too.
+        assert_eq!(compiled.inserted.len(), 41);
     }
 
     /// The same surgery at `tp = 2`: this is the regression for the ABI v2 rule

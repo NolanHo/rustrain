@@ -135,6 +135,13 @@ pub enum PlanError {
         reason: String,
     },
 
+    #[error("node {node:?} ({op}) declares communication the planner cannot express: {reason}")]
+    DeclaredCollective {
+        node: NodeId,
+        op: String,
+        reason: String,
+    },
+
     #[error("no sharding rule applies to node {node:?}: {source}")]
     ShardDerivation {
         node: NodeId,

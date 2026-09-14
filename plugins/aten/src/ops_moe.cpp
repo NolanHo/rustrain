@@ -193,6 +193,22 @@ int32_t moe_execute(rs_ctx*, const rs_tensor* const* in, uint32_t n_in, rs_tenso
 
 }  // namespace
 
+namespace {
+
+/// The communication this operator's math owes, declared because the layouts
+/// cannot show it: the routing is data, and the intermediate dim a tp split
+/// cuts is the contraction dim of the down projections, so the output is a
+/// partial sum over tp. The planner turns the ALL_REDUCE into a
+/// `partial(sum, tp)` and places the reduction at the consumer that needs a
+/// replicated value; the two ALL_TO_ALL are the expert dispatch/combine.
+const rs_collective kMoeCollectives[] = {
+    {RS_C_ALL_TO_ALL, static_cast<rs_group_kind>(RS_G_TP | RS_G_EP), 0, 0},
+    {RS_C_ALL_TO_ALL, static_cast<rs_group_kind>(RS_G_TP | RS_G_EP), 10, 0},
+    {RS_C_ALL_REDUCE, RS_G_TP, 10, 0},
+};
+
+}  // namespace
+
 void add_moe_ops(std::vector<OpDef>& ops) {
     ops.push_back(OpDef{"moe_layer", RS_SHARD_PASS_THROUGH,
                         "Qwen3.6's sparse MoE layer as one operator: ten inputs (h, routing "
@@ -200,7 +216,8 @@ void add_moe_ops(std::vector<OpDef>& ops) {
                         "projections and the shared expert), dropless routing, per-token sum "
                         "over the selected experts plus the sigmoid-gated shared expert.",
                         (1u << RS_F32) | (1u << RS_I32) | (1u << RS_I64), RS_AUTODIFF, moe_infer,
-                        moe_execute});
+                        moe_execute,
+                        /* expansion = */ nullptr, kMoeCollectives, 3});
 }
 
 }  // namespace rsaten

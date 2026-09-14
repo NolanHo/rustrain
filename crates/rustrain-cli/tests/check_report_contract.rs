@@ -73,6 +73,15 @@ const C6_CHECK_IDS: [&str; 16] = [
 /// constant `skip` set but a dtype-dependent one.
 const COMPILE_DEPENDENT_IDS: [&str; 3] = ["l1.compile", "l1.operator_shapes", "l1.slot_allocation"];
 
+/// The three propagation items resolve the operators that **declare** communication (an
+/// operator's declared collectives are what make its output partial), so they need
+/// implementations of their own — the same host limit as the compile items, one step earlier.
+const DECLARATION_DEPENDENT_IDS: [&str; 3] = [
+    "l1.layout_propagation",
+    "l1.partial_fulfillment",
+    "l1.collective_axes",
+];
+
 /// The `skip` set of an accepted run **at `--dtype f32`**: every node of the real fixture resolves,
 /// so the compiler runs, and no item is skipped at all.
 const EXPECTED_SKIPS: [&str; 0] = [];
@@ -81,10 +90,13 @@ const EXPECTED_SKIPS: [&str; 0] = [];
 /// `f32` only, so every node is unresolved and implementation availability joins the three
 /// compile-dependent skips as the fourth — with its reasons spelled out (C2 makes an unresolved
 /// primitive a skip, never a fail and never a silent pass).
-const BF16_EXPECTED_SKIPS: [&str; 4] = [
+const BF16_EXPECTED_SKIPS: [&str; 7] = [
+    "l1.collective_axes",
     "l1.compile",
     "l1.implementation_availability",
+    "l1.layout_propagation",
     "l1.operator_shapes",
+    "l1.partial_fulfillment",
     "l1.slot_allocation",
 ];
 
@@ -194,15 +206,6 @@ const IGNORED_TENSORS: i64 = 333;
 /// counts, where a no-op cannot hide.
 const STAGE0_ONLY: [&str; 1] = ["stage 0 (rank 0): 1285 node(s), 2222 slot(s)"];
 
-/// **C5's witness at the five-axis acceptance mesh**: the per-stage node/slot counts a real
-/// `instantiate` produces after PP pruning. `instantiate` replaced by `return Ok(plan.clone())`
-/// reports 1285 node(s)/2222 slot(s) for *both* stages and turns this gate red — the tripwire
-/// the reviewer's no-op attack walks into.
-const FIVE_AXIS_STAGES: [&str; 2] = [
-    "stage 0 (rank 0): 626 node(s), 1083 slot(s)",
-    "stage 1 (rank 32): 659 node(s), 1142 slot(s)",
-];
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Status {
     Pass,
@@ -242,9 +245,9 @@ const EXPECTED_STATUS: [(&str, Status); 15] = [
     ("l1.instantiate", Status::Pass),
     ("l1.compile", Status::Skip),
     ("l1.operator_shapes", Status::Skip),
-    ("l1.layout_propagation", Status::Pass),
-    ("l1.partial_fulfillment", Status::Pass),
-    ("l1.collective_axes", Status::Pass),
+    ("l1.layout_propagation", Status::Skip),
+    ("l1.partial_fulfillment", Status::Skip),
+    ("l1.collective_axes", Status::Skip),
     ("l1.slot_allocation", Status::Skip),
     ("l1.implementation_availability", Status::Skip),
     ("l1.binding_coverage", Status::Pass),
@@ -256,12 +259,12 @@ const EXPECTED_STATUS: [(&str, Status); 15] = [
 ];
 
 /// The status table a run expects, derived from [`EXPECTED_STATUS`] with the dtype-dependent ids
-/// overridden. All four are the same fact: when every node resolves on this host, availability is a
-/// `pass` **and** compilation runs — so `l1.compile`, `l1.operator_shapes` and `l1.slot_allocation`
-/// are real checks; when resolution fails (bf16 against the f32-only reference provider) the
-/// compiler stops at resolution, and all four are `skip` with reasons.
+/// overridden. All seven are one fact: when every node resolves on this host, availability is a
+/// `pass`, the propagation walk runs, and the compiler runs — so the propagation items and the
+/// three compile items are real checks; when resolution fails (bf16 against the f32-only reference
+/// provider) the walk stops at resolution and all seven are `skip` with reasons.
 ///
-/// The remaining eleven ids are dtype-independent and stay pinned in one place.
+/// The remaining eight ids are dtype-independent and stay pinned in one place.
 fn expected_status_for(availability: &Availability) -> BTreeMap<String, Status> {
     let mut map: BTreeMap<String, Status> = EXPECTED_STATUS
         .iter()
@@ -275,6 +278,9 @@ fn expected_status_for(availability: &Availability) -> BTreeMap<String, Status> 
     };
     map.insert("l1.implementation_availability".to_string(), status);
     for id in COMPILE_DEPENDENT_IDS {
+        map.insert(id.to_string(), status);
+    }
+    for id in DECLARATION_DEPENDENT_IDS {
         map.insert(id.to_string(), status);
     }
     map
@@ -855,10 +861,13 @@ fn a_rejected_argument_emits_the_sixteenth_id_and_changes_nothing_else() {
     );
 
     for (id, status) in &accepted {
-        if id == "l1.implementation_availability" || COMPILE_DEPENDENT_IDS.contains(&id.as_str()) {
+        let dtype_decides = id == "l1.implementation_availability"
+            || COMPILE_DEPENDENT_IDS.contains(&id.as_str())
+            || DECLARATION_DEPENDENT_IDS.contains(&id.as_str());
+        if dtype_decides {
             // The statuses the dtype legitimately decides: the fallback run is bf16 (nothing
-            // resolves, so availability and the three compile-dependent items are `skip`), the
-            // accepted run is f32 (all four are real checks). See the doc comment.
+            // resolves, so availability, the propagation items and the compile items are all
+            // `skip`), the accepted run is f32 (all seven are real checks). See the doc comment.
             continue;
         }
         assert_eq!(
@@ -881,22 +890,88 @@ fn a_rejected_argument_emits_the_sixteenth_id_and_changes_nothing_else() {
     );
 }
 
-/// **D4's headline acceptance.** The five-axis mesh `tp=2, cp=2, ep=4, dp=2, pp=2` must produce
-/// exactly the same report an accepted run does: every id, every status, every counter, the same
-/// availability result — and exit 0. `instantiate` runs for real on one representative rank per
-/// stage (C5's witness pins the pruned per-stage counts), and the three propagation checks run
-/// on stage 0 (rank 0), so the whole status table (with the four `pass` items D4 made real) is
-/// re-pinned at the acceptance mesh, not only at the trivial all-ones mesh.
+/// **D4's headline acceptance, re-pinned by D6.** The five-axis mesh
+/// `tp=2, cp=2, ep=4, dp=2, pp=2` used to exit 0: `instantiate` ran for real on one
+/// representative rank per stage and the propagation checks ran on stage 0, so the whole status
+/// table was re-pinned at the acceptance mesh.
+///
+/// It no longer exits 0, and that is the honest answer. The mesh shards the experts over `ep`, so
+/// the MoE layer's declared `all_to_all` routing is genuinely needed — and the planner has no
+/// expression for it yet. A run that skipped it would compute a plan whose math is missing
+/// communication, so `l1.compile` fails and names the operator, the kind, the group and the tensor.
+/// `tp=2` (which needs only the declared `all_reduce`, and that *is* expressible) passes.
 #[test]
-fn the_five_axis_acceptance_mesh_exits_zero_with_the_same_report() {
-    let (doc, items) = accepted_run(
-        &[
-            "--dtype", "f32", "--tp", "2", "--cp", "2", "--ep", "4", "--dp", "2", "--pp", "2",
-        ],
-        "f32",
-        &F32_AVAILABILITY,
+fn the_five_axis_mesh_is_refused_naming_the_unwired_expert_routing() {
+    let run = check(&[
+        "--dtype", "f32", "--tp", "2", "--cp", "2", "--ep", "4", "--dp", "2", "--pp", "2",
+    ]);
+    assert_eq!(
+        run.code,
+        Some(1),
+        "a mesh whose declared routing cannot be spliced must not report success\n{}",
+        run.stdout
     );
-    assert_details(&doc, &items, &F32_AVAILABILITY, &FIVE_AXIS_STAGES);
+    let doc = run.json();
+    let items = items(&doc);
+    let observed = statuses(&items);
+    // The degrees are accepted, so the report carries the fifteen ids of an accepted run.
+    let accepted: Vec<&str> = C6_CHECK_IDS
+        .iter()
+        .copied()
+        .filter(|id| *id != "cli.arguments")
+        .collect();
+    assert_id_set(&observed, &accepted, "five-axis mesh");
+    let compile = items
+        .iter()
+        .find(|item| item.id == "l1.compile")
+        .expect("l1.compile must be present");
+    assert_eq!(
+        compile.status,
+        Status::Fail,
+        "the unwired routing is a compile failure: {}\n{}",
+        compile.reason,
+        run.stdout
+    );
+    // `cp = 2` makes the linear-attention layer's declared CP state gather the first unwired
+    // declaration in emission order; the expert routing is the second. The walk names whichever
+    // it meets first, and both are real.
+    assert!(
+        compile.reason.contains("gated_delta_rule")
+            && compile.reason.contains("all_gather")
+            && compile.reason.contains("no expression for it yet"),
+        "the refusal must name the operator, the kind and the missing wiring: {}",
+        compile.reason
+    );
+    // The instantiated stage counts are still the D4 witness: refusal happens at compile, after
+    // every stage instantiated.
+    let instantiate = items
+        .iter()
+        .find(|item| item.id == "l1.instantiate")
+        .expect("l1.instantiate must be present");
+    assert_eq!(instantiate.status, Status::Pass);
+
+    // Without `cp`, the first unwired declaration is the expert routing: `ep = 2` shards the
+    // experts, so tokens must be dispatched and the planner cannot do it.
+    let run = check(&["--dtype", "f32", "--ep", "2"]);
+    assert_eq!(
+        run.code,
+        Some(1),
+        "an unwired routing must not report success"
+    );
+    let doc = run.json();
+    let ep_items = crate::items(&doc);
+    let compile = ep_items
+        .iter()
+        .find(|item| item.id == "l1.compile")
+        .expect("l1.compile must be present");
+    assert_eq!(compile.status, Status::Fail);
+    assert!(
+        compile.reason.contains("moe_layer")
+            && compile.reason.contains("expert-parallel routing")
+            && compile.reason.contains("all_to_all"),
+        "the refusal must name the operator, the wiring and the kind: {}",
+        compile.reason
+    );
 }
 
 /// **D4's rejection acceptance.** `--tp 3` must exit non-zero and name the constraint the
@@ -936,13 +1011,17 @@ fn a_non_divisible_degree_exits_non_zero_naming_the_constraint() {
         "the non-divisible shard must be an `l1.instantiate` failure"
     );
     let text = format!("{} {}", instantiate.reason, run.stdout);
+    // The first weight a `tp = 3` mesh cannot divide is the linear-attention q projection
+    // (2048 channels over 3 ranks). The embedding table used to be first, until its vocabulary
+    // shard was withdrawn: a sharded lookup needs its rows offset by rank, that position constant
+    // is not implemented, and replicating the table is exact at every degree.
     assert!(
-        text.contains("dim 0") && text.contains("248320") && text.contains('3'),
+        text.contains("dim 1") && text.contains("2048") && text.contains('3'),
         "the failure must name the constraint — the dim, the global size and the divisor: {}",
         instantiate.reason
     );
     assert!(
-        text.contains("embed.w"),
+        text.contains("linear_attn.in_proj_qkv.q"),
         "the failure names the slot, which names the constraint: {}",
         instantiate.reason
     );
