@@ -22,7 +22,8 @@ pub mod shard;
 
 pub use attrs::{AbiAttrs, AttrValue, Attrs};
 pub use compile::{CompiledPlan, CompiledStep, Compiler, ResolvedNode, StreamId};
-pub use instantiate::{DeclaredAxes, InstanceStage, instantiate, instantiate_stages};
+pub use rustrain_parallel::ShardMode;
+pub use instantiate::{DeclaredAxes, InstanceStage, instantiate, instantiate_stages, DeclaredAxis};
 pub use ir::{
     CheckpointPolicy, NodeId, OpRef, Phase, Plan, PlanBuilder, PlanMeta, PlanNode,
     PrecisionOverride, Slot, SlotId, SlotKind, StreamPolicy, Trace, intrinsic,

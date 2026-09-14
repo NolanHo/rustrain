@@ -36,7 +36,7 @@ fn constructors_and_accessors() {
     assert!(!shard.is_replicated());
     assert_eq!(
         shard.dims,
-        vec![rustrain_parallel::ShardSpec { dim: -1, group: tp }]
+        vec![rustrain_parallel::ShardSpec::shard(-1, tp)]
     );
     assert_eq!(shard.groups(), vec![tp]);
 
@@ -55,8 +55,8 @@ fn multi_shard_layout_shards_two_dims() {
 
     let layout = ParallelLayout {
         dims: vec![
-            rustrain_parallel::ShardSpec { dim: 0, group: ep },
-            rustrain_parallel::ShardSpec { dim: 1, group: tp },
+            rustrain_parallel::ShardSpec::shard(0, ep),
+            rustrain_parallel::ShardSpec::shard(1, tp),
         ],
         partial: None,
     };
@@ -91,8 +91,8 @@ fn d3_acceptance_qwen36_gate_up_proj_local_shape() {
 
     let gate_segment = ParallelLayout {
         dims: vec![
-            rustrain_parallel::ShardSpec { dim: 0, group: ep },
-            rustrain_parallel::ShardSpec { dim: 1, group: tp },
+            rustrain_parallel::ShardSpec::shard(0, ep),
+            rustrain_parallel::ShardSpec::shard(1, tp),
         ],
         partial: None,
     };
@@ -148,8 +148,8 @@ fn shards_on_the_same_dim_compound() {
     let tp = axis(&m, "tp");
     let layout = ParallelLayout {
         dims: vec![
-            rustrain_parallel::ShardSpec { dim: 0, group: ep },
-            rustrain_parallel::ShardSpec { dim: 0, group: tp },
+            rustrain_parallel::ShardSpec::shard(0, ep),
+            rustrain_parallel::ShardSpec::shard(0, tp),
         ],
         partial: None,
     };
@@ -237,14 +237,14 @@ fn describe_renders_names_via_the_mesh() {
     );
     let multi = ParallelLayout {
         dims: vec![
-            rustrain_parallel::ShardSpec { dim: 0, group: ep },
-            rustrain_parallel::ShardSpec { dim: 1, group: tp },
+            rustrain_parallel::ShardSpec::shard(0, ep),
+            rustrain_parallel::ShardSpec::shard(1, tp),
         ],
         partial: None,
     };
     assert_eq!(multi.describe(&m), "shard(0, ep) + shard(1, tp)");
     let with_partial = ParallelLayout {
-        dims: vec![rustrain_parallel::ShardSpec { dim: 0, group: ep }],
+        dims: vec![rustrain_parallel::ShardSpec::shard(0, ep)],
         partial: Some(rustrain_parallel::PartialSpec {
             op: ReduceOp::Sum,
             group: tp,
@@ -284,8 +284,8 @@ fn serialization_forms_are_pinned() {
 
     let layout = ParallelLayout {
         dims: vec![
-            rustrain_parallel::ShardSpec { dim: 0, group: ep },
-            rustrain_parallel::ShardSpec { dim: -1, group: tp },
+            rustrain_parallel::ShardSpec::shard(0, ep),
+            rustrain_parallel::ShardSpec::shard(-1, tp),
         ],
         partial: Some(rustrain_parallel::PartialSpec {
             op: ReduceOp::Sum,
@@ -308,4 +308,73 @@ fn serialization_forms_are_pinned() {
     );
     let back_rep: ParallelLayout = serde_json::from_str(r#"{"dims":[],"partial":null}"#).unwrap();
     assert_eq!(back_rep, rep);
+}
+
+/// A declared replicating shard: `docs/design/qwen36-text/spec.md` §D6.6. The axis is sharded in
+/// *units*, a rank owns the units it needs, and two ranks may hold the same one — which is how a
+/// tensor-parallel attention keeps its key/value heads when there are fewer heads than ranks.
+#[test]
+fn a_replicating_shard_hands_each_rank_the_units_it_needs() {
+    use rustrain_parallel::{ShardMode, ShardSpec};
+
+    // The head case: 512 features of 256 (two heads) over four ranks. A single-element unit would
+    // give a rank half a head; the unit is why it does not.
+    let mode = ShardMode::Replicate { unit: 256 };
+    let slabs: Vec<(i64, i64)> = (0..4).map(|c| mode.slab(512, c, 4).unwrap()).collect();
+    assert_eq!(
+        slabs,
+        vec![(0, 256), (0, 256), (256, 256), (256, 256)],
+        "two heads, four ranks: each rank gets one, the last two share"
+    );
+
+    // Fewer units than ranks (4 units, 8 ranks): one unit each, overlapping.
+    let slabs: Vec<(i64, i64)> = (0..8).map(|c| mode.slab(1024, c, 8).unwrap()).collect();
+    assert_eq!(
+        slabs,
+        vec![
+            (0, 256),
+            (0, 256),
+            (256, 256),
+            (256, 256),
+            (512, 256),
+            (512, 256),
+            (768, 256),
+            (768, 256)
+        ]
+    );
+
+    // Every element belongs to some rank, and no slab cuts a unit in half.
+    let covered: std::collections::BTreeSet<i64> =
+        slabs.iter().flat_map(|(off, len)| *off..*off + *len).collect();
+    assert_eq!(covered.len(), 1024, "the slabs must cover the axis");
+
+    // A unit that does not divide the axis is refused, not rounded: 512 with units of 3.
+    assert_eq!(ShardMode::Replicate { unit: 3 }.slab(512, 0, 2), None);
+    // …and a strict shard is unchanged: 16 heads over 4 ranks.
+    assert_eq!(ShardMode::Divide.slab(16, 1, 4), Some((4, 4)));
+    assert_eq!(
+        ShardMode::Divide.slab(2, 1, 4),
+        None,
+        "an undeclared undersized axis stays a hard error"
+    );
+
+    // Through a layout: the local shape follows the mode, and the slab is what the loader takes.
+    let m = mesh(cfg(4, 1, 1, 1, 1));
+    let tp = axis(&m, "tp");
+    let strict = ParallelLayout {
+        dims: vec![ShardSpec::shard(1, tp)],
+        partial: None,
+    };
+    assert!(matches!(
+        strict.local_shape(&[4, 2], &m),
+        Err(ShardError::NotDivisible { dim: 1, global: 2, divisor: 4 })
+    ));
+    let replicating = ParallelLayout {
+        dims: vec![ShardSpec::replicating(1, tp, 1)],
+        partial: None,
+    };
+    assert_eq!(replicating.local_shape(&[4, 2], &m).unwrap(), vec![4, 1]);
+    assert_eq!(replicating.slab(2, 1, 2, 4, 2).unwrap(), (1, 1));
+    assert_eq!(replicating.slab(2, 1, 1, 4, 2).unwrap(), (0, 1));
+    assert_eq!(replicating.slab(2, 1, 0, 4, 2).unwrap(), (0, 1));
 }

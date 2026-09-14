@@ -11,8 +11,7 @@
 
 use rustrain_parallel::{
     Collective, DimNormalizer, GroupMask, Mesh, ParallelLayout, PartialSpec, ReduceOp, ShardError,
-    ShardSpec, transitions,
-};
+    ShardMode, ShardSpec, transitions};
 
 use crate::PlanError;
 use crate::attrs::Attrs;
@@ -368,6 +367,7 @@ pub fn derive(
                             .map(|spec| ShardSpec {
                                 dim: spec.dim - offset,
                                 group: spec.group,
+                                mode: spec.mode,
                             })
                             .collect(),
                         partial: None,
@@ -400,13 +400,21 @@ pub fn derive(
                 // Weight sharded on its output dim as a *single* spec: output
                 // features split across ranks (column parallel), no collective
                 // owed.
-                (false, [ShardSpec { dim, group }], None) if *dim == 1 => {
-                    ParallelLayout::shard(-1, *group)
-                }
+                (false, [ShardSpec { dim, group, mode }], None) if *dim == 1 => ParallelLayout {
+                    // The output features are exactly as sharded as the weight's — including a
+                    // replicating weight, whose slabs overlap so that every rank owns the
+                    // features it needs.
+                    dims: vec![ShardSpec {
+                        dim: -1,
+                        group: *group,
+                        mode: *mode,
+                    }],
+                    partial: None,
+                },
                 // Contraction split across ranks (row parallel) as a single
                 // spec: every rank holds a partial sum, which forces the
                 // all-reduce downstream.
-                (false, [ShardSpec { dim, group }], None) if *dim == 0 => {
+                (false, [ShardSpec { dim, group, mode }], None) if *dim == 0 => {
                     ParallelLayout::partial(ReduceOp::Sum, *group)
                 }
                 // Anything else — two shards on the weight, an existing
@@ -440,10 +448,18 @@ pub fn derive(
 
             let out = match (w.is_replicated(), w.dims.as_slice(), w.partial.as_ref()) {
                 (true, _, _) => x.clone(),
-                (false, [ShardSpec { dim, group }], None) if *dim == 1 => {
-                    ParallelLayout::shard(-1, *group)
-                }
-                (false, [ShardSpec { dim, group }], None) if *dim == 0 => {
+                (false, [ShardSpec { dim, group, mode }], None) if *dim == 1 => ParallelLayout {
+                    // The output features are exactly as sharded as the weight's — including a
+                    // replicating weight, whose slabs overlap so that every rank owns the
+                    // features it needs.
+                    dims: vec![ShardSpec {
+                        dim: -1,
+                        group: *group,
+                        mode: *mode,
+                    }],
+                    partial: None,
+                },
+                (false, [ShardSpec { dim, group, mode }], None) if *dim == 0 => {
                     ParallelLayout::partial(ReduceOp::Sum, *group)
                 }
                 _ => {
@@ -535,10 +551,16 @@ pub fn derive(
                             b: spec.group,
                         });
                     }
+                    // Two shards on one dim compose to the weaker promise, as they do when they
+                    // are declared (`ParallelLayout::axis_shard`).
+                    if let ShardMode::Replicate { unit } = spec.mode {
+                        existing.mode = ShardMode::Replicate { unit };
+                    }
                 } else {
                     dims.push(ShardSpec {
                         dim,
                         group: spec.group,
+                        mode: spec.mode,
                     });
                 }
                 Ok(())
@@ -668,6 +690,7 @@ fn carry_to_output_rank(
         .map(|spec| ShardSpec {
             dim: spec.dim + offset,
             group: spec.group,
+            mode: spec.mode,
         })
         .collect();
     if dims.iter().any(|spec| spec.dim < 0 || spec.dim >= out_rank) {
@@ -1568,8 +1591,8 @@ mod tests {
             d.outputs[0],
             ParallelLayout {
                 dims: vec![
-                    ShardSpec { dim: 0, group: tp },
-                    ShardSpec { dim: 2, group: ep },
+                    ShardSpec::shard(0, tp),
+                    ShardSpec::shard(2, ep),
                 ],
                 partial: None,
             },
@@ -1639,8 +1662,8 @@ mod tests {
             ParallelLayout::partial(ReduceOp::Sum, tp),
             ParallelLayout {
                 dims: vec![
-                    ShardSpec { dim: 0, group: tp },
-                    ShardSpec { dim: 1, group: ep },
+                    ShardSpec::shard(0, tp),
+                    ShardSpec::shard(1, ep),
                 ],
                 partial: None,
             },
@@ -1709,8 +1732,8 @@ mod tests {
             // `Partial` or a single `Shard`.
             ParallelLayout {
                 dims: vec![
-                    ShardSpec { dim: 0, group: g },
-                    ShardSpec { dim: 1, group: g },
+                    ShardSpec::shard(0, g),
+                    ShardSpec::shard(1, g),
                 ],
                 partial: None,
             },
@@ -1718,7 +1741,7 @@ mod tests {
             ParallelLayout::partial(ReduceOp::Sum, g),
             // One shard plus a partial: two facts, no rule.
             ParallelLayout {
-                dims: vec![ShardSpec { dim: 0, group: g }],
+                dims: vec![ShardSpec::shard(0, g)],
                 partial: Some(PartialSpec {
                     op: ReduceOp::Sum,
                     group: g,
@@ -1960,8 +1983,8 @@ mod tests {
             ParallelLayout::partial(ReduceOp::Sum, tp),
             ParallelLayout {
                 dims: vec![
-                    ShardSpec { dim: 0, group: tp },
-                    ShardSpec { dim: 1, group: tp },
+                    ShardSpec::shard(0, tp),
+                    ShardSpec::shard(1, tp),
                 ],
                 partial: None,
             },
@@ -1988,8 +2011,8 @@ mod tests {
             ParallelLayout::partial(ReduceOp::Sum, tp),
             ParallelLayout {
                 dims: vec![
-                    ShardSpec { dim: 0, group: tp },
-                    ShardSpec { dim: 1, group: ep },
+                    ShardSpec::shard(0, tp),
+                    ShardSpec::shard(1, ep),
                 ],
                 partial: None,
             },
@@ -2017,7 +2040,7 @@ mod tests {
         let (tp, _) = tp_ep_masks();
         let plan = declared_pair_plan(
             ParallelLayout {
-                dims: vec![ShardSpec { dim: 0, group: tp }],
+                dims: vec![ShardSpec::shard(0, tp)],
                 partial: Some(PartialSpec {
                     op: ReduceOp::Sum,
                     group: tp,
@@ -2046,7 +2069,7 @@ mod tests {
         let (tp, ep) = tp_ep_masks();
         let plan = declared_pair_plan(
             ParallelLayout {
-                dims: vec![ShardSpec { dim: 0, group: ep }],
+                dims: vec![ShardSpec::shard(0, ep)],
                 partial: Some(PartialSpec {
                     op: ReduceOp::Sum,
                     group: tp,

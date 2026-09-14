@@ -29,11 +29,40 @@
 
 use std::collections::BTreeMap;
 
-use rustrain_parallel::{GroupMask, Mesh, ParallelLayout, ShardSpec};
+use rustrain_parallel::{GroupMask, Mesh, ParallelLayout, ShardSpec, ShardMode};
 
 use crate::PlanError;
 use crate::ir::{NodeId, Plan, PlanNode, Slot, SlotId, SlotKind};
 use crate::shard::{ShardRules, canonicalize, derive};
+
+/// One declared axis: the mesh axis a slot dim is sharded by, and how its slabs relate to the
+/// axis (disjoint or overlapping). The description spells this with its own serde type
+/// (`rustrain_model::AxisDecl`); `Expanded::declarations()` converts, so the two crates keep their
+/// own vocabularies and adding a mode is one compile error, not a silent default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredAxis {
+    pub axis: String,
+    pub mode: ShardMode,
+}
+
+impl DeclaredAxis {
+    /// A strict shard: `global` must divide by the group's degree.
+    pub fn divide(axis: impl Into<String>) -> Self {
+        Self {
+            axis: axis.into(),
+            mode: ShardMode::Divide,
+        }
+    }
+
+    /// A shard in units of `unit` elements whose slabs may overlap when a rank cannot be given a
+    /// whole unit per rank.
+    pub fn replicate(axis: impl Into<String>, unit: i64) -> Self {
+        Self {
+            axis: axis.into(),
+            mode: ShardMode::Replicate { unit },
+        }
+    }
+}
 
 /// The description's declarations, carried from `expand` to [`instantiate`] as **input**.
 ///
@@ -42,9 +71,9 @@ use crate::shard::{ShardRules, canonicalize, derive};
 /// the "description × topology → plan" operands visible). Both fields are written by
 /// `rustrain-model`'s `Expanded::declarations()` and read by [`instantiate`] — nothing else.
 pub struct DeclaredAxes {
-    /// Slot **name** → (logical dim as written in the description → axis names, in declaration
-    /// order). Names, not ids: a description's `targets[].slot` refers to a name.
-    pub slots: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    /// Slot **name** → (logical dim as written in the description → the axes declared on it, in
+    /// declaration order). Names, not ids: a description's `targets[].slot` refers to a name.
+    pub slots: BTreeMap<String, BTreeMap<String, Vec<DeclaredAxis>>>,
     /// Every expanded stack instance in stack order, with the stage its stack entry declared
     /// (`None` = the entry has no `stage`). PP pruning indexes by this list.
     pub instances: Vec<InstanceStage>,
@@ -144,17 +173,23 @@ pub fn instantiate(
                 dim: dim_text.clone(),
             })?;
             for axis in axes {
-                let index = mesh.index_of(axis).ok_or_else(|| PlanError::UnknownAxis {
+                let index = mesh.index_of(&axis.axis).ok_or_else(|| PlanError::UnknownAxis {
                     slot: slot_name.clone(),
                     dim: dim_text.clone(),
-                    axis: axis.clone(),
+                    axis: axis.axis.clone(),
                     axes: axis_names(mesh),
                 })?;
                 // A mesh has at most `Mesh::MAX_AXES` axes, so `single` cannot overflow; an
                 // impossible overflow is still reported, not unwrapped.
                 let group =
                     GroupMask::single(index).map_err(|source| PlanError::Mesh { source })?;
-                specs.push(ShardSpec { dim, group });
+                // The description's mode travels into the layout, which is the only thing the
+                // propagation walk, the loader and the display all read.
+                specs.push(ShardSpec {
+                    dim,
+                    group,
+                    mode: axis.mode,
+                });
             }
         }
         // One spelling for every distribution the plan carries: each declared dim is resolved

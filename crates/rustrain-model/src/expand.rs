@@ -11,12 +11,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rustrain_abi::ffi::RsDtype;
 use rustrain_parallel::{Mesh, MeshFingerprint, ParallelConfig};
-use rustrain_plan::{AttrValue, Attrs, OpRef, Phase, Plan, PlanBuilder, SlotId, SlotKind};
+use rustrain_plan::{
+    AttrValue, Attrs, DeclaredAxis, OpRef, Phase, Plan, PlanBuilder, SlotId, SlotKind,
+};
 
 use crate::ModelError;
-use crate::desc::{
-    AttrLiteral, FORMAT, ModelDesc, NodeDecl, StackEntry, StageDecl, Target, Template,
-};
+use crate::desc::{AxisMode, 
+    AttrLiteral, FORMAT, ModelDesc, NodeDecl, StackEntry, StageDecl, Target, Template, AxisDecl};
 use crate::params::{Params, Value};
 use crate::pattern::is_wildcard_segment;
 use crate::transform::parse_transform;
@@ -53,8 +54,54 @@ pub struct Expanded {
     /// The `axes` declared on the top-level `inputs` (D6): an input slot can
     /// itself be distributed — cp / dp shard the token stream. Merged into
     /// [`Expanded::declarations`] next to the binding axes.
-    input_axes: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    input_axes: BTreeMap<String, BTreeMap<String, Vec<AxisDecl>>>,
 }
+
+/// The description's axis declarations, in the layout vocabulary `instantiate` reads.
+///
+/// The two spellings of an axis (`"tp"` and `{"axis": "tp", "mode": "replicate"}`) collapse here;
+/// a third mode would fail to compile in this match rather than default to a silent divide.
+/// Input axes are activations: they have no unit, and the object form is refused with a reason
+/// rather than quietly sharded by single elements.
+fn declared_axes_plain(axes: &BTreeMap<String, Vec<AxisDecl>>) -> BTreeMap<String, Vec<DeclaredAxis>> {
+    let mut out = BTreeMap::new();
+    for (dim, axes) in axes {
+        let mut declared = Vec::with_capacity(axes.len());
+        for axis in axes {
+            declared.push(DeclaredAxis {
+                axis: axis.axis().to_string(),
+                mode: match axis.mode() {
+                    AxisMode::Divide => rustrain_plan::ShardMode::Divide,
+                    AxisMode::Replicate => rustrain_plan::ShardMode::Replicate { unit: 1 },
+                },
+            });
+        }
+        out.insert(dim.clone(), declared);
+    }
+    out
+}
+
+fn declared_axes(axes: &BTreeMap<String, Vec<ResolvedAxis>>) -> BTreeMap<String, Vec<DeclaredAxis>> {
+    axes.iter()
+        .map(|(dim, axes)| {
+            (
+                dim.clone(),
+                axes.iter()
+                    .map(|axis| DeclaredAxis {
+                        axis: axis.axis.clone(),
+                        mode: match axis.mode {
+                            AxisMode::Divide => rustrain_plan::ShardMode::Divide,
+                            AxisMode::Replicate => rustrain_plan::ShardMode::Replicate {
+                                unit: axis.unit,
+                            },
+                        },
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
 
 impl Expanded {
     /// The declarations `instantiate` consumes: the `binding` axes by slot name, and the stage
@@ -64,14 +111,14 @@ impl Expanded {
     /// stays portable and its digest does not change when a description declares a sharding
     /// (`docs/design/model-description.md` §0, D4 rulings R2).
     pub fn declarations(&self) -> rustrain_plan::DeclaredAxes {
-        let mut slots: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+        let mut slots: BTreeMap<String, BTreeMap<String, Vec<DeclaredAxis>>> = BTreeMap::new();
         for binding in &self.bindings {
             for hit in &binding.slots {
                 if hit.axes.is_empty() {
                     // Absent axes = replicated: absent from the map, never an empty entry.
                     continue;
                 }
-                slots.insert(hit.slot.clone(), hit.axes.clone());
+                slots.insert(hit.slot.clone(), declared_axes(&hit.axes));
             }
         }
         // Input axes (D6): a top-level input declares its own distribution. A
@@ -80,7 +127,8 @@ impl Expanded {
         // description error that cannot occur — the bindings' entry is kept.
         for (name, axes) in &self.input_axes {
             if !axes.is_empty() {
-                slots.entry(name.clone()).or_insert_with(|| axes.clone());
+                let declared = declared_axes_plain(axes);
+                slots.entry(name.clone()).or_insert(declared);
             }
         }
         rustrain_plan::DeclaredAxes {
@@ -95,6 +143,15 @@ impl Expanded {
                 .collect(),
         }
     }
+}
+
+/// One axis declaration after resolution: its unit resolved against the parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAxis {
+    pub axis: String,
+    pub mode: AxisMode,
+    /// The granularity the axis shards at, in elements (1 unless declared otherwise).
+    pub unit: i64,
 }
 
 /// One `binding` after resolution.
@@ -127,7 +184,7 @@ pub struct ResolvedBindingSlot {
     /// instances against `slots` by position, which C5 forbids.
     pub pattern: String,
     /// slot dimension (decimal string) → symbolic axis names.
-    pub axes: BTreeMap<String, Vec<String>>,
+    pub axes: BTreeMap<String, Vec<ResolvedAxis>>,
 }
 
 /// Description → global plan, applying every §3.5 mandate `expand` can check.
@@ -412,7 +469,7 @@ struct Expander<'a> {
     /// Every expanded instance in stack order: `(prefix, declared stage)`.
     stages: Vec<(String, Option<i64>)>,
     /// The `axes` declared on the top-level `inputs` (D6), keyed by slot name.
-    input_axes: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    input_axes: BTreeMap<String, BTreeMap<String, Vec<AxisDecl>>>,
 }
 
 impl<'a> Expander<'a> {
@@ -437,6 +494,22 @@ impl<'a> Expander<'a> {
     // ---- top level: the inputs section --------------------------------------
 
     fn expand_inputs(&mut self) -> Result<(), ModelError> {
+        let desc = self.desc;
+        // An input is an activation: it has no unit, and a description that declares one is
+        // told so here rather than sharded by single elements.
+        for (name, port) in &desc.inputs {
+            for (dim, axes) in &port.axes {
+                if axes
+                    .iter()
+                    .any(|axis| matches!(axis, AxisDecl::Sharded { unit: Some(_), .. }))
+                {
+                    return Err(ModelError::Invalid(format!(
+                        "input `{name}` declares a `unit` on axis {dim}; units belong to a slot's \
+                         binding, not to an input activation"
+                    )));
+                }
+            }
+        }
         let desc = self.desc;
         for (name, port) in &desc.inputs {
             let dtype = self.dtype_of(port.dtype.as_deref())?;
@@ -1008,7 +1081,7 @@ impl<'a> Expander<'a> {
                 })?;
             }
 
-            let targets: Vec<(String, BTreeMap<String, Vec<String>>)> =
+            let targets: Vec<(String, BTreeMap<String, Vec<AxisDecl>>)> =
                 match (&binding.slot, binding.targets.is_empty()) {
                     (Some(slot), true) => vec![(slot.clone(), binding.axes.clone())],
                     (None, false) => binding
@@ -1087,6 +1160,46 @@ impl<'a> Expander<'a> {
                     ModelError::Invalid(format!("binding {index} (`{}`): {e}", binding.source))
                 })?;
             }
+
+            // Resolve every declared axis' unit here, next to `split.sizes`: both name a
+            // parameter or a literal, and both are needed before a slot exists.
+            let mut resolved_axes: BTreeMap<String, BTreeMap<String, Vec<ResolvedAxis>>> =
+                BTreeMap::new();
+            for (slot, axes) in &targets {
+                let mut per_dim: BTreeMap<String, Vec<ResolvedAxis>> = BTreeMap::new();
+                for (dim, declarations) in axes {
+                    let mut resolved = Vec::with_capacity(declarations.len());
+                    for axis in declarations {
+                        let unit = match axis {
+                            AxisDecl::Name(_) | AxisDecl::Sharded { unit: None, .. } => 1,
+                            AxisDecl::Sharded {
+                                unit: Some(text), ..
+                            } => {
+                                let value = self.dim_of(text)?;
+                                if value <= 0 {
+                                    return Err(ModelError::Invalid(format!(
+                                        "binding {index} (`{}`): axis unit `{text}` = {value} is \
+                                         not positive",
+                                        binding.source
+                                    )));
+                                }
+                                value
+                            }
+                        };
+                        resolved.push(ResolvedAxis {
+                            axis: axis.axis().to_string(),
+                            mode: axis.mode(),
+                            unit,
+                        });
+                    }
+                    per_dim.insert(dim.clone(), resolved);
+                }
+                resolved_axes.insert(slot.clone(), per_dim);
+            }
+            let targets: Vec<(String, BTreeMap<String, Vec<ResolvedAxis>>)> = targets
+                .iter()
+                .map(|(slot, _)| (slot.clone(), resolved_axes.get(slot).cloned().unwrap_or_default()))
+                .collect();
 
             let captures = source_captures(&binding.source);
             let mut slots = Vec::new();
@@ -1345,7 +1458,7 @@ mod axes_declaration_tests {
         let declarations = expanded.declarations();
         assert_eq!(
             declarations.slots.get("tok").and_then(|d| d.get("0")),
-            Some(&vec!["dp".to_string()]),
+            Some(&vec![DeclaredAxis::divide("dp")]),
             "the input's dp shard must reach instantiate"
         );
     }

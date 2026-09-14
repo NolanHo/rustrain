@@ -592,6 +592,51 @@ hidden **与改动前逐位相同**（`np.array_equal` → True，`max|d| 0.0`�
 checkpoint 不在 page cache 时仍是主要成本之一）；③ 更高度数（tp=8 / ep）受益更大，但那些配置本身还在
 D6 的阻断项里（见下）。
 
+### D6.6 — tp≥4 的 KV 复制：机制已落地，模型接线还差一步（2026-09，本轮）
+
+**要解决什么**：`check --tp 4` 死在 `slot layers.3.kh`：`dim 1` 全局 2（KV 头）不能被 4 整除。
+`qwen36-5d-example.md` §4 早就写了"tp≥4 需 KV 复制"，但它没说清**复制的粒度**。
+
+**这一轮想清楚的三件事**：
+
+1. **"head 偏移位置常量"其实不需要**。原先的设想是：每个 rank 持有一部分 q 头，sdpa 需要知道自己的
+   q 头在全局的偏移才能把 q 头映射到 kv 头（GQA 的 repeats=8）。真正需要的是**让每个 rank 恰好持有它
+   那部分 q 头需要的 kv 头**：q 头按 tp 连续切，rank r 的 q 头 `[r·q/tp,(r+1)·q/tp)` 映射到的 kv 头区间是
+   `[⌊r·kv/tp⌋, ⌊r·kv/tp⌋+⌈kv/tp⌉)`（可直接由除法证明），所以只要 **kv 轴的 slab 用同一个规则算**，
+   本地 `sdpa` 的"本地 q 头 / 本地 kv 头"分组就自动正确 —— 偏移被 slab 本身吃掉了，
+   算子不需要新的位置常量。
+2. **复制必须按"单位"而不是按元素**。KV 投影的输出特征轴是 512（2 头 × 256），tp=4 时按元素
+   `ceil(512/4)=128` 会切出**半个头**（本轮实测：`l1.instantiate` 通过后 `l1.compile` 在 reshape 上报
+   `[512,128] cannot fill -1`，正是这个错误被抓住）。所以复制模式带 **unit**：
+   轴按 `unit` 分成若干单位，一个 rank 拿 `ceil(units/degree)` 个连续单位，slab 可以重叠。
+   KV 权重声明 `unit = head_dim` → 每 rank 恰好 1 个头。
+3. **声明式，不是 fallback**。`Divide`（默认，严格整除，不整除仍是硬错误）与
+   `Replicate{unit}`（声明后才允许重叠）是两种**声明的**语义；描述里写成
+   `"axes": {"1": [{"axis": "tp", "mode": "replicate", "unit": "head_dim"}]}`，字符串形式
+   `["tp"]` 不变（既有描述零改动）。unit 与 `split.sizes` 一样解析参数名或整数字面量。
+
+**落地了什么（本次提交，全部有测试）**：
+`rustrain-parallel`：`ShardMode{Divide,Replicate{unit}}` 成为 `ShardSpec` 的字段（默认 `Divide`，
+**序列化时省略**，所以既有 plan 的 wire form 与 digest 不变 —— digest 只哈希决策，不哈希 layout，
+两重保险），`local_shape` 与新增的 `slab(global,dim,coord,degree,rank)` 走同一个函数；
+`rustrain-plan`：`DeclaredAxis`（plan 的词汇）+ `instantiate` 从声明建 spec + 传播链路
+（linear 列并行、view 的维度平移、二元算子的 dim 合并）都携带 mode；
+`rustrain-model`：描述侧的 `AxisDecl`（untagged：字符串或对象）与 unit 解析；
+`rustrain-cli`：加载器不再自己算 `coord*local`，改成问 layout 要 `slab`（一个事实一个来源）。
+测试：`a_replicating_shard_hands_each_rank_the_units_it_needs`（512/4 → 每 rank 一个头、
+4 单位 8 rank 的重叠、单位不整除被拒、严格路径不变）、`an_axis_may_declare_how_its_slabs_relate`
+（两种写法 + unit 解析）。
+
+**还差的一步（诚实记录，下一步就做）**：**reshape/view 规则里的 unit 换算**。k_proj 的**权重**按
+head 单位切一次就对（512 特征 → 每 rank 1 个头），但**激活**路径是
+`k = x @ w`（[seq,512]）→ `reshape` 成 `[seq,2,256]`——这条规则现在只把 shard 的**轴号**平移，
+不知道"512 特征轴上的 unit=256"到了 `[2,256]` 上应该是"头轴 unit=1"。所以模型里的声明暂时**没有**
+启用（`model.json` 保持原样，`--tp 4` 仍精确报 `layers.3.kh` 不可整除——宁可精确拒绝，不给半个头）。
+需要给 view/reshape 的映射函数传入输入/输出**形状**，按 refold 的比例换算 unit（unit % m == 0 →
+移到外层轴、unit = unit/m；否则留在内层轴；两者都不整除 → 拒绝）。做完这一步，把
+`k_proj`/`v_proj`（含 MTP）四个 binding 改成 replicating，`check --tp 4/8` 应全绿，
+再到宿主上跑 `launch --sweep tp=4` 验收。
+
 ### D5 — 前向数值对齐 HuggingFace
 
 **可观察结果**：在验证宿主（8× L20X，sm_89）上，同一段 token、同样的 `input_ids`，rustrain 的 logits 与

@@ -277,8 +277,20 @@ pub(crate) fn load_weights(
                 continue;
             }
             let global = after_segment[d];
-            let local = global / degree as i64;
-            shards.push((d, coord * local as usize, local as usize));
+            // The slab comes from the layout, not from `coord * global / degree`: a declared
+            // replicating axis (`tp` with fewer key/value heads than ranks) hands two coordinates
+            // the same slice, and only the layout knows that.
+            let (offset, local) = slot
+                .layout
+                .slab(global, d as i64, coord as i64, degree as i64, rank_dims as i64)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "slot `{}`: cannot take rank {rank}'s slab of axis {d} (global {global}, \
+                         degree {degree}): {error}",
+                        slot.name
+                    )
+                })?;
+            shards.push((d, offset as usize, local as usize));
         }
 
         let key = (pair.tensor.clone(), binding.transform.clone());

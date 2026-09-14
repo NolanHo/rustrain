@@ -34,6 +34,11 @@ fn expanded() -> rustrain_model::Expanded {
     rustrain_model::expand_dir(&fixture_dir()).expect("the real description must expand")
 }
 
+/// The declared axis names, in order — what most of these tests are about.
+fn names(axes: &[rustrain_plan::DeclaredAxis]) -> Vec<&str> {
+    axes.iter().map(|axis| axis.axis.as_str()).collect()
+}
+
 fn mesh(tp: usize, cp: usize, ep: usize, dp: usize, pp: usize) -> Mesh {
     Mesh::from_config(&ParallelConfig {
         tensor: tp,
@@ -263,8 +268,8 @@ fn the_real_shape_join_resolves_declared_axes_end_to_end() {
     assert_eq!(
         gate_slot.layout.dims,
         vec![
-            rustrain_parallel::ShardSpec { dim: 0, group: ep },
-            rustrain_parallel::ShardSpec { dim: 2, group: tp },
+            rustrain_parallel::ShardSpec::shard(0, ep),
+            rustrain_parallel::ShardSpec::shard(2, tp),
         ],
         "ep × tp is two independent specs on one tensor"
     );
@@ -286,8 +291,8 @@ fn the_real_shape_join_resolves_declared_axes_end_to_end() {
     assert_eq!(
         down_slot.layout.dims,
         vec![
-            rustrain_parallel::ShardSpec { dim: 0, group: ep },
-            rustrain_parallel::ShardSpec { dim: 2, group: tp },
+            rustrain_parallel::ShardSpec::shard(0, ep),
+            rustrain_parallel::ShardSpec::shard(2, tp),
         ]
     );
 
@@ -383,7 +388,7 @@ fn an_axis_the_mesh_does_not_have_names_the_axis_and_slot() {
         .get_mut("lm_head.w")
         .expect("lm_head.w declares axes")
         .get_mut("1")
-        .expect("dim 1 is declared")[0] = "vpp".to_string();
+        .expect("dim 1 is declared")[0] = rustrain_plan::DeclaredAxis::divide("vpp");
 
     let m = mesh(2, 1, 1, 1, 1); // the canonical five axes; no `vpp`
     let err = instantiate(&expanded.plan, &declared, &m, 0, &reference_registry()).unwrap_err();
@@ -595,14 +600,14 @@ fn declarations_expose_the_binding_axes_by_slot_name() {
         .slots
         .get("layers.3.mlp.experts.gate_proj")
         .expect("gate_proj declares axes");
-    assert_eq!(gate.get("0").unwrap(), &vec!["ep".to_string()]);
-    assert_eq!(gate.get("2").unwrap(), &vec!["tp".to_string()]);
+    assert_eq!(names(gate.get("0").unwrap()), vec!["ep"]);
+    assert_eq!(names(gate.get("2").unwrap()), vec!["tp"]);
 
     let o_proj = declared
         .slots
         .get("layers.3.self_attn.o_proj")
         .expect("o_proj declares axes");
-    assert_eq!(o_proj.get("0").unwrap(), &vec!["tp".to_string()]);
+    assert_eq!(names(o_proj.get("0").unwrap()), vec!["tp"]);
 
     // A slot without declared axes is absent from the map, not an empty entry.
     assert!(!declared.slots.contains_key("input_ids"));

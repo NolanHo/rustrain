@@ -72,7 +72,7 @@ pub struct PortSpec {
     /// `binding.axes`; resolved by `instantiate` against the mesh like every
     /// other declaration (D6).
     #[serde(default)]
-    pub axes: BTreeMap<String, Vec<String>>,
+    pub axes: BTreeMap<String, Vec<AxisDecl>>,
 }
 
 /// One `params` value: read from `config.json`, a parameter expression, or a literal list (§3.1).
@@ -214,6 +214,60 @@ pub struct Select {
     pub default: Option<String>,
 }
 
+/// One axis a slot dim is sharded by, as written in a description.
+///
+/// The plain string form (`"axes": {"1": ["tp"]}`) is a strict, disjoint shard. The object form
+/// (`"axes": {"1": [{"axis": "tp", "mode": "replicate"}]}`) says the slabs may overlap when the
+/// axis has fewer elements than the group has ranks — how a tensor-parallel attention keeps its
+/// key/value heads (`rustrain_parallel::ShardMode`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum AxisDecl {
+    /// `"tp"`: divide the axis, refusing a group that does not divide it.
+    Name(String),
+    /// `{"axis": "tp", "mode": "replicate", "unit": "head_dim"}`.
+    Sharded {
+        axis: String,
+        #[serde(default)]
+        mode: AxisMode,
+        /// The granularity the axis shards at: a parameter name or an integer literal, resolved
+        /// like every other size in a description. One element by default; an attention weight
+        /// declares its head size, because sharding 512 features across four ranks by single
+        /// elements would hand a rank half a head.
+        #[serde(default)]
+        unit: Option<String>,
+    },
+}
+
+/// How the slabs of a declared axis relate to its elements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AxisMode {
+    /// Disjoint slices; a group that does not divide the axis is a compile-time error.
+    #[default]
+    Divide,
+    /// Every rank holds the slice it needs; slabs may overlap.
+    Replicate,
+}
+
+impl AxisDecl {
+    /// The axis name, however this declaration was spelled.
+    pub fn axis(&self) -> &str {
+        match self {
+            AxisDecl::Name(name) => name,
+            AxisDecl::Sharded { axis, .. } => axis,
+        }
+    }
+
+    /// How the slabs divide the axis.
+    pub fn mode(&self) -> AxisMode {
+        match self {
+            AxisDecl::Name(_) => AxisMode::Divide,
+            AxisDecl::Sharded { mode, .. } => *mode,
+        }
+    }
+}
+
 /// One parameter mapping (§3.4). `slot` and `split`+`targets` are mutually exclusive.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -226,7 +280,7 @@ pub struct Binding {
     /// slot dimension → symbolic axis names. The global plan is fully replicated; the axes are only
     /// resolved once `instantiate` has a mesh.
     #[serde(default)]
-    pub axes: BTreeMap<String, Vec<String>>,
+    pub axes: BTreeMap<String, Vec<AxisDecl>>,
     #[serde(default)]
     pub split: Option<Split>,
     #[serde(default)]
@@ -247,5 +301,5 @@ pub struct Split {
 pub struct Target {
     pub slot: String,
     #[serde(default)]
-    pub axes: BTreeMap<String, Vec<String>>,
+    pub axes: BTreeMap<String, Vec<AxisDecl>>,
 }

@@ -12,8 +12,7 @@ use rustrain_parallel::{GroupMask, Mesh, ParallelConfig, ParallelLayout, ReduceO
 use rustrain_plan::ir::intrinsic;
 use rustrain_plan::{
     Attrs, DeclaredAxes, InstanceStage, OpRef, Plan, PlanBuilder, PlanError, SlotKind, instantiate,
-    instantiate_stages,
-};
+    instantiate_stages, DeclaredAxis};
 
 /// The canonical five-axis mesh with `tp = 2`; `tp` is the first axis, so its mask is bit 0.
 fn tp_mesh() -> Mesh {
@@ -88,11 +87,11 @@ fn a_row_parallel_declared_shard_yields_partial_then_all_reduce() {
         slots: BTreeMap::from([
             (
                 "w1".to_string(),
-                BTreeMap::from([("1".to_string(), vec!["tp".to_string()])]),
+                BTreeMap::from([("1".to_string(), vec![DeclaredAxis::divide("tp")])]),
             ),
             (
                 "w2".to_string(),
-                BTreeMap::from([("0".to_string(), vec!["tp".to_string()])]),
+                BTreeMap::from([("0".to_string(), vec![DeclaredAxis::divide("tp")])]),
             ),
         ]),
         instances: Vec::new(),
@@ -199,7 +198,7 @@ fn a_declaration_naming_an_unknown_slot_is_reported() {
     let declared = DeclaredAxes {
         slots: BTreeMap::from([(
             "no.such.slot".to_string(),
-            BTreeMap::from([("0".to_string(), vec!["tp".to_string()])]),
+            BTreeMap::from([("0".to_string(), vec![DeclaredAxis::divide("tp")])]),
         )]),
         instances: Vec::new(),
     };
@@ -309,11 +308,11 @@ fn a_matmul_keeps_the_batch_shard_and_the_output_shard_in_the_local_shape() {
         slots: BTreeMap::from([
             (
                 "a".to_string(),
-                BTreeMap::from([("0".to_string(), vec!["tp".to_string()])]),
+                BTreeMap::from([("0".to_string(), vec![DeclaredAxis::divide("tp")])]),
             ),
             (
                 "b".to_string(),
-                BTreeMap::from([("1".to_string(), vec!["ep".to_string()])]),
+                BTreeMap::from([("1".to_string(), vec![DeclaredAxis::divide("ep")])]),
             ),
         ]),
         instances: Vec::new(),
@@ -328,8 +327,8 @@ fn a_matmul_keeps_the_batch_shard_and_the_output_shard_in_the_local_shape() {
         instantiated.slot(y).layout,
         ParallelLayout {
             dims: vec![
-                ShardSpec { dim: 0, group: tp },
-                ShardSpec { dim: 2, group: ep },
+                ShardSpec::shard(0, tp),
+                ShardSpec::shard(2, ep),
             ],
             partial: None,
         },
@@ -366,7 +365,7 @@ fn a_rank_growing_broadcast_shards_the_output_feature_axis() {
     let declared = DeclaredAxes {
         slots: BTreeMap::from([(
             "h".to_string(),
-            BTreeMap::from([("0".to_string(), vec!["tp".to_string()])]),
+            BTreeMap::from([("0".to_string(), vec![DeclaredAxis::divide("tp")])]),
         )]),
         instances: Vec::new(),
     };
@@ -421,7 +420,7 @@ fn staged_declarations(pre_stage: i64, post_stage: i64) -> DeclaredAxes {
     DeclaredAxes {
         slots: BTreeMap::from([(
             "post.w".to_string(),
-            BTreeMap::from([("0".to_string(), vec!["tp".to_string()])]),
+            BTreeMap::from([("0".to_string(), vec![DeclaredAxis::divide("tp")])]),
         )]),
         instances: vec![
             InstanceStage {
@@ -566,7 +565,7 @@ fn the_real_qwen36_reshape_chain_instantiates_with_heads_split() {
     let declared = DeclaredAxes {
         slots: BTreeMap::from([(
             "qgw".to_string(),
-            BTreeMap::from([("1".to_string(), vec!["tp".to_string()])]),
+            BTreeMap::from([("1".to_string(), vec![DeclaredAxis::divide("tp")])]),
         )]),
         instances: Vec::new(),
     };

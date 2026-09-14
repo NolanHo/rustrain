@@ -43,12 +43,103 @@ impl fmt::Display for ReduceOp {
 /// resolved against a concrete tensor rank when the layout is used. Logical
 /// dims keep a plan reusable across tensors of different ranks — the plan says
 /// "the last axis", not "axis 3".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ShardMode {
+    /// Every rank owns a disjoint slice: `global` must divide by the group's degree, and a rank
+    /// that cannot be given a whole element of the axis is a compile-time error
+    /// ([`ShardError::NotDivisible`]). The default, because a silent fallback is what this
+    /// framework refuses.
+    #[default]
+    Divide,
+    /// Every rank owns the slice it *needs*, even when that means two ranks hold the same one:
+    /// `local = ceil(global / degree)`, `offset = floor(coord * global / degree)`. This is how a
+    /// tensor-parallel attention keeps its key/value heads when there are fewer heads than ranks
+    /// (`docs/design/qwen36-text/spec.md` §D6.6): each rank's query slice maps to the key/value
+    /// heads it needs, and the slabs overlap rather than communicate.
+    Replicate {
+        /// The granularity the axis is sharded at, in elements: an axis of `global` elements is
+        /// `global / unit` units, and a rank owns whole units. One is the default, but an
+        /// attention weight needs the head: sharding 512 features (two heads of 256) across four
+        /// ranks in a single-element unit would hand a rank half a head.
+        unit: i64,
+    },
+}
+
+impl ShardMode {
+    /// Whether this is the default mode — the one the wire form omits.
+    pub fn is_divide(&self) -> bool {
+        matches!(self, ShardMode::Divide)
+    }
+
+    /// The slab `coord` of `degree` holds along an axis of `global` elements: `(offset, len)`.
+    pub fn slab(self, global: i64, coord: i64, degree: i64) -> Option<(i64, i64)> {
+        if degree <= 0 || coord < 0 || coord >= degree || global < 0 {
+            return None;
+        }
+        match self {
+            ShardMode::Divide => {
+                if global % degree != 0 {
+                    return None;
+                }
+                let local = global / degree;
+                Some((coord * local, local))
+            }
+            ShardMode::Replicate { unit } => {
+                if unit <= 0 || global % unit != 0 {
+                    return None;
+                }
+                let units = global / unit;
+                let local = (units + degree - 1) / degree;
+                let offset = (coord * units / degree).min(units - local);
+                Some((offset * unit, local * unit))
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for ShardMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShardMode::Divide => f.write_str("divide"),
+            ShardMode::Replicate { unit } => write!(f, "replicate({unit})"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ShardSpec {
     /// The (logical) tensor axis that is split.
     pub dim: i64,
     /// The group whose ranks hold the slices.
     pub group: GroupMask,
+    /// How the slices divide the axis — disjoint ([`ShardMode::Divide`]) or the-needle-each-rank
+    /// ([`ShardMode::Replicate`]).
+    ///
+    /// Serialized only when it is *not* the default: a strict shard must keep the exact wire form
+    /// it had before this field existed, because plans are hashed into the digest.
+    #[serde(default, skip_serializing_if = "ShardMode::is_divide")]
+    pub mode: ShardMode,
+}
+
+impl ShardSpec {
+    /// A strict, disjoint shard — the shape almost every layout has.
+    pub fn shard(dim: i64, group: GroupMask) -> Self {
+        Self {
+            dim,
+            group,
+            mode: ShardMode::Divide,
+        }
+    }
+
+    /// A shard whose slabs may overlap when there are fewer units than ranks.
+    pub fn replicating(dim: i64, group: GroupMask, unit: i64) -> Self {
+        Self {
+            dim,
+            group,
+            mode: ShardMode::Replicate { unit },
+        }
+    }
 }
 
 /// A partial reduction: every rank of `group` holds a partial of the complete
@@ -99,7 +190,7 @@ impl ParallelLayout {
     /// Split dim `dim` across `group`.
     pub fn shard(dim: i64, group: GroupMask) -> Self {
         Self {
-            dims: vec![ShardSpec { dim, group }],
+            dims: vec![ShardSpec::shard(dim, group)],
             partial: None,
         }
     }
@@ -222,17 +313,85 @@ impl ParallelLayout {
         }
         let mut local = Vec::with_capacity(global.len());
         for (d, &size) in global.iter().enumerate() {
-            let divisor = self.divisor(d as i64, tensor_rank, mesh)?;
-            if size % divisor != 0 {
-                return Err(ShardError::NotDivisible {
-                    dim: d as i64,
-                    global: size,
-                    divisor,
-                });
+            let (mode, divisor) = self.axis_shard(d as i64, tensor_rank, mesh)?;
+            match mode.slab(size, 0, divisor) {
+                Some((_, len)) => local.push(len),
+                None => {
+                    return Err(ShardError::NotDivisible {
+                        dim: d as i64,
+                        global: size,
+                        divisor,
+                    })
+                }
             }
-            local.push(size / divisor);
         }
         Ok(local)
+    }
+
+    /// The slab coordinate `coord` of `degree` holds along logical `dim`: `(offset, len)`.
+    ///
+    /// The one source for "where does a rank's slice start and how long is it": the layout agrees
+    /// with itself by construction, and the loader asks this instead of re-deriving
+    /// `coord * local` (which is only the same thing while every shard divides).
+    pub fn slab(
+        &self,
+        global: i64,
+        dim: i64,
+        coord: i64,
+        degree: i64,
+        tensor_rank: i64,
+    ) -> Result<(i64, i64), ShardError> {
+        let mode = self.mode_of(dim, tensor_rank)?;
+        mode.slab(global, coord, degree)
+            .ok_or(ShardError::NotDivisible {
+                dim,
+                global,
+                divisor: degree,
+            })
+    }
+
+    /// The mode the layout imposes on logical `dim`, without needing a mesh: `Divide` unless a
+    /// spec on that dim replicates.
+    fn mode_of(&self, dim: i64, tensor_rank: i64) -> Result<ShardMode, ShardError> {
+        let norm = DimNormalizer::new(tensor_rank)?;
+        let target = norm.normalize(dim)?;
+        let mut mode = ShardMode::Divide;
+        for spec in &self.dims {
+            if norm.normalize(spec.dim)? == target {
+                if let ShardMode::Replicate { unit } = spec.mode {
+                    mode = ShardMode::Replicate { unit };
+                }
+            }
+        }
+        Ok(mode)
+    }
+
+    /// The mode and combined degree the layout imposes on logical `dim`.
+    fn axis_shard(
+        &self,
+        dim: i64,
+        tensor_rank: i64,
+        mesh: &Mesh,
+    ) -> Result<(ShardMode, i64), ShardError> {
+        let norm = DimNormalizer::new(tensor_rank)?;
+        let target = norm.normalize(dim)?;
+        let mut mode = ShardMode::Divide;
+        let mut divisor: i64 = 1;
+        for spec in &self.dims {
+            let resolved = norm.normalize(spec.dim)?;
+            spec.group.validate(mesh).map_err(to_shard_error)?;
+            if resolved == target {
+                divisor = divisor.saturating_mul(degree_as_i64(
+                    spec.group.degree(mesh).expect("group validated"),
+                ));
+                // A dim sharded twice takes the weaker promise: overlapping slabs are the only
+                // way two groups can both be satisfied when either is undersized.
+                if let ShardMode::Replicate { unit } = spec.mode {
+                    mode = ShardMode::Replicate { unit };
+                }
+            }
+        }
+        Ok((mode, divisor))
     }
 
     /// Human form with axis names, e.g. `shard(-1, tp)`, `shard(0, ep) +
@@ -248,7 +407,18 @@ impl ParallelLayout {
         let mut parts: Vec<String> =
             Vec::with_capacity(self.dims.len() + usize::from(self.partial.is_some()));
         for spec in &self.dims {
-            parts.push(format!("shard({}, {})", spec.dim, name(mesh, spec.group)));
+            match spec.mode {
+                ShardMode::Divide => parts.push(format!(
+                    "shard({}, {})",
+                    spec.dim,
+                    name(mesh, spec.group)
+                )),
+                ShardMode::Replicate { unit } => parts.push(format!(
+                    "shard_replicated({}, {}, unit={unit})",
+                    spec.dim,
+                    name(mesh, spec.group)
+                )),
+            }
         }
         if let Some(partial) = &self.partial {
             parts.push(format!(
@@ -406,8 +576,8 @@ mod tests {
         // Two shards over the same group (case F1c's shape).
         let l = ParallelLayout {
             dims: vec![
-                ShardSpec { dim: 0, group: tp },
-                ShardSpec { dim: 1, group: tp },
+                ShardSpec::shard(0, tp),
+                ShardSpec::shard(1, tp),
             ],
             partial: None,
         };
@@ -415,7 +585,7 @@ mod tests {
 
         // A shard and a partial over the same group (case F1b's shape).
         let l = ParallelLayout {
-            dims: vec![ShardSpec { dim: 0, group: tp }],
+            dims: vec![ShardSpec::shard(0, tp)],
             partial: Some(PartialSpec {
                 op: ReduceOp::Sum,
                 group: tp,
@@ -425,10 +595,7 @@ mod tests {
 
         // A combined mask overlaps each of its own axes.
         let l = ParallelLayout {
-            dims: vec![ShardSpec {
-                dim: 0,
-                group: tp_ep,
-            }],
+            dims: vec![ShardSpec::shard(0, tp_ep)],
             partial: Some(PartialSpec {
                 op: ReduceOp::Sum,
                 group: tp,
@@ -439,8 +606,8 @@ mod tests {
         // The disjoint MoE ep x tp shape has none.
         let l = ParallelLayout {
             dims: vec![
-                ShardSpec { dim: 0, group: ep },
-                ShardSpec { dim: 1, group: tp },
+                ShardSpec::shard(0, ep),
+                ShardSpec::shard(1, tp),
             ],
             partial: None,
         };
@@ -448,7 +615,7 @@ mod tests {
 
         // A shard plus a disjoint partial has none either.
         let l = ParallelLayout {
-            dims: vec![ShardSpec { dim: 0, group: ep }],
+            dims: vec![ShardSpec::shard(0, ep)],
             partial: Some(PartialSpec {
                 op: ReduceOp::Sum,
                 group: tp,
@@ -459,11 +626,8 @@ mod tests {
         // The empty mask never overlaps anything.
         let l = ParallelLayout {
             dims: vec![
-                ShardSpec {
-                    dim: 0,
-                    group: GroupMask::NONE,
-                },
-                ShardSpec { dim: 1, group: tp },
+                ShardSpec::shard(0, GroupMask::NONE),
+                ShardSpec::shard(1, tp),
             ],
             partial: None,
         };

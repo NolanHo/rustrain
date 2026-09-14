@@ -125,7 +125,10 @@ fn fused_storage_is_split_into_semantic_slots() {
             "q_proj 只喂一个融合 slot，实际 {}",
             slot.slot
         );
-        assert_eq!(slot.axes.get("1"), Some(&vec!["tp".to_string()]));
+        assert_eq!(
+            slot.axes.get("1").map(|axes| axes.iter().map(|a| a.axis.as_str()).collect::<Vec<_>>()),
+            Some(vec!["tp"])
+        );
     }
     let q_mtp = by_source("mtp.layers.{*}.self_attn.q_proj.weight");
     assert!(q_mtp.split.is_none());

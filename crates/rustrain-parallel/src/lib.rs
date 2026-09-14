@@ -40,6 +40,6 @@ pub mod rank;
 pub use collective::{Collective, transitions};
 pub use config::{ParallelConfig, ParallelDim};
 pub use error::{ParallelError, ShardError};
-pub use layout::{DimNormalizer, ParallelLayout, PartialSpec, ReduceOp, ShardSpec};
+pub use layout::{DimNormalizer, ParallelLayout, PartialSpec, ReduceOp, ShardSpec, ShardMode};
 pub use mesh::{GroupMask, Mesh, MeshFingerprint};
 pub use rank::RankLayout;

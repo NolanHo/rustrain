@@ -318,8 +318,14 @@ fn a_split_binding_feeds_several_slots() {
     assert_eq!(split.slots.len(), 6, "3 层 × 2 个 target");
     assert_eq!(split.split.as_ref().unwrap().sizes, vec![16, 16]);
     assert_eq!(
-        split.slots[0].axes.get("1").unwrap(),
-        &vec!["tp".to_string()]
+        split.slots[0]
+            .axes
+            .get("1")
+            .unwrap()
+            .iter()
+            .map(|axis| axis.axis.as_str())
+            .collect::<Vec<_>>(),
+        vec!["tp"]
     );
 }
 
@@ -583,4 +589,43 @@ fn a_slot_claimed_twice_says_which_of_the_two_conflicts_it_is() {
         !two.contains("twice"),
         "two bindings are not one binding: {two}"
     );
+}
+
+/// The two spellings of a declared axis, and the unit that makes replication useful
+/// (`docs/design/qwen36-text/spec.md` §D6.6): a plain name divides, the object form may
+/// replicate, and the unit is resolved like every other size in a description.
+#[test]
+fn an_axis_may_declare_how_its_slabs_relate() {
+    let declaration = |axes: serde_json::Value| -> rustrain_model::Binding {
+        serde_json::from_value(serde_json::json!({
+            "slot": "layers.*.wo",
+            "source": "model.layers.{*}.wo.weight",
+            "axes": { "1": axes },
+        }))
+        .unwrap()
+    };
+    let declared_with = |axes: serde_json::Value| {
+        let mut desc = tiny();
+        desc.binding
+            .retain(|b| b.slot.as_deref() != Some("layers.*.wo"));
+        desc.binding.push(declaration(axes));
+        let expanded = expand(&desc, &config()).unwrap();
+        expanded.declarations().slots["layers.0.wo"]["1"][0].clone()
+    };
+
+    let replicating = declared_with(serde_json::json!([
+        { "axis": "tp", "mode": "replicate", "unit": "hidden" }
+    ]));
+    assert_eq!(replicating.axis, "tp");
+    assert!(
+        matches!(
+            replicating.mode,
+            rustrain_plan::ShardMode::Replicate { unit: 16 } // `hidden_size` in the test config
+        ),
+        "the unit is the parameter, resolved like a split size: {:?}",
+        replicating.mode
+    );
+
+    let strict = declared_with(serde_json::json!(["tp"]));
+    assert!(matches!(strict.mode, rustrain_plan::ShardMode::Divide));
 }

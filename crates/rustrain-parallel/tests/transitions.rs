@@ -31,7 +31,7 @@ fn layout(dims: &[(i64, GroupMask)], partial: Option<(ReduceOp, GroupMask)>) -> 
     ParallelLayout {
         dims: dims
             .iter()
-            .map(|&(dim, group)| rustrain_parallel::ShardSpec { dim, group })
+            .map(|&(dim, group)| rustrain_parallel::ShardSpec::shard(dim, group))
             .collect(),
         partial: partial.map(|(op, group)| rustrain_parallel::PartialSpec { op, group }),
     }

@@ -20,14 +20,8 @@ fn layouts_display_compactly() {
     );
     let multi = ParallelLayout {
         dims: vec![
-            rustrain_parallel::ShardSpec {
-                dim: 0,
-                group: GroupMask::from_bits(0b100),
-            },
-            rustrain_parallel::ShardSpec {
-                dim: 1,
-                group: GroupMask::from_bits(0b1),
-            },
+            rustrain_parallel::ShardSpec::shard(0, GroupMask::from_bits(0b100)),
+            rustrain_parallel::ShardSpec::shard(1, GroupMask::from_bits(0b1)),
         ],
         partial: None,
     };
@@ -58,8 +52,8 @@ fn describe_renders_names_from_the_mesh() {
     );
     let multi = ParallelLayout {
         dims: vec![
-            rustrain_parallel::ShardSpec { dim: 0, group: ep },
-            rustrain_parallel::ShardSpec { dim: 1, group: tp },
+            rustrain_parallel::ShardSpec::shard(0, ep),
+            rustrain_parallel::ShardSpec::shard(1, tp),
         ],
         partial: None,
     };
@@ -83,18 +77,9 @@ fn layouts_expose_their_groups_and_replica_flag() {
     // Distinct groups, in declaration order, duplicates dropped.
     let combined = ParallelLayout {
         dims: vec![
-            rustrain_parallel::ShardSpec {
-                dim: 0,
-                group: GroupMask::from_bits(0b1),
-            },
-            rustrain_parallel::ShardSpec {
-                dim: 1,
-                group: GroupMask::from_bits(0b100),
-            },
-            rustrain_parallel::ShardSpec {
-                dim: 2,
-                group: GroupMask::from_bits(0b1),
-            },
+            rustrain_parallel::ShardSpec::shard(0, GroupMask::from_bits(0b1)),
+            rustrain_parallel::ShardSpec::shard(1, GroupMask::from_bits(0b100)),
+            rustrain_parallel::ShardSpec::shard(2, GroupMask::from_bits(0b1)),
         ],
         partial: Some(rustrain_parallel::PartialSpec {
             op: ReduceOp::Sum,
