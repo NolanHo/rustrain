@@ -29,6 +29,7 @@ use rustrain_parallel::{GroupMask, Mesh, ParallelConfig, ParallelLayout};
 use rustrain_plan::{Attrs, OpRef, Plan, PlanBuilder, PlanNode, Slot, SlotKind};
 
 mod device;
+mod launch;
 mod load;
 mod npz;
 mod run;
@@ -59,6 +60,12 @@ enum Command {
     /// f32; the HF reference is dumped with `--dtype bf16`, and the spec's 1% tolerance on the
     /// logits and the per-layer summaries absorbs HF's bf16 rounding, not this widening.
     Run(run::RunArgs),
+    /// Run a multi-rank world as one process per GPU (`world = tp × cp × ep × dp × pp`).
+    ///
+    /// Each rank owns one CUDA context and one NCCL communicator, so this is the
+    /// only shape a multi-rank CUDA forward can take. `--sweep` runs several
+    /// meshes and writes the comparison report.
+    Launch(launch::LaunchArgs),
 }
 
 #[derive(Args)]
@@ -158,6 +165,7 @@ fn main() -> Result<()> {
         },
         Command::Check(args) => check(args),
         Command::Run(args) => run::run(args),
+        Command::Launch(args) => launch::launch(args),
     }
 }
 

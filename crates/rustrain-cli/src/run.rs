@@ -27,8 +27,8 @@ use rustrain_abi::ffi::RsDtype;
 use rustrain_parallel::{GroupMask, Mesh, ParallelConfig, ParallelLayout};
 use rustrain_plan::{Plan, SlotId};
 use rustrain_runtime::{
-    CollectiveBackend, Executor, HostAllocator, SingleRank, ThreadBackend, ThreadShared,
-    required_inputs,
+    CollectiveBackend, Executor, HostAllocator, NcclBackend, SingleRank, ThreadBackend,
+    ThreadShared, required_inputs,
 };
 
 use crate::device::DeviceSpec;
@@ -39,9 +39,9 @@ use crate::npz::{self, Npy};
 /// (replicated) logits when the plan leaves them distributed.
 const LOGITS_COMPLETE: &str = "__run__.logits.complete";
 /// The D6 numeric acceptance bound, relative to the baseline's max magnitude.
-const AGREEMENT_BOUND_RELATIVE: f64 = 1e-5;
-const METRICS_FORMAT: &str = "rustrain.metrics.v1";
-const SWEEP_FORMAT: &str = "rustrain.sweep.v1";
+pub(crate) const AGREEMENT_BOUND_RELATIVE: f64 = 1e-5;
+pub(crate) const METRICS_FORMAT: &str = "rustrain.metrics.v1";
+pub(crate) const SWEEP_FORMAT: &str = "rustrain.sweep.v1";
 
 #[derive(Args)]
 pub(crate) struct RunArgs {
@@ -66,9 +66,10 @@ pub(crate) struct RunArgs {
     pub seq: Option<usize>,
 
     /// Where to write the candidate dump (a `.npz`); a `.json` sidecar lands next to it. In
-    /// `--sweep` mode this is the JSON report path instead.
+    /// `--sweep` mode this is the JSON report path instead. Required for a normal run; a rank
+    /// child of `launch` reports through `--metrics` and dumps nothing of its own.
     #[arg(long, value_name = "PATH")]
-    pub out: PathBuf,
+    pub out: Option<PathBuf>,
 
     /// The mesh degrees. `tp=cp=ep=dp=pp=1` runs the whole model on rank 0 — the first
     /// comparison. Any other combination runs a real multi-rank forward (N threads in this
@@ -107,11 +108,32 @@ pub(crate) struct RunArgs {
     pub recipe: Option<PathBuf>,
 
     /// Where the slot buffers live: `cpu` (default), `cuda`, or `cuda:<index>` (`cuda` alone is
-    /// device 0). A CUDA device with a mesh whose world size is > 1 is refused up front: one
-    /// CUDA context can only be current on one thread, so a multi-rank CUDA launch needs one
-    /// process per rank (the next step of D6).
+    /// device 0). A CUDA device with a mesh whose world size is > 1 is refused up front **in this
+    /// process**: one CUDA context can only be current on one thread. `rustrain launch` runs the
+    /// world as one process per rank instead.
     #[arg(long, value_name = "SPEC", default_value = "cpu")]
     pub device: String,
+
+    /// Run **one rank** of a multi-process world: this process owns rank `N`, its own CUDA
+    /// device, and its own collectives. `rustrain launch` passes it; running one rank by hand is
+    /// a debugging tool for a stuck world.
+    #[arg(long, value_name = "N")]
+    pub rank: Option<usize>,
+
+    /// The world size `--rank` belongs to. Defaults to the mesh's own size, and a disagreement
+    /// with the mesh is an error rather than a reinterpretation.
+    #[arg(long, value_name = "N")]
+    pub world: Option<usize>,
+
+    /// The directory the ranks of a multi-process world exchange NCCL's unique ids through. One
+    /// per run: a stale file from an earlier run would hand a rank the wrong communicator.
+    #[arg(long, value_name = "DIR")]
+    pub rdzv: Option<PathBuf>,
+
+    /// The NCCL library to load. Omitted, the loader's own search runs (`libnccl.so.2`, then
+    /// `libnccl.so`).
+    #[arg(long, value_name = "PATH")]
+    pub nccl_lib: Option<PathBuf>,
 }
 
 /// One hidden state's summary row, in the comparison's `[mean, std, max]` order.
@@ -138,22 +160,32 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
             args.pp
         );
     }
-    // The CUDA guard, up front: a context is current on one thread, so one
-    // allocator serves one execution thread. Refused here, before anything
-    // touches the model or the device — multi-rank CUDA is one process per
-    // rank, which is the next step of D6.
     let world = degrees.iter().fold(1usize, |a, b| a.saturating_mul(*b));
-    if device.is_cuda() && world > 1 {
-        bail!(
-            "`--device cuda` with a mesh of world size {world}: a CUDA context can only be \
-             current on one host thread at a time, so one allocator/context serves one execution \
-             thread; a multi-rank CUDA launch needs one process per rank, which is the next step \
-             of D6. Run one rank (every degree 1) or drop `--device cuda`"
-        );
-    }
 
     // ---- the probe tokens -----------------------------------------------
     let tokens = probe_tokens(args.tokens.as_deref(), args.seq)?;
+
+    // One rank of a multi-process world: `launch` starts `world` of these, each
+    // with its own rank, device and rendezvous directory. The rank runs its own
+    // forward and writes its metrics where the launcher reads them — it dumps
+    // nothing itself, because the world's dump is rank 0's, assembled by the
+    // launcher.
+    if let Some(rank) = args.rank {
+        return run_one_rank(&args, &tokens, rank, world, device);
+    }
+
+    // The CUDA guard applies to *this process*: a context is current on one
+    // thread, so one allocator serves one execution thread. A multi-rank CUDA
+    // world is one process per rank instead — `rustrain launch` starts it.
+    if device.is_cuda() && world > 1 {
+        bail!(
+            "`--device cuda` with a mesh of world size {world} in one process: a CUDA context can \
+             only be current on one host thread at a time, so one allocator/context serves one \
+             execution thread. Run the world as one process per rank with `rustrain launch`, or \
+             run a single rank here with `--rank 0 --world {world}` (plus `--rdzv <DIR>`), or drop \
+             `--device cuda`"
+        );
+    }
 
     if let Some(list) = &args.sweep {
         return run_sweep(&args, &tokens, list, device);
@@ -182,6 +214,120 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
         )
     })?;
 
+    emit_result(&args, &tokens, &config, result)
+}
+
+/// One rank of a multi-process world: this process's rank, its own CUDA device,
+/// its own NCCL communicator — and its metrics on disk, where the launcher that
+/// started it reads them.
+///
+/// Deliberately not a "small run": the rank loads the model, instantiates its
+/// own plan, loads its own weight slabs, compiles, and executes, exactly as a
+/// single-process run would. The only difference is where its collectives go and
+/// who collects the answer.
+fn run_one_rank(
+    args: &RunArgs,
+    tokens: &[i64],
+    rank: usize,
+    world: usize,
+    device: DeviceSpec,
+) -> Result<()> {
+    let config = ParallelConfig {
+        tensor: args.tp,
+        context: args.cp,
+        expert: args.ep,
+        data: args.dp,
+        pipeline: args.pp,
+    };
+    let mesh = Mesh::from_config(&config);
+    if world != mesh.world_size() {
+        bail!(
+            "`--world {world}` disagrees with the mesh `{}`: the rank's plan and the world it \
+             synchronises with must be the same world",
+            mesh_text(&config)
+        );
+    }
+    if rank >= world {
+        bail!("`--rank {rank}` is outside a world of {world} rank(s)");
+    }
+    if world > 1 && !device.is_cuda() {
+        bail!(
+            "a rank child of a multi-process world needs `--device cuda:<index>`: the CPU \
+             multi-rank path is N threads in *one* process (run without `--rank`), and the \
+             reference provider is the conformance oracle, not an execution path"
+        );
+    }
+    let metrics_path = args.metrics.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "a rank child reports its metrics for the launcher: pass `--metrics <PATH>`"
+        )
+    })?;
+
+    let transport = if world == 1 {
+        // A one-rank world has no peers: no rendezvous directory, no NCCL.
+        Transport::Single
+    } else {
+        let rendezvous = args.rdzv.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "`--rank` in a world of {world} needs `--rdzv <DIR>`: that is the directory the \
+                 ranks exchange NCCL's unique ids through, and it must hold no stale ids from an \
+                 earlier run"
+            )
+        })?;
+        Transport::Nccl {
+            rank,
+            world_size: world,
+            rendezvous,
+            library: args.nccl_lib.as_deref(),
+        }
+    };
+    let started = Instant::now();
+    let report = run_rank(
+        &args.model,
+        &args.checkpoint,
+        tokens,
+        &mesh,
+        rank,
+        &transport,
+        &args.plugins,
+        args.recipe.as_deref(),
+        device,
+    )
+    .with_context(|| format!("rank {rank} of {}", mesh_text(&config)))?;
+
+    if let Some(parent) = metrics_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(metrics_path, serde_json::to_string_pretty(&report)? + "\n")
+        .with_context(|| format!("writing the rank metrics {}", metrics_path.display()))?;
+    eprintln!(
+        "rank {rank} of {} finished in {:.1} s -> {}",
+        mesh_text(&config),
+        started.elapsed().as_secs_f64(),
+        metrics_path.display()
+    );
+    Ok(())
+}
+
+/// Writes everything a finished world produces: the `.npz` dump, the `.json`
+/// sidecar, the optional metrics report, and the human summary on stdout.
+///
+/// Separate from [`run`] because `launch` assembles the same [`MeshResult`] from
+/// `world` child processes and must produce exactly the same artifacts — one
+/// dump format, one sidecar format, one report, whatever started the world.
+pub(crate) fn emit_result(
+    args: &RunArgs,
+    tokens: &[i64],
+    config: &ParallelConfig,
+    result: MeshResult,
+) -> Result<()> {
+    let out = args.out.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "--out is required: this run dumps the candidate logits there (a rank child of \
+             `launch` reports through --metrics instead)"
+        )
+    })?;
     let window = result.window;
     let vocab = result.vocab;
 
@@ -196,7 +342,7 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
             summary_le.extend_from_slice(&v.to_le_bytes());
         }
     }
-    let tokens_i64: Vec<i64> = tokens.clone();
+    let tokens_i64: Vec<i64> = tokens.to_vec();
     let mut ids_le = Vec::with_capacity(tokens_i64.len() * 8);
     for id in &tokens_i64 {
         ids_le.extend_from_slice(&id.to_le_bytes());
@@ -207,7 +353,7 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
         hidden_le.extend_from_slice(&v.to_le_bytes());
     }
     npz::write_npz(
-        &args.out,
+        out,
         &[
             Npy {
                 name: "input_ids",
@@ -242,16 +388,16 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
     .context("writing the candidate dump")?;
 
     // ---- the sidecar and the human report --------------------------------
-    let sidecar_path = args.out.with_extension(format!(
+    let sidecar_path = out.with_extension(format!(
         "{}json",
-        args.out
-            .extension()
+        out.extension()
             .map(|e| format!("{}.", e.to_string_lossy()))
             .unwrap_or_default()
     ));
     let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
     let degrees = serde_json::json!({
-        "tp": args.tp, "cp": args.cp, "ep": args.ep, "dp": args.dp, "pp": args.pp,
+        "tp": config.tensor, "cp": config.context, "ep": config.expert,
+        "dp": config.data, "pp": config.pipeline,
     });
     let mut sidecar = serde_json::json!({
         "format": "rustrain.run.v1",
@@ -309,8 +455,10 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
     .with_context(|| format!("writing the sidecar {}", sidecar_path.display()))?;
 
     println!(
-        "run {}  rank 0 of tp={} cp={} ep={} dp={} pp={} (world {})",
-        result.name, args.tp, args.cp, args.ep, args.dp, args.pp, result.world
+        "run {}  rank 0 of {} (world {})",
+        result.name,
+        mesh_text(config),
+        result.world
     );
     println!("  digest {}", &result.digest[..result.digest.len().min(12)]);
     println!(
@@ -351,7 +499,7 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
              replicated tensor"
         );
     }
-    println!("  wrote {}", args.out.display());
+    println!("  wrote {}", out.display());
     println!("  wrote {}", sidecar_path.display());
     if result.world > 1 {
         if let Some(path) = &args.metrics {
@@ -377,7 +525,7 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
 }
 
 /// Everything one mesh execution produced, from rank 0's point of view.
-struct MeshResult {
+pub(crate) struct MeshResult {
     name: String,
     window: i64,
     vocab: usize,
@@ -409,9 +557,31 @@ fn mesh_text(cfg: &ParallelConfig) -> String {
     )
 }
 
+/// How one rank's collectives reach the other ranks.
+///
+/// The three answers are three different machines, not three settings: a single
+/// rank needs no transport at all, the CPU world exchanges through shared memory
+/// between threads, and a GPU world exchanges through NCCL between processes —
+/// because a CUDA context is current on one thread, so one process can only own
+/// one rank.
+pub(crate) enum Transport<'a> {
+    /// World size 1: every collective is a local copy.
+    Single,
+    /// N ranks as N threads in this process, through shared scratch buffers.
+    Threads(&'a Arc<ThreadShared>),
+    /// N ranks as N processes, each on its own CUDA device, through NCCL.
+    Nccl {
+        rank: usize,
+        world_size: usize,
+        rendezvous: &'a Path,
+        library: Option<&'a Path>,
+    },
+}
+
 /// One rank's forward, or why it failed. Everything the rank touches — model
 /// load, instantiate, weight load, compile, execute — happens inside, so a
-/// rank is a complete unit the multi-rank driver runs on its own thread.
+/// rank is a complete unit the multi-rank driver runs on its own thread or in
+/// its own process.
 #[allow(clippy::too_many_arguments)]
 fn run_rank(
     model_dir: &Path,
@@ -419,7 +589,7 @@ fn run_rank(
     tokens: &[i64],
     mesh: &Mesh,
     rank: usize,
-    shared: Option<&Arc<ThreadShared>>,
+    transport: &Transport<'_>,
     plugins: &[PathBuf],
     recipe_path: Option<&Path>,
     device: DeviceSpec,
@@ -437,6 +607,45 @@ fn run_rank(
     let registry = crate::load_registry(plugins).context("loading the operator providers")?;
     let recipe = crate::load_recipe(recipe_path).context("loading the recipe")?;
 
+    // The transport comes up before any weight is read: a missing NCCL library,
+    // a device that will not open, or a rendezvous directory that cannot be
+    // created is a configuration error, and it should cost seconds rather than
+    // a full checkpoint load on every rank.
+    let backend: Box<dyn CollectiveBackend + Send> = match transport {
+        Transport::Single => Box::new(SingleRank::new(mesh.world_size())),
+        Transport::Threads(shared) => {
+            Box::new(ThreadBackend::new(rank, mesh.clone(), Arc::clone(shared)))
+        }
+        Transport::Nccl {
+            rank: transport_rank,
+            world_size,
+            rendezvous,
+            library,
+        } => {
+            if *transport_rank != rank || *world_size != mesh.world_size() {
+                bail!(
+                    "this process was given rank {rank} but the transport was set up for rank                      {transport_rank} of world {world_size} (the mesh has {})",
+                    mesh.world_size()
+                );
+            }
+            let index = match device {
+                DeviceSpec::Cuda(index) => index,
+                DeviceSpec::Cpu => bail!(
+                    "the NCCL transport needs a CUDA device: rank {rank} of a multi-process world                      runs one rank per GPU"
+                ),
+            };
+            let backend = NcclBackend::new(rank, mesh.clone(), index, rendezvous, *library)
+                .map_err(|error| {
+                    anyhow::anyhow!("starting NCCL for rank {rank} on device {index}: {error}")
+                })?;
+            eprintln!(
+                "rank {rank} on cuda:{index}: NCCL {} (rank world size {})",
+                backend.library(),
+                mesh.world_size()
+            );
+            Box::new(backend)
+        }
+    };
     let mut plan = rustrain_plan::instantiate(
         &expanded.plan,
         &expanded.declarations(),
@@ -548,10 +757,6 @@ fn run_rank(
         resolve_completed_logits(&compiled.plan, completed_logits.is_some(), &outputs.logits)?;
 
     // ---- feed, execute, read --------------------------------------------
-    let backend: Box<dyn CollectiveBackend + Send> = match shared {
-        None => Box::new(SingleRank::new(mesh.world_size())),
-        Some(shared) => Box::new(ThreadBackend::new(rank, mesh.clone(), shared.clone())),
-    };
     // The framework owns the memory: host for the CPU default, the
     // runtime-loaded CUDA driver for a device run. One CudaAllocator per rank
     // thread (the CUDA guard above refuses world > 1 with a device).
@@ -746,7 +951,7 @@ fn execute_mesh(
             tokens,
             &mesh,
             0,
-            None,
+            &Transport::Single,
             plugins,
             recipe_path,
             device,
@@ -771,7 +976,7 @@ fn execute_mesh(
                     &tokens,
                     &mesh,
                     rank,
-                    Some(&shared),
+                    &Transport::Threads(&shared),
                     &plugins,
                     recipe_path.as_deref(),
                     device,
@@ -793,7 +998,7 @@ fn execute_mesh(
                 tokens,
                 &mesh,
                 0,
-                Some(&shared),
+                &Transport::Threads(&shared),
                 plugins,
                 recipe_path,
                 device,
@@ -822,11 +1027,24 @@ fn execute_mesh(
         results
     };
 
+    assemble_ranks(name, world, rank_results)
+}
+
+/// Assembles the world's result from every rank's metrics report.
+///
+/// The ranks are `serde_json::Value`s either way — an in-process world passes
+/// what its threads returned, a multi-process world what its children wrote —
+/// so the validation, the rank table and the dump are one code path for both.
+pub(crate) fn assemble_ranks(
+    name: String,
+    world: usize,
+    results: Vec<Result<serde_json::Value>>,
+) -> Result<MeshResult> {
     // Collect: every rank must have produced metrics and rank 0 the logits;
     // any rank error fails the whole run, with the worker errors named.
     let mut errors: Vec<String> = Vec::new();
     let mut ranks = Vec::with_capacity(world);
-    for result in rank_results {
+    for result in results {
         match result {
             Ok(value) => ranks.push(value),
             Err(error) => errors.push(format!("{error:#}")),
@@ -912,7 +1130,6 @@ fn execute_mesh(
     })
 }
 
-/// Aggregates the executor's per-step collective records by (kind, group name).
 fn collective_breakdown(mesh: &Mesh, stats: &rustrain_runtime::RunStats) -> Vec<serde_json::Value> {
     let mut by_key: std::collections::BTreeMap<(String, String), (usize, u64, u64)> =
         std::collections::BTreeMap::new();
@@ -996,7 +1213,7 @@ fn rank_input_rows(
 
 /// The probe tokens: `--tokens` verbatim, `--seq` as `0..n-1`, and the two must agree when both
 /// are given.
-fn probe_tokens(tokens: Option<&str>, seq: Option<usize>) -> Result<Vec<i64>> {
+pub(crate) fn probe_tokens(tokens: Option<&str>, seq: Option<usize>) -> Result<Vec<i64>> {
     let parsed = tokens.map(parse_tokens).transpose()?;
     let generated = seq.map(|n| {
         if n == 0 {
@@ -1235,7 +1452,7 @@ fn resolve_completed_logits(plan: &Plan, completed: bool, pattern: &str) -> Resu
 // ---- the configuration sweep -----------------------------------------------
 
 /// `--sweep "tp=2;tp=4;tp=2,ep=2"` → one `ParallelConfig` per `;`-separated entry.
-fn parse_sweep(list: &str) -> Result<Vec<ParallelConfig>> {
+pub(crate) fn parse_sweep(list: &str) -> Result<Vec<ParallelConfig>> {
     let mut configs = Vec::new();
     for (index, entry) in list.split(';').enumerate() {
         let entry = entry.trim();
@@ -1292,6 +1509,10 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f64 {
 /// `--out`. A world-1 baseline always runs first; every configuration's rank-0
 /// logits are compared against it with the D6 relative bound.
 fn run_sweep(args: &RunArgs, tokens: &[i64], list: &str, device: DeviceSpec) -> Result<()> {
+    let out = args
+        .out
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("--sweep writes one JSON report: pass --out <PATH>"))?;
     let configs = parse_sweep(list)?;
 
     // The same CUDA guard as the single run, checked for every listed mesh
@@ -1325,12 +1546,11 @@ fn run_sweep(args: &RunArgs, tokens: &[i64], list: &str, device: DeviceSpec) -> 
         device,
     )
     .context("running the world-1 baseline")?;
-    let baseline_max = max_abs(&baseline.logits);
     if baseline.logits.is_empty() {
         bail!("the world-1 baseline produced no logits");
     }
 
-    let mut entries = Vec::with_capacity(configs.len());
+    let mut runs = Vec::with_capacity(configs.len());
     for cfg in &configs {
         let result = execute_mesh(
             &args.model,
@@ -1342,6 +1562,40 @@ fn run_sweep(args: &RunArgs, tokens: &[i64], list: &str, device: DeviceSpec) -> 
             device,
         )
         .with_context(|| format!("executing the sweep config {}", mesh_text(cfg)))?;
+        runs.push((*cfg, result));
+    }
+    sweep_report(
+        out,
+        &args.model,
+        &args.checkpoint,
+        tokens,
+        &baseline_cfg,
+        &baseline,
+        &runs,
+    )
+}
+
+/// Turns a baseline plus one result per configuration into the sweep report —
+/// one JSON on disk and one line per configuration on stdout.
+///
+/// Shared by the in-process sweep and by `launch`, so a multi-process sweep and
+/// a threaded one cannot drift into two different report formats: the numbers
+/// differ, the shape does not.
+pub(crate) fn sweep_report(
+    out: &Path,
+    model: &Path,
+    checkpoint: &Path,
+    tokens: &[i64],
+    baseline_cfg: &ParallelConfig,
+    baseline: &MeshResult,
+    runs: &[(ParallelConfig, MeshResult)],
+) -> Result<()> {
+    let baseline_max = max_abs(&baseline.logits);
+    if baseline.logits.is_empty() {
+        bail!("the world-1 baseline produced no logits");
+    }
+    let mut entries = Vec::with_capacity(runs.len());
+    for (cfg, result) in runs {
         if result.logits.len() != baseline.logits.len() {
             bail!(
                 "the {} config produced {} logits, the baseline {}: the meshes are not the same \
@@ -1370,8 +1624,8 @@ fn run_sweep(args: &RunArgs, tokens: &[i64], list: &str, device: DeviceSpec) -> 
 
     let report = serde_json::json!({
         "format": SWEEP_FORMAT,
-        "model": args.model.display().to_string(),
-        "checkpoint": args.checkpoint.display().to_string(),
+        "model": model.display().to_string(),
+        "checkpoint": checkpoint.display().to_string(),
         "probe_tokens": tokens,
         "bound_relative": AGREEMENT_BOUND_RELATIVE,
         "baseline": {
@@ -1387,17 +1641,17 @@ fn run_sweep(args: &RunArgs, tokens: &[i64], list: &str, device: DeviceSpec) -> 
         },
         "configs": entries,
     });
-    std::fs::write(&args.out, serde_json::to_string_pretty(&report)? + "\n")
-        .with_context(|| format!("writing the sweep report {}", args.out.display()))?;
+    std::fs::write(out, serde_json::to_string_pretty(&report)? + "\n")
+        .with_context(|| format!("writing the sweep report {}", out.display()))?;
 
     let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
     println!(
         "sweep {} over {} config(s)  baseline world 1 (max |logits| {:.3e})",
-        args.model.display(),
-        configs.len(),
+        model.display(),
+        runs.len(),
         baseline_max
     );
-    for (cfg, entry) in configs.iter().zip(&entries) {
+    for ((cfg, _), entry) in runs.iter().zip(&entries) {
         let diff = entry["max_abs_diff"].as_f64().unwrap_or(f64::NAN);
         let bound = entry["bound"].as_f64().unwrap_or(f64::NAN);
         let pass = entry["pass"].as_bool().unwrap_or(false);
@@ -1422,7 +1676,7 @@ fn run_sweep(args: &RunArgs, tokens: &[i64], list: &str, device: DeviceSpec) -> 
             if pass { "PASS" } else { "FAIL" }
         );
     }
-    println!("  wrote {}", args.out.display());
+    println!("  wrote {}", out.display());
     Ok(())
 }
 

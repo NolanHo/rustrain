@@ -17,8 +17,9 @@
 //! allocator sets the primary context current on the thread that constructs it
 //! and uses it from the same thread, so **one allocator (one context) serves
 //! one execution thread**. A multi-rank CUDA launch therefore needs one
-//! process per rank; the CLI refuses `--device cuda` with a mesh whose world
-//! size is > 1 up front (`crates/rustrain-cli/src/run.rs`) — that refusal is
+//! process per rank; `rustrain run --rank i --world n` is that process (the
+//! CLI's `launch` subcommand starts them), and it refuses `--device cuda`
+//! with a mesh whose world size is > 1 *inside one process* — that refusal is
 //! the real guard, this comment is only the explanation.
 
 use std::ffi::c_void;
@@ -59,28 +60,8 @@ fn check(code: CuResult, call: &str) -> Result<(), String> {
     }
 }
 
-/// Device memory for one CUDA device, over the runtime-loaded driver API.
-pub struct CudaAllocator {
-    /// Kept mapped for the lifetime of the allocator so the function pointers
-    /// below stay valid. Declared first: fields drop in declaration order, and
-    /// nothing in the drop paths below may outlive the library.
-    _library: libloading::Library,
-    /// The device whose primary context this allocator retained.
-    device: CuDevice,
-    mem_alloc: unsafe extern "C" fn(*mut CuDevicePtr, usize) -> CuResult,
-    mem_free: unsafe extern "C" fn(CuDevicePtr) -> CuResult,
-    memcpy_htod: unsafe extern "C" fn(CuDevicePtr, *const c_void, usize) -> CuResult,
-    memcpy_dtoh: unsafe extern "C" fn(*mut c_void, CuDevicePtr, usize) -> CuResult,
-    ctx_sync: unsafe extern "C" fn() -> CuResult,
-    primary_ctx_release: unsafe extern "C" fn(CuDevice) -> CuResult,
-    /// Every live allocation this allocator made, so `Drop` can free them
-    /// before the context goes away.
-    live: Vec<(CuDevicePtr, u64)>,
-}
-
 /// Resolves one driver symbol as a plain function pointer. The library stays
-/// mapped for the lifetime of the allocator, so the copy is valid for just as
-/// long.
+/// mapped for the lifetime of its owner, so the copy is valid for just as long.
 ///
 /// # Safety
 /// `name` must be a static, NUL-terminated symbol name.
@@ -93,16 +74,33 @@ unsafe fn resolve<T: Copy>(library: &libloading::Library, name: &[u8]) -> Result
     Ok(*symbol)
 }
 
-impl CudaAllocator {
-    /// Loads the driver, initialises CUDA, picks `device_index`, retains its
-    /// primary context and makes it current on this thread.
-    pub fn new(device_index: usize) -> Result<Self, String> {
-        let ordinal = i32::try_from(device_index).map_err(|_| {
-            format!("device index {device_index} does not fit a CUDA device ordinal")
-        })?;
+/// The runtime-loaded driver and the handful of calls the framework makes.
+///
+/// One instance per context: `libcuda` is refcounted by the loader, and the
+/// symbol copies are cheap. Kept private to the crate — the two owners
+/// ([`CudaAllocator`] and [`CudaContext`]) are the only callers, and a public
+/// driver handle would invite code that bypasses the allocator.
+struct Driver {
+    /// Kept mapped for the lifetime of the owner so the function pointers
+    /// below stay valid. Declared first: fields drop in declaration order, and
+    /// nothing in the drop paths below may outlive the library.
+    _library: libloading::Library,
+    mem_alloc: unsafe extern "C" fn(*mut CuDevicePtr, usize) -> CuResult,
+    mem_free: unsafe extern "C" fn(CuDevicePtr) -> CuResult,
+    memcpy_htod: unsafe extern "C" fn(CuDevicePtr, *const c_void, usize) -> CuResult,
+    memcpy_dtoh: unsafe extern "C" fn(*mut c_void, CuDevicePtr, usize) -> CuResult,
+    memcpy_dtod: unsafe extern "C" fn(CuDevicePtr, CuDevicePtr, usize) -> CuResult,
+    ctx_sync: unsafe extern "C" fn() -> CuResult,
+    ctx_set_current: unsafe extern "C" fn(CuContext) -> CuResult,
+    primary_ctx_release: unsafe extern "C" fn(CuDevice) -> CuResult,
+}
 
+impl Driver {
+    /// Loads the driver and resolves every symbol the framework uses.
+    ///
+    /// Loading the library runs no device code and creates no context.
+    fn load() -> Result<Self, String> {
         // `libcuda.so.1` is the CUDA 11+ name; `libcuda.so` is the legacy one.
-        // Loading the library runs no device code and creates no context.
         let library = unsafe { libloading::Library::new("libcuda.so.1") }.or_else(|first| {
             unsafe { libloading::Library::new("libcuda.so") }.map_err(|second| {
                 format!(
@@ -112,15 +110,7 @@ impl CudaAllocator {
         })?;
 
         // SAFETY: every symbol is a static driver entry point with exactly the
-        // signature given; the library is held for the allocator's lifetime.
-        let cu_init: unsafe extern "C" fn(u32) -> CuResult =
-            unsafe { resolve(&library, b"cuInit\0") }?;
-        let cu_device_get: unsafe extern "C" fn(*mut CuDevice, i32) -> CuResult =
-            unsafe { resolve(&library, b"cuDeviceGet\0") }?;
-        let cu_primary_ctx_retain: unsafe extern "C" fn(*mut CuContext, CuDevice) -> CuResult =
-            unsafe { resolve(&library, b"cuDevicePrimaryCtxRetain\0") }?;
-        let cu_ctx_set_current: unsafe extern "C" fn(CuContext) -> CuResult =
-            unsafe { resolve(&library, b"cuCtxSetCurrent\0") }?;
+        // signature given; the library is held for the owner's lifetime.
         let mem_alloc: unsafe extern "C" fn(*mut CuDevicePtr, usize) -> CuResult =
             unsafe { resolve(&library, b"cuMemAlloc_v2\0") }?;
         let mem_free: unsafe extern "C" fn(CuDevicePtr) -> CuResult =
@@ -129,13 +119,43 @@ impl CudaAllocator {
             unsafe { resolve(&library, b"cuMemcpyHtoD_v2\0") }?;
         let memcpy_dtoh: unsafe extern "C" fn(*mut c_void, CuDevicePtr, usize) -> CuResult =
             unsafe { resolve(&library, b"cuMemcpyDtoH_v2\0") }?;
+        let memcpy_dtod: unsafe extern "C" fn(CuDevicePtr, CuDevicePtr, usize) -> CuResult =
+            unsafe { resolve(&library, b"cuMemcpyDtoD_v2\0") }?;
         let ctx_sync: unsafe extern "C" fn() -> CuResult =
             unsafe { resolve(&library, b"cuCtxSynchronize\0") }?;
-        // `Drop` releases the retained primary context; the frozen symbol list
-        // in the D6-GPU brief does not name this call, but "releases the
-        // context" cannot be done without it.
+        let ctx_set_current: unsafe extern "C" fn(CuContext) -> CuResult =
+            unsafe { resolve(&library, b"cuCtxSetCurrent\0") }?;
         let primary_ctx_release: unsafe extern "C" fn(CuDevice) -> CuResult =
             unsafe { resolve(&library, b"cuDevicePrimaryCtxRelease\0") }?;
+
+        Ok(Self {
+            _library: library,
+            mem_alloc,
+            mem_free,
+            memcpy_htod,
+            memcpy_dtoh,
+            memcpy_dtod,
+            ctx_sync,
+            ctx_set_current,
+            primary_ctx_release,
+        })
+    }
+
+    /// Initialises CUDA, picks `device_index`, retains its primary context and
+    /// makes it current on this thread.
+    fn retain(&self, device_index: usize) -> Result<(CuDevice, CuContext), String> {
+        let ordinal = i32::try_from(device_index).map_err(|_| {
+            format!("device index {device_index} does not fit a CUDA device ordinal")
+        })?;
+        // The three calls needed here are resolved on demand: they are used
+        // once per context, and keeping them in the struct would suggest the
+        // framework calls them anywhere else.
+        let cu_init: unsafe extern "C" fn(u32) -> CuResult =
+            unsafe { resolve(&self._library, b"cuInit\0") }?;
+        let cu_device_get: unsafe extern "C" fn(*mut CuDevice, i32) -> CuResult =
+            unsafe { resolve(&self._library, b"cuDeviceGet\0") }?;
+        let cu_primary_ctx_retain: unsafe extern "C" fn(*mut CuContext, CuDevice) -> CuResult =
+            unsafe { resolve(&self._library, b"cuDevicePrimaryCtxRetain\0") }?;
 
         // SAFETY: the calls below touch only the driver's own state; the
         // parameters point at locals that outlive each call.
@@ -153,17 +173,33 @@ impl CudaAllocator {
         // Retaining is what makes libtorch — a user of the same primary
         // context — share it with us; setting it current is what makes every
         // later driver call on this thread use it.
-        check(unsafe { cu_ctx_set_current(context) }, "cuCtxSetCurrent")?;
+        check(
+            unsafe { (self.ctx_set_current)(context) },
+            "cuCtxSetCurrent",
+        )?;
+        Ok((device, context))
+    }
+}
 
+/// Device memory for one CUDA device, over the runtime-loaded driver API.
+pub struct CudaAllocator {
+    driver: Driver,
+    /// The device whose primary context this allocator retained.
+    device: CuDevice,
+    /// Every live allocation this allocator made, so `Drop` can free them
+    /// before the context goes away.
+    live: Vec<(CuDevicePtr, u64)>,
+}
+
+impl CudaAllocator {
+    /// Loads the driver, initialises CUDA, picks `device_index`, retains its
+    /// primary context and makes it current on this thread.
+    pub fn new(device_index: usize) -> Result<Self, String> {
+        let driver = Driver::load()?;
+        let (device, _context) = driver.retain(device_index)?;
         Ok(Self {
-            _library: library,
+            driver,
             device,
-            mem_alloc,
-            mem_free,
-            memcpy_htod,
-            memcpy_dtoh,
-            ctx_sync,
-            primary_ctx_release,
             live: Vec::new(),
         })
     }
@@ -177,12 +213,12 @@ impl Drop for CudaAllocator {
         for (ptr, _) in self.live.drain(..) {
             // SAFETY: `ptr` came from `cuMemAlloc_v2` on the context this
             // allocator set current, which is still current here.
-            unsafe { (self.mem_free)(ptr) };
+            unsafe { (self.driver.mem_free)(ptr) };
         }
         // The context was retained in `new`; release the reference.
         // SAFETY: as above — the context is current and `device` is the one it
         // was retained for.
-        unsafe { (self.primary_ctx_release)(self.device) };
+        unsafe { (self.driver.primary_ctx_release)(self.device) };
     }
 }
 
@@ -197,7 +233,7 @@ unsafe impl Allocator for CudaAllocator {
         let mut ptr: CuDevicePtr = 0;
         // SAFETY: the context is current on this thread (set in `new`), and
         // `ptr` is written by the driver with the allocation's address.
-        let code = unsafe { (self.mem_alloc)(&mut ptr as *mut CuDevicePtr, n) };
+        let code = unsafe { (self.driver.mem_alloc)(&mut ptr as *mut CuDevicePtr, n) };
         check(code, "cuMemAlloc_v2")?;
         self.live.push((ptr, bytes));
         Ok(ptr as *mut c_void)
@@ -211,7 +247,7 @@ unsafe impl Allocator for CudaAllocator {
             let (device_ptr, _) = self.live.swap_remove(index);
             // SAFETY: `device_ptr` was allocated by this allocator and not yet
             // freed.
-            unsafe { (self.mem_free)(device_ptr) };
+            unsafe { (self.driver.mem_free)(device_ptr) };
         }
     }
 
@@ -233,8 +269,9 @@ unsafe impl Allocator for CudaAllocator {
         }
         // SAFETY: the destination is a live device allocation of at least `n`
         // bytes, and the source slice holds exactly `n` bytes.
-        let code =
-            unsafe { (self.memcpy_htod)(dst as CuDevicePtr, src.as_ptr() as *const c_void, n) };
+        let code = unsafe {
+            (self.driver.memcpy_htod)(dst as CuDevicePtr, src.as_ptr() as *const c_void, n)
+        };
         check(code, "cuMemcpyHtoD_v2")
     }
 
@@ -249,13 +286,82 @@ unsafe impl Allocator for CudaAllocator {
         // driver copy alone does not order against them — synchronise the
         // context first so the copy reads the finished data.
         // SAFETY: the context is current on this thread.
-        check(unsafe { (self.ctx_sync)() }, "cuCtxSynchronize")?;
+        check(unsafe { (self.driver.ctx_sync)() }, "cuCtxSynchronize")?;
         // SAFETY: `src` is a live device allocation of at least `n` bytes, and
         // `host` holds exactly `n` bytes.
-        let code =
-            unsafe { (self.memcpy_dtoh)(host.as_mut_ptr() as *mut c_void, src as CuDevicePtr, n) };
+        let code = unsafe {
+            (self.driver.memcpy_dtoh)(host.as_mut_ptr() as *mut c_void, src as CuDevicePtr, n)
+        };
         check(code, "cuMemcpyDtoH_v2")?;
         Ok(host)
+    }
+}
+
+/// A retained primary context for code that needs the device but not this
+/// allocator's memory calls — the NCCL backend, whose buffers come from the
+/// same context (torch's caching allocator and this allocator share it).
+///
+/// Holding its own retain is deliberate: the executor owns the allocator and
+/// the backend in one struct and drops them in field order, so a backend that
+/// borrowed the allocator's context could outlive it. Refcounting the primary
+/// context removes that ordering dependency entirely.
+pub(crate) struct CudaContext {
+    driver: Driver,
+    device: CuDevice,
+    /// The retained primary context. `set_current` re-activates *this* handle:
+    /// retaining again would leak a reference (`Drop` releases one).
+    context: CuContext,
+}
+
+impl CudaContext {
+    pub(crate) fn open(device_index: usize) -> Result<Self, String> {
+        let driver = Driver::load()?;
+        let (device, context) = driver.retain(device_index)?;
+        Ok(Self {
+            driver,
+            device,
+            context,
+        })
+    }
+
+    /// Makes this device's primary context current on the calling thread. NCCL
+    /// reads the current device when it builds a communicator, and the driver
+    /// copies below need the context too.
+    pub(crate) fn set_current(&self) -> Result<(), String> {
+        // SAFETY: `context` is the handle `open` retained for `device`, and it
+        // is still released exactly once, in `Drop`.
+        check(
+            unsafe { (self.driver.ctx_set_current)(self.context) },
+            "cuCtxSetCurrent",
+        )
+    }
+
+    /// A device-to-device copy, for the one case a collective needs a private
+    /// copy of an operand that aliases its own output.
+    pub(crate) fn copy_device(
+        &self,
+        dst: *mut c_void,
+        src: *const c_void,
+        bytes: u64,
+    ) -> Result<(), String> {
+        if dst.is_null() || src.is_null() {
+            return Err("cuMemcpyDtoD_v2: null pointer".to_string());
+        }
+        let n = usize::try_from(bytes)
+            .map_err(|_| format!("copy of {bytes} bytes does not fit this host"))?;
+        // SAFETY: both pointers are live device allocations of at least `n`
+        // bytes in the context this handle retained, which is current here.
+        let code = unsafe { (self.driver.memcpy_dtod)(dst as CuDevicePtr, src as CuDevicePtr, n) };
+        check(code, "cuMemcpyDtoD_v2")
+    }
+}
+
+impl Drop for CudaContext {
+    fn drop(&mut self) {
+        // SAFETY: the context was retained in `open` (`set_current` retains
+        // again and releases here too — the count is what keeps it alive, not
+        // the identity of the release call).
+        unsafe { (self.driver.primary_ctx_release)(self.device) };
     }
 }
 
@@ -311,6 +417,37 @@ mod tests {
                         || error.contains("cuCtxSetCurrent"),
                     "the failure must name the library it could not load or the driver call and \
                      its code, got: {error}"
+                );
+            }
+        }
+    }
+
+    /// The context handle is a second owner of the same primary context: on a
+    /// device machine opening it and copying device-to-device must work, and on
+    /// a machine without one it must report the missing driver instead of
+    /// panicking — the same contract the allocator has.
+    #[test]
+    fn cuda_context_opens_and_copies_device_to_device_or_reports_why_not() {
+        match CudaContext::open(0) {
+            Ok(context) => {
+                context.set_current().expect("set current");
+                let mut allocator =
+                    CudaAllocator::new(0).expect("the allocator shares the context");
+                let src = allocator.alloc(64, RsDeviceKind::CUDA).expect("src");
+                let dst = allocator.alloc(64, RsDeviceKind::CUDA).expect("dst");
+                let data: Vec<u8> = (0..64u8).collect();
+                allocator.copy_in(src, 64, &data).expect("copy in");
+                context.copy_device(dst, src, 64).expect("device copy");
+                assert_eq!(allocator.copy_out(dst, 64).expect("copy out"), data);
+            }
+            Err(error) => {
+                assert!(
+                    error.contains("tried libcuda.so.1")
+                        || error.contains("cuInit")
+                        || error.contains("cuDeviceGet")
+                        || error.contains("cuDevicePrimaryCtxRetain")
+                        || error.contains("cuCtxSetCurrent"),
+                    "the failure must name the library or the driver call, got: {error}"
                 );
             }
         }

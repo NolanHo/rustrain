@@ -579,7 +579,7 @@ impl CollectiveBackend for ThreadBackend {
     }
 }
 
-fn element_width(input: &RsTensor, output: &mut RsTensor) -> Result<usize, String> {
+pub(crate) fn element_width(input: &RsTensor, output: &mut RsTensor) -> Result<usize, String> {
     let in_width = input.dtype.byte_width().map(|w| w as usize);
     let out_width = output.dtype.byte_width().map(|w| w as usize);
     match (in_width, out_width) {
@@ -593,11 +593,11 @@ fn element_width(input: &RsTensor, output: &mut RsTensor) -> Result<usize, Strin
 
 /// The logical shape a descriptor presents (dims only; strides are the view's
 /// business and `materialise`/`scatter` handle them).
-fn logical_shape(t: &RsTensor) -> Vec<i64> {
+pub(crate) fn logical_shape(t: &RsTensor) -> Vec<i64> {
     t.dims().to_vec()
 }
 
-fn resolve_dim(req: &CollectiveRequest, shape: &[i64]) -> Result<usize, String> {
+pub(crate) fn resolve_dim(req: &CollectiveRequest, shape: &[i64]) -> Result<usize, String> {
     let rank = shape.len() as i64;
     let dim = req.dim.unwrap_or(0);
     let dim = if dim < 0 { dim + rank } else { dim };
@@ -611,7 +611,7 @@ fn resolve_dim(req: &CollectiveRequest, shape: &[i64]) -> Result<usize, String> 
     Ok(dim as usize)
 }
 
-fn shape_error(req: &CollectiveRequest, expected: &[i64], actual: &[i64]) -> String {
+pub(crate) fn shape_error(req: &CollectiveRequest, expected: &[i64], actual: &[i64]) -> String {
     format!(
         "collective {} on group {}: the exchange produces shape {expected:?}, but the output \
          slot holds {actual:?}",
@@ -633,7 +633,7 @@ fn mismatched_contribution(req: &CollectiveRequest, rank: usize, members: &[usiz
 /// its shape and strides reach, plus one element. A device operand must come
 /// back in one transfer of the whole span — walking it element by element is
 /// only possible once it is host memory.
-fn span_of(t: &RsTensor, width: usize) -> u64 {
+pub(crate) fn span_of(t: &RsTensor, width: usize) -> u64 {
     let shape = logical_shape(t);
     let rank = (t.rank as usize).min(shape.len());
     let mut max_offset = 0i64;
@@ -648,7 +648,11 @@ fn span_of(t: &RsTensor, width: usize) -> u64 {
 /// Copies a strided view into a contiguous host buffer, in row-major logical
 /// order. The operand's bytes are brought to the host through `host` first, so
 /// a device slot is staged in one transfer instead of being dereferenced here.
-fn materialise(t: &RsTensor, width: usize, host: &dyn Allocator) -> Result<Vec<u8>, String> {
+pub(crate) fn materialise(
+    t: &RsTensor,
+    width: usize,
+    host: &dyn Allocator,
+) -> Result<Vec<u8>, String> {
     let shape = logical_shape(t);
     let rank = (t.rank as usize).min(shape.len());
     let strides = &t.stride[..rank];
@@ -690,7 +694,7 @@ fn materialise(t: &RsTensor, width: usize, host: &dyn Allocator) -> Result<Vec<u
 ///
 /// Strides are in *elements* (`rs_tensor`'s contract), so the expected stride
 /// starts at one and grows by the shape, not by the element width.
-fn is_row_major(t: &RsTensor, shape: &[i64]) -> bool {
+pub(crate) fn is_row_major(t: &RsTensor, shape: &[i64]) -> bool {
     let mut expected = 1i64;
     for d in (0..shape.len()).rev() {
         if shape[d] > 1 && t.stride[d] != expected {
@@ -704,7 +708,12 @@ fn is_row_major(t: &RsTensor, shape: &[i64]) -> bool {
 /// Writes a contiguous row-major result into a (possibly strided) descriptor.
 /// A row-major output is one transfer; a strided one stages the span, edits it
 /// on the host and writes it back.
-fn scatter(t: &mut RsTensor, data: &[u8], width: usize, host: &mut dyn Allocator) -> Result<(), String> {
+pub(crate) fn scatter(
+    t: &mut RsTensor,
+    data: &[u8],
+    width: usize,
+    host: &mut dyn Allocator,
+) -> Result<(), String> {
     let shape = logical_shape(t);
     let rank = (t.rank as usize).min(shape.len());
     let strides = &t.stride[..rank];
@@ -752,7 +761,7 @@ fn scatter(t: &mut RsTensor, data: &[u8], width: usize, host: &mut dyn Allocator
 
 /// Copies one tensor into another, honouring both descriptors' shapes and
 /// strides. The shapes must agree; the data layouts need not.
-fn copy_tensor(
+pub(crate) fn copy_tensor(
     input: &RsTensor,
     output: &mut RsTensor,
     host: &mut dyn Allocator,
@@ -1001,8 +1010,18 @@ mod tests {
         let mut host = HostAllocator::new();
         let input_bytes = 4u64 * 4;
         let input_ptr = host.alloc(input_bytes, RsDeviceKind::CPU).unwrap();
-        host.copy_in(input_ptr, input_bytes, &[1.0f32.to_le_bytes(), 2.0f32.to_le_bytes(), 3.0f32.to_le_bytes(), 4.0f32.to_le_bytes()].concat())
-            .unwrap();
+        host.copy_in(
+            input_ptr,
+            input_bytes,
+            &[
+                1.0f32.to_le_bytes(),
+                2.0f32.to_le_bytes(),
+                3.0f32.to_le_bytes(),
+                4.0f32.to_le_bytes(),
+            ]
+            .concat(),
+        )
+        .unwrap();
         let output_ptr = host.alloc(input_bytes, RsDeviceKind::CPU).unwrap();
 
         let mut input = RsTensor::new(RsDtype::F32, &[4]);

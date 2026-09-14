@@ -23,12 +23,14 @@
 pub mod collective;
 pub mod conformance;
 pub mod device;
+pub mod nccl;
 
 pub use collective::{
     CollectiveBackend, CollectiveKind, CollectiveReport, CollectiveRequest, SingleRank,
     ThreadBackend, ThreadShared,
 };
 pub use device::CudaAllocator;
+pub use nccl::NcclBackend;
 
 use std::ffi::c_void;
 
