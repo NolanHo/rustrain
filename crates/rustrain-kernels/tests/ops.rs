@@ -504,7 +504,13 @@ fn gated_delta_rule_memory_reports_its_scratch() {
     let g = Owned::f32(&[1, 4, 1], vec![0.0; 4]);
     let mut req = RsMemReq::default();
     let io: Vec<*const RsTensor> = vec![&q.t, &q.t, &v.t, &g.t, &g.t];
-    let attrs = attrs_view(&[ai64("chunk_size", 2)]);
+    // The attribute array is bound to a local first: `attrs_view` borrows the slice, and a
+    // temporary passed straight into the call dies at the end of its statement, leaving the
+    // view pointing at freed stack. The plugin then read a garbage `key` pointer and segfaulted
+    // inside the name comparison — on the release build it does, on another layout it merely
+    // reads the wrong attribute, which is the worse of the two outcomes.
+    let attr_items = [ai64("chunk_size", 2)];
+    let attrs = attrs_view(&attr_items);
     let st = unsafe { (o.memory.unwrap())(io.as_ptr(), io.len() as u32, &attrs, &mut req) };
     assert_eq!(st, 0);
     assert_eq!(req.workspace_bytes, 448);

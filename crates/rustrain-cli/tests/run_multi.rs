@@ -356,6 +356,12 @@ fn the_metrics_report_counts_what_parallel_effects_mean() {
         serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
     assert_eq!(doc["format"], "rustrain.sweep.v1");
     assert_eq!(doc["probe_tokens"], serde_json::json!([0, 1, 2, 3]));
+    // The verdict says which dtype it judged and against which bound, and only an f32 sweep
+    // claims to be a gate (spec D6.11: bf16's reassociation noise is the same decade as the
+    // dropped-partial bug the sweep is looking for).
+    assert_eq!(doc["dtype"], "f32");
+    assert_eq!(doc["bound_relative"].as_f64().unwrap(), 1e-5);
+    assert_eq!(doc["gating"], serde_json::Value::Bool(true));
 
     // The loader reads what the rank needs and nothing else: at world 1 that is every byte of
     // every tensor, and at tp = 2 the `tp`-sharded tensors are read only in part. Both numbers

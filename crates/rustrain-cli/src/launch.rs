@@ -179,9 +179,12 @@ pub(crate) fn launch(args: LaunchArgs) -> Result<()> {
             runs.push((*cfg, result));
         }
         run::sweep_report(
-            &args.out,
-            &args.model,
-            &args.checkpoint,
+            &run::SweepIdentity {
+                out: &args.out,
+                model: &args.model,
+                checkpoint: &args.checkpoint,
+                dtype: args.dtype,
+            },
             &tokens,
             &baseline_cfg,
             &baseline,

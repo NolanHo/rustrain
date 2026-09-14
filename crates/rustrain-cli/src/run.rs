@@ -11,16 +11,19 @@
 //! Widening to f32 would double the device bytes and the host traffic without adding any
 //! precision the model has. `--dtype f32` keeps the widened plan for the f32-only reference
 //! provider, `check --dtype f32` and debugging; the widening is exact (bf16 ⊂ f32). The dump
-//! stays f32 either way, so the HF comparison does not change: its reference is dumped with
-//! `--dtype bf16`, and the spec's 1% tolerance (`max_abs_diff / max_abs` on the logits and the
-//! per-layer summaries) absorbs HF's own bf16 rounding, not the run's dtype.
+//! stays f32 either way, but the *reference* must be dumped in the run's dtype: a bf16 run
+//! against an f32 reference reports the dtype, not the implementation (HF's own bf16 forward
+//! sits 1.5e-1 from its own f32 forward on the logits — spec D6.11). So the sidecar carries a
+//! machine-readable `dtype` token beside the prose, and the comparison script refuses a mixed
+//! pair instead of applying the f32 tolerance to it.
 //!
-//! D6's numeric claim is a different one, against **our own** world-1 run: the collectives
-//! reorder f32 summation (an all-reduce adds partials instead of one sequential accumulation),
-//! so bit-identity is not claimed; the acceptance bound is a *relative* one —
-//! `max_abs_diff / max_abs(baseline) ≤ 1e-5` — comfortably above the reassociation noise
-//! (≲1e-7 for these magnitudes) and orders of magnitude below what a wrong shard slice or a
-//! dropped partial would produce.
+//! D6's numeric claim is a different one, against **our own** world-1 run: changing the mesh
+//! changes every GEMM's shape and every collective's order, so the two runs differ by
+//! reassociation alone — no bit-identity is claimed, the bound is relative, and **it follows
+//! the dtype** ([`agreement_bound_relative`]): in f32 the reassociation stays inside 1e-5, in
+//! bf16 it lands in the same decade as the dtype's own noise (measured 9.3e-2 at tp=4, spec
+//! D6.11). The f32 sweep is therefore the one that proves the sharding; the bf16 sweep number
+//! is a dtype noise level, and the report names the bound it used.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
@@ -43,10 +46,36 @@ use crate::npz::{self, Npy};
 /// The completion view's output slot name — where the runner reads the full
 /// (replicated) logits when the plan leaves them distributed.
 const LOGITS_COMPLETE: &str = "__run__.logits.complete";
-/// The D6 numeric acceptance bound, relative to the baseline's max magnitude.
-pub(crate) const AGREEMENT_BOUND_RELATIVE: f64 = 1e-5;
+/// The D6 numeric acceptance bound, relative to the baseline's max magnitude, for an **f32** run.
+///
+/// Well above the reassociation noise and well below what a wrong shard slice or a dropped
+/// partial would produce. Measured end to end on the host (S=8, `max|logits|` 12.98): 2.670e-5
+/// (tp=2), 3.338e-5 (tp=4), 2.766e-5 (tp=8) — 3–4× inside the bound, which is the margin the
+/// 40-layer accumulation actually needs.
+pub(crate) const AGREEMENT_BOUND_RELATIVE_F32: f64 = 1e-5;
+/// The same bound for a **bf16** run, where reassociation is not noise but the dtype's own
+/// rounding: bf16 carries 8 significand bits, so a rounded sum moves by up to `2^-8 ≈ 3.9e-3` of
+/// its value. Measured against world 1 at S=8: 9.63e-2 (tp=2), 9.33e-2 (tp=4), 1.03e-1 (tp=8) —
+/// the same decade as HF's own bf16-vs-f32 logits spread (1.52e-1).
+///
+/// Three times the worst measurement, and a **noise level, not a gate**: at bf16 the
+/// reassociation noise is the same decade as the dropped-partial bug the sweep exists to catch,
+/// which is why the gating sweep runs `--dtype f32` and this bound only keeps a bf16 sweep
+/// honest about what it measured.
+pub(crate) const AGREEMENT_BOUND_RELATIVE_BF16: f64 = 3e-1;
 pub(crate) const METRICS_FORMAT: &str = "rustrain.metrics.v1";
 pub(crate) const SWEEP_FORMAT: &str = "rustrain.sweep.v1";
+/// What a `gating: false` sweep report is telling its reader.
+const GATING_NOTE: &str = "the gate is the same sweep at --dtype f32, where the reassociation \
+                            noise is far below the bound; a bf16 pass is a dtype noise level";
+
+/// The bound the sweep applies to a run of this dtype.
+pub(crate) fn agreement_bound_relative(dtype: RunDtype) -> f64 {
+    match dtype {
+        RunDtype::F32 => AGREEMENT_BOUND_RELATIVE_F32,
+        RunDtype::Bf16 => AGREEMENT_BOUND_RELATIVE_BF16,
+    }
+}
 
 /// The dtype the weights live in for this run, and how the loader hands them over.
 ///
@@ -490,6 +519,13 @@ pub(crate) fn emit_result(
         "collectives": result.rank0_collectives,
         "peak_bytes": result.peak_bytes,
         "wall_seconds": result.wall.as_secs_f64(),
+        // The dtype as a machine-readable token, next to the prose below. A comparison
+        // between dumps is only meaningful between equal dtypes — HF's own bf16 forward
+        // differs from its own f32 forward by more than the f32 tolerance (logits 1.5e-1
+        // measured, see `docs/design/qwen36-text/spec.md` D6.11), so a bf16 candidate
+        // judged against an f32 reference reports the dtype, not the implementation.
+        // `scripts/hf_qwen36_reference.py compare` refuses that pair by reading this field.
+        "dtype": args.dtype.to_string(),
         "precision": match args.dtype {
             RunDtype::Bf16 => {
                 "weights bf16 — the checkpoint's own dtype, copied through unchanged (2 bytes \
@@ -1853,14 +1889,27 @@ fn run_sweep(args: &RunArgs, tokens: &[i64], list: &str, device: DeviceSpec) -> 
         runs.push((*cfg, result));
     }
     sweep_report(
-        out,
-        &args.model,
-        &args.checkpoint,
+        &SweepIdentity {
+            out,
+            model: &args.model,
+            checkpoint: &args.checkpoint,
+            dtype: args.dtype,
+        },
         tokens,
         &baseline_cfg,
         &baseline,
         &runs,
     )
+}
+
+/// Where a sweep report goes and what it says it ran. Grouped into one value because the
+/// identity is four fields wide (output path, model, checkpoint, dtype) and a sweep that grows
+/// another one should not grow another parameter.
+pub(crate) struct SweepIdentity<'a> {
+    pub out: &'a Path,
+    pub model: &'a Path,
+    pub checkpoint: &'a Path,
+    pub dtype: RunDtype,
 }
 
 /// Turns a baseline plus one result per configuration into the sweep report —
@@ -1869,15 +1918,25 @@ fn run_sweep(args: &RunArgs, tokens: &[i64], list: &str, device: DeviceSpec) -> 
 /// Shared by the in-process sweep and by `launch`, so a multi-process sweep and
 /// a threaded one cannot drift into two different report formats: the numbers
 /// differ, the shape does not.
+///
+/// The bound it judges each configuration against follows the run's dtype
+/// ([`agreement_bound_relative`]) and the report names both, so a bf16 number is never read
+/// against an f32 bound.
 pub(crate) fn sweep_report(
-    out: &Path,
-    model: &Path,
-    checkpoint: &Path,
+    identity: &SweepIdentity<'_>,
     tokens: &[i64],
     baseline_cfg: &ParallelConfig,
     baseline: &MeshResult,
     runs: &[(ParallelConfig, MeshResult)],
 ) -> Result<()> {
+    let SweepIdentity {
+        out,
+        model,
+        checkpoint,
+        dtype,
+    } = *identity;
+    let bound_relative = agreement_bound_relative(dtype);
+    let gating = matches!(dtype, RunDtype::F32);
     let baseline_max = max_abs(&baseline.logits);
     if baseline.logits.is_empty() {
         bail!("the world-1 baseline produced no logits");
@@ -1894,7 +1953,7 @@ pub(crate) fn sweep_report(
             );
         }
         let diff = max_abs_diff(&baseline.logits, &result.logits);
-        let bound = AGREEMENT_BOUND_RELATIVE * baseline_max;
+        let bound = bound_relative * baseline_max;
         entries.push(serde_json::json!({
             "degrees": {
                 "tp": cfg.tensor, "cp": cfg.context, "ep": cfg.expert,
@@ -1915,7 +1974,13 @@ pub(crate) fn sweep_report(
         "model": model.display().to_string(),
         "checkpoint": checkpoint.display().to_string(),
         "probe_tokens": tokens,
-        "bound_relative": AGREEMENT_BOUND_RELATIVE,
+        "dtype": dtype.to_string(),
+        "bound_relative": bound_relative,
+        // Whether this report's verdict is a gate. It is not, for bf16: the reassociation noise
+        // there is the same decade as the dropped-partial bug the sweep is looking for, so
+        // `pass` says "inside the dtype's own noise", not "the sharding is right" (D6.11).
+        "gating": gating,
+        "gating_note": GATING_NOTE,
         "baseline": {
             "degrees": {
                 "tp": baseline_cfg.tensor, "cp": baseline_cfg.context, "ep": baseline_cfg.expert,
@@ -1934,10 +1999,17 @@ pub(crate) fn sweep_report(
 
     let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
     println!(
-        "sweep {} over {} config(s)  baseline world 1 (max |logits| {:.3e})",
+        "sweep {} over {} config(s)  baseline world 1 (max |logits| {:.3e})  dtype {}  bound {:.1e}{}",
         model.display(),
         runs.len(),
-        baseline_max
+        baseline_max,
+        dtype,
+        bound_relative,
+        if gating {
+            ""
+        } else {
+            "  [not a gate: bf16 noise level, see gating_note]"
+        },
     );
     for ((cfg, _), entry) in runs.iter().zip(&entries) {
         let diff = entry["max_abs_diff"].as_f64().unwrap_or(f64::NAN);
@@ -2294,6 +2366,18 @@ mod tests {
                 slot.name
             );
         }
+    }
+
+    /// The sweep's bound is a property of the dtype, and only the f32 one is a gate: bf16's
+    /// reassociation noise (measured 0.93–1.03e-1, spec D6.11) is the same decade as the
+    /// dropped-partial bug the sweep looks for, so a bf16 `pass` is a noise level.
+    #[test]
+    fn the_agreement_bound_follows_the_dtype_and_only_f32_gates() {
+        assert_eq!(agreement_bound_relative(RunDtype::F32), 1e-5);
+        assert_eq!(agreement_bound_relative(RunDtype::Bf16), 3e-1);
+        // Ten times looser and sixteen times tighter is the whole point: at 1e-5 every bf16
+        // mesh would fail (1.219 / 1.306e-4 measured), and at 3e-1 no f32 bug would be caught.
+        assert!(agreement_bound_relative(RunDtype::Bf16) > agreement_bound_relative(RunDtype::F32));
     }
 
     /// The dump's bf16 -> f32 conversion is exact: bf16 is a subset of f32, so the npz the HF

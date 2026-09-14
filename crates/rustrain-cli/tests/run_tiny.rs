@@ -262,6 +262,15 @@ fn run_executes_the_tiny_forward_and_writes_the_dump_the_script_reads() {
         dir.join("candidate.npz.json").is_file(),
         "the sidecar lands next to the dump"
     );
+    // The comparison script reads this token to decide which tolerance the pair gets; without
+    // it a bf16 dump was judged against an f32 reference at the f32 bound (spec D6.11).
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("candidate.npz.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        sidecar["dtype"], "f32",
+        "the sidecar names the dtype as a token, not only as prose"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -14,8 +14,8 @@
 //! widening them to f32 would double the host traffic and the device bytes without adding any
 //! precision the model has. `--dtype f32` widens bf16/f16/f32 weights to f32 — exact for bf16 and
 //! f16 (both are subsets of f32) — for the f32-only reference provider and `check --dtype f32`.
-//! The HF reference dump is bf16; the spec's 1% tolerance absorbs HF's own bf16 rounding, not the
-//! run's dtype.
+//! Numerical claims are only made between dumps of one dtype; see `run.rs`'s header and spec
+//! D6.11 for what that costs the comparison.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

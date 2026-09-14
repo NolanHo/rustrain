@@ -59,9 +59,9 @@ enum Command {
     /// (the model's precision; f32 would double the host traffic and the device bytes for
     /// nothing), and the plan resolves bf16 variants such as `cuda.aten.bf16`. `--dtype f32`
     /// widens them (exact — bf16 is a subset of f32) for the f32-only reference provider and
-    /// debugging. The dump stays f32 either way; the HF reference is dumped with
-    /// `--dtype bf16`, and the spec's 1% tolerance absorbs HF's bf16 rounding, not the run's
-    /// dtype.
+    /// debugging. The dump stays f32 either way, but the HF reference must be dumped in the
+    /// run's own dtype: the sidecar carries a `dtype` token and the comparison refuses a mixed
+    /// pair (spec D6.11).
     Run(run::RunArgs),
     /// Run a multi-rank world as one process per GPU (`world = tp × cp × ep × dp × pp`).
     ///
