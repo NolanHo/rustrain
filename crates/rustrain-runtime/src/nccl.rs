@@ -618,6 +618,42 @@ fn member_offset(
     (outer * degree * along + member_index * along) * inner
 }
 
+/// The element offset of one outer block in a *local* buffer — one that is
+/// already sharded, and therefore has no member axis. Folding a member index
+/// into this offset is the one way the collective arithmetic goes silently
+/// wrong on every rank but the root: the root's own slab lands where the
+/// destination expects it either way.
+fn local_offset(outer: usize, along: usize, inner: usize) -> usize {
+    member_offset(outer, 0, along, inner, 1)
+}
+
+/// The `(send, recv)` element offsets this rank passes to `ncclAllGather` for
+/// one outer block. The source is this rank's local buffer; the destination is
+/// the gathered tensor, which *does* interleave members — NCCL adds this
+/// rank's own slot (`rank * count`) to `recv` inside the call.
+fn all_gather_offsets(outer: usize, along: usize, inner: usize, degree: usize) -> (usize, usize) {
+    (
+        local_offset(outer, along, inner),
+        member_offset(outer, 0, along, inner, degree),
+    )
+}
+
+/// The `(send, recv)` element offsets for `ncclReduceScatter`, the mirror
+/// image: the source holds `degree` chunks per outer block and NCCL selects
+/// this rank's chunk inside the call, so the destination — the local buffer —
+/// is the side without a member axis.
+fn reduce_scatter_offsets(
+    outer: usize,
+    along: usize,
+    inner: usize,
+    degree: usize,
+) -> (usize, usize) {
+    (
+        member_offset(outer, 0, along, inner, degree),
+        local_offset(outer, along, inner),
+    )
+}
+
 impl NcclBackend {
     /// The contiguous-buffer implementation every collective goes through: the
     /// direct path passes the slots' own pointers, the staged path passes
@@ -691,8 +727,8 @@ impl NcclBackend {
                 }
                 call(unsafe { (self.lib.group_start)() }, "ncclGroupStart")?;
                 for outer in 0..segments.outer {
-                    let send = member_offset(outer, comm.index, segments.along, segments.inner, 1);
-                    let recv = member_offset(outer, 0, segments.along, segments.inner, degree);
+                    let (send, recv) =
+                        all_gather_offsets(outer, segments.along, segments.inner, degree);
                     let count = segments.along * segments.inner;
                     // SAFETY: the block offsets stay inside both buffers, whose
                     // extents the shape check above established.
@@ -723,10 +759,11 @@ impl NcclBackend {
                 }
                 call(unsafe { (self.lib.group_start)() }, "ncclGroupStart")?;
                 for outer in 0..segments.outer {
-                    // The source holds `degree` chunks per outer block; this
-                    // rank keeps its own.
-                    let send = member_offset(outer, 0, segments.along, segments.inner, degree);
-                    let recv = member_offset(outer, comm.index, segments.along, segments.inner, 1);
+                    // The source holds `degree` chunks per outer block and NCCL
+                    // picks this rank's own chunk inside the call; the
+                    // destination is this rank's local buffer.
+                    let (send, recv) =
+                        reduce_scatter_offsets(outer, segments.along, segments.inner, degree);
                     let count = segments.along * segments.inner;
                     // SAFETY: as in all_gather — offsets inside both buffers.
                     let code = unsafe {
@@ -1061,6 +1098,94 @@ mod tests {
         // block.
         assert_eq!(member_offset(0, 1, 4, 3, 2), 12);
         assert_eq!(member_offset(1, 1, 4, 3, 2), 12 + 24);
+    }
+
+    /// `ncclAllGather`'s two offsets, emulated over in-memory buffers: every
+    /// rank sends its *local* block and NCCL walks the members of the gathered
+    /// tensor. Folding a member index into the send offset shifts every
+    /// non-root rank's slab by one block and reads past the local buffer on the
+    /// last outer block — while the root's own half stays correct, which is the
+    /// one thing a "the first half agrees" smoke test does check.
+    #[test]
+    fn all_gather_offsets_place_every_member_s_slab_where_the_gathered_shape_says() {
+        for (local_shape, dim, degree) in [
+            (&[4i64, 3][..], 0usize, 2usize),
+            (&[8, 6][..], 1, 3),
+            (&[2, 3, 4][..], 1, 2),
+        ] {
+            let segments = Segments::of(local_shape, dim).unwrap();
+            let count = segments.along * segments.inner;
+            let local_total: usize = local_shape.iter().product::<i64>() as usize;
+            // Every rank labels its own elements, so a misplaced slab cannot
+            // pass for a correct one.
+            let locals: Vec<Vec<i64>> = (0..degree)
+                .map(|rank| {
+                    (0..local_total)
+                        .map(|k| rank as i64 * 1000 + k as i64)
+                        .collect()
+                })
+                .collect();
+            let mut gathered = vec![-1i64; local_total * degree];
+            for outer in 0..segments.outer {
+                let (send, recv) =
+                    all_gather_offsets(outer, segments.along, segments.inner, degree);
+                for (rank, local) in locals.iter().enumerate() {
+                    // NCCL adds the member's own slot to `recv` inside the call.
+                    let at = recv + rank * count;
+                    gathered[at..at + count].copy_from_slice(&local[send..send + count]);
+                }
+            }
+            let block = degree * count;
+            let expected: Vec<i64> = (0..gathered.len())
+                .map(|flat| {
+                    let outer = flat / block;
+                    let rank = (flat % block) / count;
+                    rank as i64 * 1000 + (outer * count + flat % count) as i64
+                })
+                .collect();
+            assert_eq!(
+                gathered, expected,
+                "{local_shape:?} along dim {dim} over {degree} rank(s)"
+            );
+        }
+    }
+
+    /// The mirror image: `ncclReduceScatter` reads the full tensor, picks this
+    /// rank's chunk inside the call, and writes it into the rank's *local*
+    /// buffer — so the member index belongs in the chunk NCCL selects, never in
+    /// the `recv` offset.
+    #[test]
+    fn reduce_scatter_offsets_keep_each_rank_s_own_chunk_in_its_local_buffer() {
+        for (global_shape, dim, degree) in [
+            (&[8i64, 3][..], 0usize, 2usize),
+            (&[8, 6][..], 1, 3),
+            (&[2, 4, 3][..], 1, 2),
+        ] {
+            let mut local_shape = global_shape.to_vec();
+            local_shape[dim] /= degree as i64;
+            let segments = Segments::of(&local_shape, dim).unwrap();
+            let count = segments.along * segments.inner;
+            let source: Vec<i64> = (0..global_shape.iter().product::<i64>()).collect();
+            for rank in 0..degree {
+                let mut local = vec![-1i64; source.len() / degree];
+                for outer in 0..segments.outer {
+                    let (send, recv) =
+                        reduce_scatter_offsets(outer, segments.along, segments.inner, degree);
+                    // NCCL picks this rank's chunk out of the send buffer.
+                    let at = send + rank * count;
+                    local[recv..recv + count].copy_from_slice(&source[at..at + count]);
+                }
+                let expected: Vec<i64> = (0..local.len())
+                    .map(|flat| {
+                        ((flat / count) * degree + rank) as i64 * count as i64 + (flat % count) as i64
+                    })
+                    .collect();
+                assert_eq!(
+                    local, expected,
+                    "{global_shape:?} along dim {dim} over {degree} rank(s), rank {rank}"
+                );
+            }
+        }
     }
 
     /// The dtype and reduce-op tables are the ABI's, and an unnameable value is

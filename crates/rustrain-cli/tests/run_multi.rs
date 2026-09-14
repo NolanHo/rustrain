@@ -12,6 +12,19 @@
 //! cp=4, dp=2, tp=2,dp=2 — the cp/dp cases against the fixtures that declare
 //! the input sharded along those axes, where the runner's completion view
 //! forces the all-gather and the dump reads the gathered tensor.
+//!
+//! `run-tiny-logits` closes the last hole in that table: every other fixture's
+//! logits are replicated by the time the dump reads them, so no case gathered
+//! a **vocabulary-sharded** tensor — the shape the real model's `lm_head` has.
+//! Its head is bound on the vocabulary axis, so rank 0 can only produce the
+//! baseline's width and values if the completion view, the inserted gather and
+//! the per-member slab placement are all right. (The NCCL half of that placement
+//! needs GPUs; it is pinned separately in `rustrain-runtime`'s `nccl` tests and
+//! exercised end-to-end on the verification host with this same fixture.)
+//!
+//! **This box runs the host-assembly collective backend.** A defect that lives
+//! only in the NCCL backend's pointer arithmetic is invisible here — one
+//! backend's green tests are not evidence about the other.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -41,13 +54,36 @@ fn bf16_bytes(values: &[f32]) -> Vec<u8> {
     out
 }
 
-/// The D6 tiny checkpoint: one embed table plus two towers' up/down pairs, all
-/// real safetensors bytes (header + bf16 data + index) — the same shapes every
-/// fixture in this file binds. `t0` carries the tp declarations, `t1` the ep
-/// ones; the cp/dp fixtures bind the same tensors with no axes (replicated
-/// weights, sharded sequence).
+/// The D6 tiny checkpoint: one embed table, two towers' up/down pairs and the
+/// vocabulary head, all real safetensors bytes (header + bf16 data + index) —
+/// the same shapes every fixture in this file binds. `t0` carries the tp
+/// declarations, `t1` the ep ones; the cp/dp fixtures bind the same tensors
+/// with no axes (replicated weights, sharded sequence); `run-tiny-logits`
+/// binds the head on the vocabulary axis, so its logits are sharded until the
+/// runner's completion view gathers them.
 fn write_checkpoint(dir: &Path) {
-    let tensors: Vec<(&str, Vec<i64>, Vec<f32>)> = vec![
+    write_tensors(dir, &tiny_tensors());
+}
+
+/// The same checkpoint plus the vocabulary head, for `run-tiny-logits`: a
+/// checkpoint tensor no binding consumes is a hard error, so the head can only
+/// live in a checkpoint the head fixture is the one to load.
+fn write_checkpoint_with_head(dir: &Path) {
+    let mut tensors = tiny_tensors();
+    // head [8, 4] (checkpoint [vocab, hidden], transposed into the [4, 8]
+    // slot): the vocabulary axis is the one that gets sharded, so only the
+    // completed (gathered) tensor has the baseline's width.
+    tensors.push((
+        "model.head.weight",
+        vec![8, 4],
+        (0..32).map(|o| (o + 5) as f32).collect(),
+    ));
+    write_tensors(dir, &tensors);
+}
+
+/// Every tensor the fixtures other than `run-tiny-logits` bind.
+fn tiny_tensors() -> Vec<(&'static str, Vec<i64>, Vec<f32>)> {
+    vec![
         // embed [8, 4]: E[i][j] = i*4 + j + 1
         (
             "model.embed.weight",
@@ -78,11 +114,13 @@ fn write_checkpoint(dir: &Path) {
             vec![4, 12],
             (0..48).map(|o| (o + 3) as f32).collect(),
         ),
-    ];
+    ]
+}
 
+fn write_tensors(dir: &Path, tensors: &[(&str, Vec<i64>, Vec<f32>)]) {
     let mut payload = Vec::new();
     let mut header = serde_json::Map::new();
-    for (name, shape, values) in &tensors {
+    for (name, shape, values) in tensors {
         let start = payload.len();
         payload.extend_from_slice(&bf16_bytes(values));
         let end = payload.len();
@@ -102,15 +140,18 @@ fn write_checkpoint(dir: &Path) {
     shard.extend_from_slice(&payload);
     std::fs::write(dir.join("model.safetensors"), &shard).unwrap();
 
+    let weight_map: serde_json::Map<String, serde_json::Value> = tensors
+        .iter()
+        .map(|(name, _, _)| {
+            (
+                (*name).to_string(),
+                serde_json::json!("model.safetensors"),
+            )
+        })
+        .collect();
     let index = serde_json::json!({
         "metadata": {"total_size": payload.len()},
-        "weight_map": {
-            "model.embed.weight": "model.safetensors",
-            "model.t0.up.weight": "model.safetensors",
-            "model.t0.down.weight": "model.safetensors",
-            "model.t1.up.weight": "model.safetensors",
-            "model.t1.down.weight": "model.safetensors",
-        },
+        "weight_map": weight_map,
     });
     std::fs::write(
         dir.join("model.safetensors.index.json"),
@@ -180,6 +221,18 @@ fn the_sharded_logits_agree_with_the_world1_forward() {
     let dir = std::env::temp_dir().join(format!("rustrain-run-multi-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     write_checkpoint(&dir);
+    // `run-tiny-logits` binds a checkpoint tensor the other fixtures do not, and
+    // an unconsumed tensor is a hard error, so it loads its own checkpoint.
+    let head_dir = dir.join("with-head");
+    std::fs::create_dir_all(&head_dir).unwrap();
+    write_checkpoint_with_head(&head_dir);
+    let checkpoint_of = |fixture_name: &str| -> &Path {
+        if fixture_name == "run-tiny-logits" {
+            &head_dir
+        } else {
+            &dir
+        }
+    };
 
     // (fixture, mesh flags, label)
     let cases: &[(&str, &[&str], &str)] = &[
@@ -192,11 +245,16 @@ fn the_sharded_logits_agree_with_the_world1_forward() {
         ("run-tiny-cp", &["--tp", "2", "--cp", "2"], "tp=2,cp=2"),
         ("run-tiny-dp", &["--dp", "2"], "dp=2"),
         ("run-tiny-dp", &["--tp", "2", "--dp", "2"], "tp=2,dp=2"),
+        // The vocabulary head is sharded: the dump can only have the baseline's
+        // width if the completion view plus its gather ran and landed the
+        // members' slabs in member order.
+        ("run-tiny-logits", &["--tp", "2"], "tp=2, sharded head"),
+        ("run-tiny-logits", &["--tp", "4"], "tp=4, sharded head"),
     ];
 
     // The world-1 baselines, one per fixture.
     let mut baselines: Vec<(&str, Vec<f32>)> = Vec::new();
-    for fixture_name in ["run-tiny-par", "run-tiny-cp", "run-tiny-dp"] {
+    for fixture_name in ["run-tiny-par", "run-tiny-cp", "run-tiny-dp", "run-tiny-logits"] {
         let out = dir.join(format!("base-{fixture_name}.npz"));
         let model_dir = fixture(fixture_name);
         let (ok, _, stderr) = run_cli(&[
@@ -204,7 +262,7 @@ fn the_sharded_logits_agree_with_the_world1_forward() {
             "--model",
             model_dir.to_str().unwrap(),
             "--checkpoint",
-            dir.to_str().unwrap(),
+            checkpoint_of(fixture_name).to_str().unwrap(),
             "--tokens",
             "0,1,2,3",
             "--out",
@@ -222,7 +280,7 @@ fn the_sharded_logits_agree_with_the_world1_forward() {
             "--model",
             model_dir.to_str().unwrap(),
             "--checkpoint",
-            dir.to_str().unwrap(),
+            checkpoint_of(fixture_name).to_str().unwrap(),
             "--tokens",
             "0,1,2,3",
             "--out",
