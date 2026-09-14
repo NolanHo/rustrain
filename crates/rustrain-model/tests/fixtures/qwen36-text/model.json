@@ -2449,7 +2449,11 @@
    ],
    "axes": {
     "1": [
-     "tp"
+     {
+      "axis": "tp",
+      "mode": "replicate",
+      "unit": "head_dim"
+     }
     ]
    }
   },
@@ -2461,7 +2465,11 @@
    ],
    "axes": {
     "1": [
-     "tp"
+     {
+      "axis": "tp",
+      "mode": "replicate",
+      "unit": "head_dim"
+     }
     ]
    }
   },
@@ -2624,7 +2632,11 @@
    ],
    "axes": {
     "1": [
-     "tp"
+     {
+      "axis": "tp",
+      "mode": "replicate",
+      "unit": "head_dim"
+     }
     ]
    }
   },
@@ -2636,7 +2648,11 @@
    ],
    "axes": {
     "1": [
-     "tp"
+     {
+      "axis": "tp",
+      "mode": "replicate",
+      "unit": "head_dim"
+     }
     ]
    }
   },

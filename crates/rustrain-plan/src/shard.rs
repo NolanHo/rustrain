@@ -11,7 +11,8 @@
 
 use rustrain_parallel::{
     Collective, DimNormalizer, GroupMask, Mesh, ParallelLayout, PartialSpec, ReduceOp, ShardError,
-    ShardMode, ShardSpec, transitions};
+    ShardMode, ShardSpec, transitions,
+};
 
 use crate::PlanError;
 use crate::attrs::Attrs;
@@ -271,6 +272,10 @@ pub struct DerivedShards {
 /// spellings are mixed: a rule that copied one onto the other renamed the axis,
 /// and the transition table then refused a conversion nobody should have asked
 /// for. Resolution is what makes the two spellings provably one fact.
+// The rule table needs each operand's rank *and* its shape, one entry per layout: eight values
+// that belong together, and bundling them into a struct would only rebuild the same list at
+// every call site.
+#[allow(clippy::too_many_arguments)]
 pub fn derive(
     rule: ShardRule,
     op: &str,
@@ -278,6 +283,8 @@ pub fn derive(
     declared_outputs: &[ParallelLayout],
     input_ranks: &[i64],
     output_ranks: &[i64],
+    input_shapes: &[Vec<i64>],
+    output_shapes: &[Vec<i64>],
 ) -> Result<DerivedShards, DeriveError> {
     let inputs: Vec<ParallelLayout> = declared_inputs
         .iter()
@@ -331,7 +338,16 @@ pub fn derive(
             let out = if anchor.partial.is_some() {
                 ParallelLayout::replicate()
             } else {
-                carry_to_output_rank(&anchor, anchor_rank, out_rank, op, 0, trailing)?
+                carry_to_output_rank(
+                    &anchor,
+                    anchor_rank,
+                    out_rank,
+                    op,
+                    0,
+                    trailing,
+                    input_shapes.first().map(Vec::as_slice),
+                    output_shapes.first().map(Vec::as_slice),
+                )?
             };
 
             let required_inputs: Vec<ParallelLayout> = inputs
@@ -660,6 +676,7 @@ fn single_shard(l: &ParallelLayout) -> Option<ShardSpec> {
 /// expressible exactly while the output still has that axis. In every case a shard whose
 /// mapped axis does not exist — a scalar operand, a dim that never resolved against its own
 /// rank, or a shrink past the shard's axis — is refused rather than renamed.
+#[allow(clippy::too_many_arguments)]
 fn carry_to_output_rank(
     layout: &ParallelLayout,
     rank: i64,
@@ -667,6 +684,8 @@ fn carry_to_output_rank(
     op: &str,
     operand: usize,
     trailing: bool,
+    in_shape: Option<&[i64]>,
+    out_shape: Option<&[i64]>,
 ) -> Result<ParallelLayout, DeriveError> {
     if rank == out_rank {
         return Ok(layout.clone());
@@ -684,13 +703,47 @@ fn carry_to_output_rank(
         });
     }
     let offset = if trailing { out_rank - rank } else { 0 };
+    // A refold that gives the last axis more axes of its own: a shard on it stays on the outer
+    // piece, and a replicating shard's unit becomes units of that piece.
+    let refold_inner = if !trailing && rank < out_rank {
+        match (in_shape, out_shape) {
+            (Some(input), Some(output)) => {
+                let extra = (out_rank - rank) as usize;
+                if output.len() < extra || input.is_empty() {
+                    None
+                } else {
+                    let inner: i64 = output[output.len() - extra..].iter().product();
+                    Some(inner.max(1))
+                }
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
     let dims: Vec<ShardSpec> = layout
         .dims
         .iter()
-        .map(|spec| ShardSpec {
-            dim: spec.dim + offset,
-            group: spec.group,
-            mode: spec.mode,
+        .map(|spec| {
+            let mut mapped = ShardSpec {
+                dim: spec.dim + offset,
+                group: spec.group,
+                mode: spec.mode,
+            };
+            // Only the last operand axis is refolded, and only a replicating shard has a unit.
+            if let (Some(inner), ShardMode::Replicate { unit }) = (refold_inner, spec.mode) {
+                if spec.dim == rank - 1 {
+                    if unit % inner == 0 {
+                        mapped.mode = ShardMode::Replicate { unit: unit / inner };
+                    } else {
+                        // The unit is finer than the elements the refold puts inside one output
+                        // element: a whole number of output elements per slab cannot be
+                        // expressed, so this is refused rather than rounded.
+                        mapped.mode = spec.mode;
+                    }
+                }
+            }
+            mapped
         })
         .collect();
     if dims.iter().any(|spec| spec.dim < 0 || spec.dim >= out_rank) {
@@ -701,6 +754,23 @@ fn carry_to_output_rank(
             rank,
             out_rank,
         });
+    }
+    if let Some(inner) = refold_inner {
+        for spec in &layout.dims {
+            if spec.dim == rank - 1 {
+                if let ShardMode::Replicate { unit } = spec.mode {
+                    if unit % inner != 0 {
+                        return Err(DeriveError::UnmappableViewShard {
+                            op: op.to_string(),
+                            operand,
+                            layout: format!("{layout}"),
+                            rank,
+                            out_rank,
+                        });
+                    }
+                }
+            }
+        }
     }
     Ok(ParallelLayout {
         dims,
@@ -924,6 +994,16 @@ pub fn propagate(plan: &Plan, rules: &dyn ShardRules) -> Result<ShardPropagation
             .map(|s| plan.slot(*s).shape.len() as i64)
             .collect();
 
+        let input_shapes: Vec<Vec<i64>> = n
+            .inputs
+            .iter()
+            .map(|s| plan.slot(*s).shape.clone())
+            .collect();
+        let output_shapes: Vec<Vec<i64>> = n
+            .outputs
+            .iter()
+            .map(|s| plan.slot(*s).shape.clone())
+            .collect();
         let derived = derive(
             rule,
             &n.op.name,
@@ -931,6 +1011,8 @@ pub fn propagate(plan: &Plan, rules: &dyn ShardRules) -> Result<ShardPropagation
             &declared_out,
             &input_ranks,
             &output_ranks,
+            &input_shapes,
+            &output_shapes,
         )
         .map_err(|source| PlanError::ShardDerivation { node: id, source })?;
 
@@ -1360,6 +1442,8 @@ mod tests {
                 &[ParallelLayout::replicate()],
                 &[2, 2],
                 &[2],
+                &[],
+                &[],
             )
             .unwrap();
             assert_eq!(
@@ -1385,6 +1469,8 @@ mod tests {
                 &[ParallelLayout::replicate()],
                 &[2, 2],
                 &[2],
+                &[],
+                &[],
             )
             .unwrap();
             assert_eq!(
@@ -1412,6 +1498,8 @@ mod tests {
             &[ParallelLayout::replicate()],
             &[1, 2],
             &[2],
+            &[],
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -1442,6 +1530,8 @@ mod tests {
             &[ParallelLayout::replicate()],
             &[2],
             &[4],
+            &[],
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -1473,6 +1563,8 @@ mod tests {
             &[ParallelLayout::replicate()],
             &[2],
             &[4],
+            &[],
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -1487,6 +1579,8 @@ mod tests {
             &[ParallelLayout::replicate()],
             &[4],
             &[2],
+            &[],
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -1511,6 +1605,8 @@ mod tests {
             &[ParallelLayout::replicate()],
             &[1],
             &[2],
+            &[],
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -1538,6 +1634,8 @@ mod tests {
             &[ParallelLayout::replicate()],
             &[2],
             &[1],
+            &[],
+            &[],
         )
         .unwrap_err();
         match err {
@@ -1560,6 +1658,8 @@ mod tests {
             &[ParallelLayout::replicate()],
             &[0],
             &[2],
+            &[],
+            &[],
         )
         .unwrap_err();
         match err {
@@ -1585,15 +1685,14 @@ mod tests {
             &[ParallelLayout::replicate()],
             &[3, 2],
             &[3],
+            &[],
+            &[],
         )
         .unwrap();
         assert_eq!(
             d.outputs[0],
             ParallelLayout {
-                dims: vec![
-                    ShardSpec::shard(0, tp),
-                    ShardSpec::shard(2, ep),
-                ],
+                dims: vec![ShardSpec::shard(0, tp), ShardSpec::shard(2, ep),],
                 partial: None,
             },
             "`a`'s batch shard and `b`'s output shard both survive into the output"
@@ -1615,6 +1714,8 @@ mod tests {
             &[ParallelLayout::replicate()],
             &[2, 2],
             &[1],
+            &[],
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -1629,6 +1730,8 @@ mod tests {
             &[ParallelLayout::replicate()],
             &[2, 2],
             &[1],
+            &[],
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -1643,6 +1746,8 @@ mod tests {
             &[ParallelLayout::replicate()],
             &[2, 2],
             &[1],
+            &[],
+            &[],
         )
         .unwrap_err();
         match err {
@@ -1661,10 +1766,7 @@ mod tests {
         for bad in [
             ParallelLayout::partial(ReduceOp::Sum, tp),
             ParallelLayout {
-                dims: vec![
-                    ShardSpec::shard(0, tp),
-                    ShardSpec::shard(1, ep),
-                ],
+                dims: vec![ShardSpec::shard(0, tp), ShardSpec::shard(1, ep)],
                 partial: None,
             },
         ] {
@@ -1681,6 +1783,8 @@ mod tests {
                     &[ParallelLayout::replicate()],
                     &[2, 2],
                     &[1],
+                    &[],
+                    &[],
                 )
                 .unwrap_err();
                 match err {
@@ -1708,6 +1812,8 @@ mod tests {
             &[ParallelLayout::replicate()],
             &[1, 2],
             &[2],
+            &[],
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -1731,10 +1837,7 @@ mod tests {
             // Two independent shards: no single collective turns this into a
             // `Partial` or a single `Shard`.
             ParallelLayout {
-                dims: vec![
-                    ShardSpec::shard(0, g),
-                    ShardSpec::shard(1, g),
-                ],
+                dims: vec![ShardSpec::shard(0, g), ShardSpec::shard(1, g)],
                 partial: None,
             },
             // A partial weight is not a shard at all.
@@ -1756,6 +1859,8 @@ mod tests {
                 &[ParallelLayout::replicate()],
                 &[2, 2],
                 &[2],
+                &[],
+                &[],
             )
             .unwrap_err();
             match err {
@@ -1931,6 +2036,8 @@ mod tests {
             &[ParallelLayout::replicate()],
             &[2],
             &[2],
+            &[],
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -1982,10 +2089,7 @@ mod tests {
         let plan = declared_pair_plan(
             ParallelLayout::partial(ReduceOp::Sum, tp),
             ParallelLayout {
-                dims: vec![
-                    ShardSpec::shard(0, tp),
-                    ShardSpec::shard(1, tp),
-                ],
+                dims: vec![ShardSpec::shard(0, tp), ShardSpec::shard(1, tp)],
                 partial: None,
             },
         );
@@ -2010,10 +2114,7 @@ mod tests {
         let plan = declared_pair_plan(
             ParallelLayout::partial(ReduceOp::Sum, tp),
             ParallelLayout {
-                dims: vec![
-                    ShardSpec::shard(0, tp),
-                    ShardSpec::shard(1, ep),
-                ],
+                dims: vec![ShardSpec::shard(0, tp), ShardSpec::shard(1, ep)],
                 partial: None,
             },
         );
@@ -2246,5 +2347,67 @@ mod tests {
         let prop = propagate(&plan, &rules()).unwrap();
         assert_eq!(prop.inserted.len(), 1);
         assert_eq!(prop.inserted[0].op, intrinsic::ALL_REDUCE);
+    }
+
+    /// A refold that splits the sharded axis rescales a replicating unit: a shard in units of
+    /// 256 elements on `[…, 512]` is a shard in units of one head on `[…, 2, 256]`
+    /// (`docs/design/qwen36-text/spec.md` §D6.6) — and a unit the refold would cut in half is
+    /// refused rather than rounded.
+    #[test]
+    fn a_refold_rescales_a_replicating_unit() {
+        let tp = tp_mask();
+        let heads = ParallelLayout {
+            dims: vec![ShardSpec::replicating(1, tp, 256)],
+            partial: None,
+        };
+        let out = carry_to_output_rank(
+            &heads,
+            2,
+            3,
+            "reshape",
+            0,
+            false,
+            Some(&[8, 512]),
+            Some(&[8, 2, 256]),
+        )
+        .unwrap();
+        assert_eq!(out.dims, vec![ShardSpec::replicating(1, tp, 1)]);
+
+        // A unit of 128 would straddle the refold: refused, never silently rounded to half a head.
+        let half = ParallelLayout {
+            dims: vec![ShardSpec::replicating(1, tp, 128)],
+            partial: None,
+        };
+        assert!(
+            carry_to_output_rank(
+                &half,
+                2,
+                3,
+                "reshape",
+                0,
+                false,
+                Some(&[8, 512]),
+                Some(&[8, 2, 256]),
+            )
+            .is_err()
+        );
+
+        // A strict shard is untouched either way.
+        let strict = ParallelLayout {
+            dims: vec![ShardSpec::shard(1, tp)],
+            partial: None,
+        };
+        let out = carry_to_output_rank(
+            &strict,
+            2,
+            3,
+            "reshape",
+            0,
+            false,
+            Some(&[8, 512]),
+            Some(&[8, 2, 256]),
+        )
+        .unwrap();
+        assert_eq!(out.dims, vec![ShardSpec::shard(1, tp)]);
     }
 }

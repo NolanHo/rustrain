@@ -29,7 +29,7 @@
 
 use std::collections::BTreeMap;
 
-use rustrain_parallel::{GroupMask, Mesh, ParallelLayout, ShardSpec, ShardMode};
+use rustrain_parallel::{GroupMask, Mesh, ParallelLayout, ShardMode, ShardSpec};
 
 use crate::PlanError;
 use crate::ir::{NodeId, Plan, PlanNode, Slot, SlotId, SlotKind};
@@ -173,12 +173,14 @@ pub fn instantiate(
                 dim: dim_text.clone(),
             })?;
             for axis in axes {
-                let index = mesh.index_of(&axis.axis).ok_or_else(|| PlanError::UnknownAxis {
-                    slot: slot_name.clone(),
-                    dim: dim_text.clone(),
-                    axis: axis.axis.clone(),
-                    axes: axis_names(mesh),
-                })?;
+                let index = mesh
+                    .index_of(&axis.axis)
+                    .ok_or_else(|| PlanError::UnknownAxis {
+                        slot: slot_name.clone(),
+                        dim: dim_text.clone(),
+                        axis: axis.axis.clone(),
+                        axes: axis_names(mesh),
+                    })?;
                 // A mesh has at most `Mesh::MAX_AXES` axes, so `single` cannot overflow; an
                 // impossible overflow is still reported, not unwrapped.
                 let group =
@@ -239,6 +241,16 @@ pub fn instantiate(
             .iter()
             .map(|s| out.slot(*s).layout.clone())
             .collect();
+        let input_shapes: Vec<Vec<i64>> = node
+            .inputs
+            .iter()
+            .map(|s| plan.slot(*s).shape.clone())
+            .collect();
+        let output_shapes: Vec<Vec<i64>> = node
+            .outputs
+            .iter()
+            .map(|s| out.slot(*s).shape.clone())
+            .collect();
         let output_ranks: Vec<i64> = node
             .outputs
             .iter()
@@ -251,6 +263,8 @@ pub fn instantiate(
             &declared_out,
             &input_ranks,
             &output_ranks,
+            &input_shapes,
+            &output_shapes,
         )
         .map_err(|source| PlanError::ShardDerivation {
             node: NodeId(i),

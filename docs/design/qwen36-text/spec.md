@@ -255,7 +255,7 @@ L1 全绿（按契约 skip 的四个项除外）；`l1.instantiate` 的 `details
 |---|---|---|
 | `world=1`（GPU 基线） | ✅ | D5：40 层 f32，1382 步，6.6 s，峰值 134.2 GiB |
 | `tp=2` | ✅ 可执行（编译通过，数值待多进程验证） | 见下面的 D6.0：规则改为描述符声明后才编译得通；2 个 kv 头 ÷ 2 = 1，GQA 分组语义正确 |
-| `tp=4` / `tp=8` | ⛔ 阻断 | `rustrain check --tp 4` 在 `l1.instantiate` 报 `slot layers.3.kh`：dim 1 全局 2 不可被 4 整除。设计文档 §4 写明 **tp≥4 需 KV 复制**；且 `sdpa` 的 `num_heads`/`num_kv_heads` 是全局值，分片后还缺 **head 偏移位置常量**（`model-description.md` §4.2 步骤 4，D4 未做） |
+| `tp=4` / `tp=8` | ✅ **可执行（2026-09 落地，见 §D6.6）** | `check --tp 4`/`--tp 8` 全绿；宿主机 4/8 进程真多卡：logits 与 world=1 `max\|diff\| 3.34e-5 / 2.77e-5`（界 1.298e-4）**PASS**，42 层 hidden 最坏 rel_L2 **1.65e-6 / 1.84e-6**，argmax 全同；每 rank 权重 34.6 / 18.3 GiB（world=1 是 132 GiB），峰值 35.8 / 19.3 GiB |
 | `ep>1` | ⛔ 阻断 | `moe_layer` 声明了两个 `ALL_TO_ALL {tp, ep}`，但**计划器与编译器从不读 `RsCollective`**（读者只有 ABI 访问器和一个断言 `n_collectives == 2` 的测试）→ 声明式集合通信这条路径（I-3 的第二条）没有实现，EP 跑起来不会通信 |
 | `cp>1` | ⛔ 空转 | 描述里没有任何槽声明 `cp` 轴（只有 `tp`/`ep`），`--cp N` 只是给 mesh 加一个没人用的轴；rope 位置、卷积边界、跨 rank K/V 交换都还没有位置常量与通信声明 |
 | `dp>1` | ⚠️ 无通信 | 前向没有梯度可归约；DP 只复制权重。如实报告"权重字节不减少、集合通信 0 次" |
@@ -627,15 +627,31 @@ D6 的阻断项里（见下）。
 4 单位 8 rank 的重叠、单位不整除被拒、严格路径不变）、`an_axis_may_declare_how_its_slabs_relate`
 （两种写法 + unit 解析）。
 
-**还差的一步（诚实记录，下一步就做）**：**reshape/view 规则里的 unit 换算**。k_proj 的**权重**按
-head 单位切一次就对（512 特征 → 每 rank 1 个头），但**激活**路径是
-`k = x @ w`（[seq,512]）→ `reshape` 成 `[seq,2,256]`——这条规则现在只把 shard 的**轴号**平移，
-不知道"512 特征轴上的 unit=256"到了 `[2,256]` 上应该是"头轴 unit=1"。所以模型里的声明暂时**没有**
-启用（`model.json` 保持原样，`--tp 4` 仍精确报 `layers.3.kh` 不可整除——宁可精确拒绝，不给半个头）。
-需要给 view/reshape 的映射函数传入输入/输出**形状**，按 refold 的比例换算 unit（unit % m == 0 →
-移到外层轴、unit = unit/m；否则留在内层轴；两者都不整除 → 拒绝）。做完这一步，把
-`k_proj`/`v_proj`（含 MTP）四个 binding 改成 replicating，`check --tp 4/8` 应全绿，
-再到宿主上跑 `launch --sweep tp=4` 验收。
+**同一轮补上的那一步：reshape/view 的 unit 换算**。k_proj 的**权重**按 head 单位切一次就对，但**激活**
+路径 `k = x @ w [seq,512]` → `reshape [seq,2,256]` 的映射原先只平移轴号，不知道"512 特征轴上的
+unit=256"到了 `[2,256]` 上就是"头轴 unit=1"。现在 `derive` 多收两个形状（每个 operand 的 rank 与
+shape 一起传），`carry_to_output_rank` 在 refold 时把最后一个轴的 unit 除以新内层轴的乘积
+（`unit % Πinner == 0` 才可表达，否则**拒绝**——半个头不会被默默算出来）。测试
+`a_refold_rescales_a_replicating_unit` 钉住这两面（换算 + 拒绝）。
+
+**验收（宿主实测，`launch --sweep tp=4` / `tp=8`，各含一次 world=1 基线）**：
+
+| | tp=4（4 进程 / 4 卡） | tp=8（8 进程 / 8 卡） |
+|---|---|---|
+| logits vs world=1 `max\|diff\|` | **3.338e-5**（界 1.298e-4） | **2.766e-5** |
+| logits rel_L2 | 1.497e-6 | 1.416e-6 |
+| 42 层 hidden 最坏 rel_L2 | 1.652e-6 | 1.838e-6 |
+| argmax（8 行） | 全同 | 全同 |
+| 每 rank 权重 / 峰值 | 34.6 / 35.8 GiB | 18.3 / 19.3 GiB |
+| 每 rank 读到的字节 | 32.7 GiB | 27.1 GiB |
+| 每 rank 前向墙钟 | 8.54–9.28 s | 8.39–8.56 s |
+| 集合通信（每 rank） | 83 次（1 all_gather + 82 all_reduce） | 同左 |
+
+`check --tp 2/4/8` 现在都是 exit 0；`check --tp 3` 仍精确点名不可整除的槽（严格路径没有被削弱）。
+
+**顺带的一条证据（给 tp=2 那个 4 s 偏差）**：tp=4/tp=8 的 per-rank 墙钟**很紧**（8.4–9.3 s），
+而 tp=2 上 rank 1 曾比 rank 0 慢 4 s——说明那不是"多进程都这样"，而是 **2-rank 这一档特有的**
+（下一步就在 tp=2 上打步级时间戳）。
 
 ### D5 — 前向数值对齐 HuggingFace
 
