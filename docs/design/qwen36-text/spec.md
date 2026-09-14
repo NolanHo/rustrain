@@ -400,6 +400,99 @@ all_reduce）。工作区测试全绿、clippy 0 warning、`ops check` exit 0。
 未接线（`moe_layer` 声明的两个 `all_to_all` 仍然没有消费者 —— 门禁也看不见它，因为没有检查项断言
 "声明的集合通信都被接进 plan 了"）；`cp>1` 仍是空转（没有槽声明 `cp` 轴）。
 
+### D6.1 — NCCL 传输与 `launch`：一个只在真多卡上现形的偏移错
+
+**交付**：`rustrain-runtime` 的 NCCL 后端（运行期 `dlopen` `libnccl.so.2`，核心 crate 的依赖闭包仍零
+CUDA 链接）；`run --rank/--world/--rdzv` 的单 rank 形态；`rustrain launch` 以 `world = tp×cp×ep×dp×pp`
+个 OS 进程一进程一卡启动（rank `i` → `cuda:base+i`，CUDA context 只得在一个线程里 current，所以一张卡
+一个进程）；NCCL unique id 走**文件 rendezvous**（root 写 `comm-<mask>.id`，write-then-rename，其余成员
+轮询、有界超时，失败点名文件与 root）。运行期依赖仍是 host 侧只有 `libloading` + `libc`。
+
+**首次 tp=2 端到端跑出来的缺陷（本节的重量级内容）**：
+
+- **症状**：`tp=2` 的 logits 与 world=1 的 `max|diff| = 12.70`（相对界 1.3e-4 → FAIL）。但逐段看：
+  **前半（rank 0 自己的 vocab 分片）逐元素正确**（`max|d| 2.67e-5`，正是 GEMM 分块噪声量级），
+  **后半（rank 1 贡献的 124160 列）全错**；而两半的**统计量几乎相同**（`mean -2.1609` vs `-2.1696`、
+  `std 1.4812` vs `1.5039`、`max 7.46846` vs `7.46847`，8 行 argmax 全对）—— 看上去像"噪声偏大"。
+- **定位（三步，都可复现）**：① 按行做匹配矩阵 → `t1[i] == s1[i+1]` **逐位相等**（8 行里 7 行），即不是
+  置换、不是尺度错，而是**整体平移一个 slab**；② 一个 slab = 本地 vocab 宽度 = `along*inner` →
+  指向"本 rank 的 send 偏移多算了一个 slab"；③ 读代码：`all_gather` 的 send 写成
+  `member_offset(outer, comm.index, along, inner, 1)` —— `degree` 传 1 却把成员序号折进了**本地**缓冲区
+  一侧，等价于 `(outer + index) * slab`。rank 0 恰好正确（`index=0`），rank 1 整块平移，且最后一个
+  outer block 会**读过本地缓冲区尾部**（第 8 行匹配不上的原因）。`reduce_scatter` 的 recv 是**同一个
+  错误**（镜像方向），当时没触发而已，一并修掉。
+- **为什么门禁没抓住**：host 组装后端（`collective.rs`）是**另一个实现**且写法正确、测试全绿；CPU 盒上
+  的 D6 验收（`run_multi.rs` 的 `the_sharded_logits_agree_with_the_world1_forward`）跑的就是它，而
+  `run-tiny-par` 的 logits 在 dump 时已是 replicate —— **没有任何测试曾经 gather 过一个
+  按 vocab 切分的张量**。一个后端的绿灯对另一个后端的偏移算术零信息。
+- **修法与三条防复发（都已落地）**：
+  1. 偏移算术**只有一处**：`all_gather_offsets` / `reduce_scatter_offsets`，执行路径与测试共用；
+     "本地缓冲区没有成员轴"写在函数名与注释里，`local_offset` 不再接受成员序号（错误形态**写不出来**）。
+  2. `nccl.rs` 新增两条**内存模拟测试**（不需要 GPU）：把 rank 标进数据、复现 NCCL 的选块语义
+     （`send` 是本地块，成员轴只在目标形状里），断言组装结果等于数学拼接；**变异反证过**
+     （把成员序号折回本地一侧 → 立即越界 panic）。
+  3. 新 fixture `run-tiny-logits`：head 绑在 vocab 轴上，于是 **NCCL 端到端**也有秒级回归
+     （宿主上 `launch --sweep tp=2;tp=4`）。变异反证：把 send 改回错误形态 → tiny 也 FAIL
+     （`max|diff| 2.7e12`），修好后 **逐位相同**（`0.000e0`）。CPU 盒的 `run_multi` 覆盖计划侧
+     （dump 宽度 + 数值），宿主覆盖执行侧。
+- 规则已写进 `skills/architecture/SKILL.md` §3 禁止模式与 §5，以及 `docs/architecture.md` §3.1。
+
+### D6.2 — 正确性：tp=2 与 world=1 前向（**PASS**）
+
+同一段 token（`9707,11,1879,0,323,358,314,279`）、同一份 67 GB checkpoint、同一 `cuda.aten.f32` 插件、
+f32 执行，`rustrain launch --sweep tp=2` 的真实数字：
+
+| 判据 | 读数 | 界 |
+|---|---|---|
+| `logits` `max\|diff\|`（8×248320 全张量） | **2.670e-5** | `1e-5 × max\|logits\| = 1.298e-4` → **PASS** |
+| `logits` rel_L2 | **1.331e-6** | — |
+| 前半 / 后半 vocab 的 `max\|d\|` | 2.670e-5 / 2.575e-5 | 分片两侧**对称**（修好后才对称） |
+| 8 行 argmax | 全同 | — |
+| 42 层 hidden 逐层 rel_L2 | 最坏 **1.638e-6**（42 行全部 ≤1.6e-6） | `first divergence > 1e-3: None` |
+
+**这些数字说明什么**：两侧都是 f32、同一批权重，差别只可能来自 GEMM 分块与归约顺序 —— 2.7e-5 正是
+f32 重结合的噪声量级，比任何"切错维/漏一次通信/拿错 slab"的量级低 6 个数量级（错误版本是 12.70）。
+**与"对齐 HF 的 1%"是两回事**：那条判据在 D5 已判定为低于参考自身噪声地板；这里是分片实现的自洽性检验，
+它**不**证明数学对，证明数学对的是 D5 的 HF 对比。rel_L2 与 `max|diff|/max|logits|` 都要看，不看 `mean`
+（近零量，相对化只会放大噪声）。
+
+### D6.3 — 代价指标（每 rank，真实模型，从 sweep 报告读出）
+
+| 指标 | world=1 基线 | `tp=2` rank 0 | `tp=2` rank 1 |
+|---|---|---|---|
+| 权重字节 | 142,021,005,824（132.27 GiB） | **72,087,929,600（67.14 GiB）** | 同左 |
+| 峰值字节（投影） | 144,068,886,528（134.17 GiB） | **73,788,211,200（68.72 GiB）** | 同左 |
+| plan 步数 | 1370 | 1411 | 1411 |
+| 集合通信次数 | 42（度数 1 的恒等） | **83**（1 all_gather + 82 all_reduce，组 = tp） | 同左 |
+| 集合通信字节（发/收） | 0 / 0 | **598,212,608 / 852,492,288** | 同左 |
+| 前向墙钟 | 6.525 s | **6.740 s** | **10.730 s** |
+| checkpoint 读取字节 | 117,051,115,776（109 GiB） | 同左（**未分片**） | 同左 |
+
+**如实报告**：① TP 把权重与峰值显存**各减半**（67.14 GiB/rank、68.72 GiB/rank），这是真实的并行收益；
+② 墙钟**没有加速**（rank 0 6.74 s ≈ 基线 6.53 s，rank 1 10.73 s 更慢），本就不承诺 —— 但 rank 1 比
+rank 0 慢 4 s 是**未解释的偏差**，记录为开放测量项：已排除的两个解释是"rank 序号相关的代码路径"
+（tiny 上 tp=2/tp=4 的 per-rank 墙钟对称）与"这张卡慢"（宿主实测 `cuda:0` / `cuda:1` 的 8192³ f32
+matmul 都是 21.46 ms / 51.2 TFLOPS、拷贝都是 ~4.25 TB/s）—— 下一步是在 rank 1 上打步级时间戳，
+看这 4 s 是花在计算、集合通信等待，还是某个只在非 0 rank 上跑的收尾步骤；
+③ **每 rank 仍读整份 109 GiB checkpoint**（`checkpoint_bytes_read` 不随分片下降），加载耗时是整个
+sweep ~23 分钟的主因，是明确的性能缺口；④ 「8 个 rank 的墙钟」这件事本文没有承诺，也没有测。
+
+**复现命令（宿主，`/root/rustrain-gpu/`）**：
+
+```sh
+# 秒级 NCCL 端到端回归（vocab 分片的 head → 真 gather）：tp=2 / tp=4 均须逐位相同
+python3 scripts/make_tiny_checkpoint.py --out /root/rustrain-gpu/d6tiny-logits --with-head
+./target/release/rustrain launch --model crates/rustrain-cli/tests/fixtures/run-tiny-logits \
+  --checkpoint /root/rustrain-gpu/d6tiny-logits --tokens 0,1,2,3 --sweep "tp=2;tp=4" \
+  --out /var/tmp/d6-tiny-logits-sweep.json --plugin /root/rustrain-gpu/aten-build/librustrain_aten.so \
+  --recipe plugins/aten/aten.toml --device cuda --nccl-lib "$NCCL" --keep-rdzv
+
+# 真实模型验收（baseline world=1 + tp=2，各读一遍 67 GB checkpoint，约 23 分钟）
+bash /root/rustrain-gpu/host-d6-run.sh        # ./rustrain launch --sweep tp=2 ... --keep-rdzv
+python3 /root/rustrain-gpu/host-compare.py    # 逐层 rel_L2 + logits（dump 在 <out>.rdzv/）
+python3 /root/rustrain-gpu/host-logits.py     # 两半 vocab 的 max|d| / rel_L2 / 差异列
+```
+
 ### D5 — 前向数值对齐 HuggingFace
 
 **可观察结果**：在验证宿主（8× L20X，sm_89）上，同一段 token、同样的 `input_ids`，rustrain 的 logits 与

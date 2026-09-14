@@ -315,6 +315,22 @@ checkpoint），所以它确实需要，且不是新需求。
 **当前的真实边界**：这条路径**到 loss 为止**。反向图、优化器步、训练循环都不存在。
 CLI 只走到 `Compiler::compile`（为了 `plan explain`），执行器只在测试与门禁里被驱动。
 
+### 3.1 集合通信：两个后端，同一份契约
+
+`CollectiveBackend` 有两个实现，它们必须**逐元素**同意同一份语义：
+
+| 后端 | 进程模型 | 谁能看见它的缺陷 |
+|---|---|---|
+| host 组装（`collective.rs`） | 单进程多 rank（测试、小规模 CPU 对照） | 内存里的组装测试 |
+| NCCL（`nccl.rs`，运行期 `dlopen`，核心 crate 零 CUDA 链接依赖） | **一进程一卡**（`rustrain launch` 起 `world` 个子进程，文件 rendezvous 交换 unique id；CUDA context 只能在一个线程里 current，所以一个进程只能拥有一张卡） | 只有真多卡的数值对比 |
+
+**一个后端的绿灯不是另一个后端的证据（D6 实测）**：NCCL 的 `all_gather` 曾把 rank 序号折进**本地**缓冲区
+一侧的偏移（本地缓冲区没有成员轴），于是非 root 的 rank 每块数据平移一整块、最后一块读过缓冲区尾，
+而 root 自己那一半**逐元素正确** —— host 后端是另一个实现，写法正确、测试全绿，没有一条测试看见它。
+**不需要 GPU 就能钉住的部分必须钉住**：偏移算术由执行路径与测试**共用**的
+`all_gather_offsets` / `reduce_scatter_offsets` 给出，测试在内存里复现 NCCL 的选块语义
+（`send` 是本地块；成员轴只存在于 gather/scatter 的目标形状里），并已用变异反证过。
+
 ---
 
 ## 4. 加载路径
