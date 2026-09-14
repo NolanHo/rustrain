@@ -113,7 +113,7 @@ fn sdpa_plan(
         if rank < 3 {
             return Err(fail!(
                 op,
-                "sdpa with 'num_heads' expects per-head inputs [.., S, H, D] of rank >= 3,                  got rank {rank}"
+                "sdpa with 'num_heads' expects per-head inputs [.., S, H, D] of rank >= 3, got rank {rank}"
             ));
         }
         (

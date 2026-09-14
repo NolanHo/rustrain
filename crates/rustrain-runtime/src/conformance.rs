@@ -1395,7 +1395,7 @@ pub fn uncovered_operators() -> Vec<(&'static str, &'static str)> {
         ),
         (
             "dequantize",
-            "takes a quantized payload and its scale; the harness cannot yet feed one operator's              output into another's input",
+            "takes a quantized payload and its scale; the harness cannot yet feed one operator's output into another's input",
         ),
     ]
 }
