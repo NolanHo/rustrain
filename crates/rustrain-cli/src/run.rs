@@ -914,6 +914,7 @@ fn run_rank(
             "tensors_read": load.stats.tensors_read,
             "pairs_total": load.stats.pairs_total,
             "workers": load.workers,
+            "read_runs": load.stats.read_runs,
             // The load's own wall clock, and the two sums that run inside it: `read` and `fill`
             // are added up over `workers` threads, so they must NOT be summed with each other or
             // with the wall time; the device writes happen on the calling thread and overlap both.

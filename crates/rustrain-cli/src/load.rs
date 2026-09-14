@@ -12,7 +12,6 @@
 //! (both are subsets of f32) — and the plan runs f32. HF's reference dump is bf16; the spec's 1%
 //! tolerance absorbs HF's own bf16 rounding.
 
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -40,6 +39,8 @@ pub(crate) struct LoadStats {
     /// groups — which is exactly what makes this a measurement rather than a restatement.
     pub bytes_distinct: u64,
     pub tensors_read: usize,
+    /// How many `read` calls the narrowed reads took, for the days the window is not enough.
+    pub read_runs: usize,
     pub pairs_total: usize,
     pub read: Duration,
     /// The composed walk: widening, layout and the rank's slab, done in one pass per member.
@@ -93,6 +94,11 @@ pub(crate) struct LoadedWeight {
 /// multiple GB/s. One worker per tensor fixes both sides at once, and the memory it costs is one
 /// tensor's checkpoint bytes plus its slots per worker.
 const LOAD_WORKERS: usize = 16;
+
+/// The most read syscalls a group's narrowed read may cost. Past this the covering window is
+/// cheaper than the syscalls, so the loader reads the whole window instead — a fallback that only
+/// ever reads *more* than the runs would.
+const READ_RUN_CAP: usize = 8192;
 
 /// One slot's share of a group: what to cut out of the prepared tensor, and what the two
 /// independent shape facts say the result must be.
@@ -418,6 +424,7 @@ pub(crate) fn load_weights(
             Ok(group_stats) => {
                 stats.bytes_read += group_stats.bytes_read;
                 stats.tensors_read += group_stats.tensors_read;
+                stats.read_runs += group_stats.read_runs;
                 stats.read += group_stats.read;
                 stats.fill += group_stats.fill;
             }
@@ -514,12 +521,101 @@ impl Cuts {
         self.axes.iter().map(|(_, _, len)| *len).collect()
     }
 
+    /// The checkpoint element range the result reads, as `(lowest, highest)`.
+    ///
+    /// This is what makes a rank read only what it needs: every cut is a range on one axis, so the
+    /// union of the members' spans is the exact byte window the group has to touch — an eighth of
+    /// every sharded tensor at `tp = 8`, instead of the whole tensor cut in host memory.
+    fn source_span(&self, strides: &[i64]) -> (i64, i64) {
+        if self.axes.is_empty() {
+            return (0, 0);
+        }
+        let low: i64 = self
+            .axes
+            .iter()
+            .map(|(axis, start, _)| start * strides[*axis])
+            .sum();
+        let high: i64 = self
+            .axes
+            .iter()
+            .map(|(axis, start, len)| (start + len - 1) * strides[*axis])
+            .sum();
+        (low, high)
+    }
+
+    /// The contiguous runs of checkpoint elements the result reads, in increasing order.
+    ///
+    /// A box is contiguous across every axis *inside* its innermost partial one, so the read can be
+    /// narrowed to these runs rather than to the whole window that covers them: the expert tensor
+    /// whose middle axis is a `tp` slab is one run per expert, not one element per row. `cap` is
+    /// the point at which the run list stops being worth its syscalls and the caller reads the
+    /// covering window instead — the result is then a single run.
+    fn runs(
+        &self,
+        source_dims: &[i64],
+        strides: &[i64],
+        cap: usize,
+        window: (i64, i64),
+    ) -> Vec<(i64, i64)> {
+        // Back to source-axis order: one kept range per checkpoint axis.
+        let mut ranges: Vec<(usize, i64, i64)> = self
+            .axes
+            .iter()
+            .map(|(axis, start, len)| (*axis, *start, *len))
+            .collect();
+        ranges.sort_by_key(|(axis, _, _)| *axis);
+
+        // The innermost checkpoint axis that is *not* fully covered decides the run length: every
+        // axis after it is full, so one run covers it and all of them.
+        let partial = ranges
+            .iter()
+            .rposition(|(axis, start, len)| *start != 0 || *len != source_dims[*axis]);
+        let Some(k) = partial else {
+            // The whole tensor: one run, however the axes are ordered.
+            return vec![(window.0, window.1 - window.0 + 1)];
+        };
+
+        let (axis_k, start_k, len_k) = ranges[k];
+        let run_elems = len_k * strides[axis_k];
+        let inner: Vec<(usize, i64, i64)> = ranges[..k].to_vec();
+        let count: i64 = inner.iter().map(|(_, _, len)| *len).product();
+        if count > cap as i64 {
+            return vec![(window.0, window.1 - window.0 + 1)];
+        }
+
+        // Odometer over the kept indices of the axes before `k`; their summed offset is the base.
+        let mut runs = Vec::with_capacity(count as usize);
+        let mut index = vec![0i64; inner.len()];
+        loop {
+            let base: i64 = inner
+                .iter()
+                .zip(&index)
+                .map(|((axis, start, _), i)| (start + i) * strides[*axis])
+                .sum();
+            runs.push((base + start_k * strides[axis_k], run_elems));
+            let mut a = inner.len();
+            loop {
+                if a == 0 {
+                    return runs;
+                }
+                a -= 1;
+                index[a] += 1;
+                if index[a] < inner[a].2 {
+                    break;
+                }
+                index[a] = 0;
+            }
+        }
+    }
+
     /// Every element of the result, read out of the checkpoint bytes at its composed offset.
     ///
     /// The walk is an odometer over the result's axes with the checkpoint stride of each axis, so
     /// the inner loop is one pointer step and one conversion per element — no division, no
     /// intermediate buffer, and each output element is written exactly once.
-    fn fill(&self, bytes: &[u8], dtype: &str, strides: &[i64]) -> Result<Vec<f32>> {
+    /// `window` is the checkpoint element the buffer's first byte holds: the read is narrowed to
+    /// the group's span, so every offset is relative to it.
+    fn fill(&self, bytes: &[u8], dtype: &str, strides: &[i64], window: i64) -> Result<Vec<f32>> {
         let shape: Vec<usize> = self.axes.iter().map(|(_, _, len)| *len as usize).collect();
         let step: Vec<i64> = self
             .axes
@@ -530,7 +626,8 @@ impl Cuts {
             .axes
             .iter()
             .map(|(axis, start, _)| start * strides[*axis])
-            .sum();
+            .sum::<i64>()
+            - window;
         match dtype {
             "bf16" => Ok(walk(&shape, &step, base, |offset| {
                 let byte = offset as usize * 2;
@@ -625,155 +722,106 @@ fn load_group(
         ..LoadStats::default()
     };
 
-    // ---- the bytes ----
+    // ---- what this group has to touch, decided before a byte is read ----
+    // The transform, the `split` segment and this rank's shard slabs are all "swap two axes" or
+    // "keep a sub-range of one axis", so they compose into one map *before* any data moves
+    // (`Cuts`). That map gives two things at once: the exact elements this rank needs — so the
+    // read is narrowed to them, instead of reading the whole tensor and cutting it in host memory
+    // — and the one pass that turns those bytes into the slot.
+    let strides = strides_of(&group.shape);
+    let width = dtype_width(&group.dtype)?;
+    let numel: i64 = group.shape.iter().product();
+    let declared_bytes = (group.data.1 - group.data.0) as i64;
+    let expected_bytes = numel
+        .checked_mul(width as i64)
+        .ok_or_else(|| anyhow::anyhow!("tensor `{}`: numel × width overflows", group.tensor))?;
+    if declared_bytes != expected_bytes {
+        bail!(
+            "tensor `{}` {}: the shard declares {declared_bytes} bytes, but the shape times \
+             {width}-byte elements is {expected_bytes}",
+            group.tensor,
+            shape_text(&group.shape)
+        );
+    }
+    let mut planned: Vec<Cuts> = Vec::with_capacity(group.members.len());
+    for member in &group.members {
+        planned.push(member_cuts(group, member, rank)?);
+    }
+    if planned.is_empty() {
+        return Ok(stats);
+    }
+    let mut window = (i64::MAX, i64::MIN);
+    for cuts in &planned {
+        let (low, high) = cuts.source_span(&strides);
+        window = (window.0.min(low), window.1.max(high));
+    }
+    let first = window.0.max(0);
+    let last = window.1.min(numel - 1);
+    // The bytes to read are the union of the members' runs, not the window that covers them: a
+    // tensor whose middle axis is this rank's slab is read per expert, and only in part.
+    let mut runs: Vec<(i64, i64)> = Vec::new();
+    for cuts in &planned {
+        runs.extend(cuts.runs(&group.shape, &strides, READ_RUN_CAP, window));
+    }
+    runs.sort_unstable();
+    let mut merged: Vec<(i64, i64)> = Vec::with_capacity(runs.len());
+    for (start, len) in runs {
+        match merged.last_mut() {
+            // Overlapping or adjacent runs merge; the list stays sorted and disjoint.
+            Some((last_start, last_len)) if start <= *last_start + *last_len => {
+                *last_len = (*last_start + *last_len).max(start + len) - *last_start;
+            }
+            _ => merged.push((start, len)),
+        }
+    }
+    if merged.len() > READ_RUN_CAP || merged.is_empty() {
+        merged = vec![(first, last - first + 1)];
+    }
+
+    // ---- the bytes, one read per run ----
     let read_started = Instant::now();
-    let len = (group.data.1 - group.data.0) as usize;
+    let len = ((last - first + 1) as u64)
+        .checked_mul(width as u64)
+        .ok_or_else(|| anyhow::anyhow!("tensor `{}`: the read length overflows", group.tensor))?
+        as usize;
     let mut bytes = vec![0u8; len];
-    let mut file = std::fs::File::open(&group.shard)
+    let file = std::fs::File::open(&group.shard)
         .with_context(|| format!("opening the safetensors shard {}", group.shard.display()))?;
     // `data_offsets` are relative to the *data section*: the shard is 8 bytes of header
     // length, the header, then the data. Reading the length again (8 bytes per shard) is the
     // only way to know where the data begins without re-parsing the header.
+    use std::os::unix::fs::FileExt;
     let mut header_len = [0u8; 8];
-    file.read_exact(&mut header_len)
+    file.read_exact_at(&mut header_len, 0)
         .with_context(|| format!("reading the header length of {}", group.shard.display()))?;
     let base = 8 + u64::from_le_bytes(header_len);
-    file.seek(SeekFrom::Start(base + group.data.0))
-        .with_context(|| {
-            format!(
-                "seeking `{}` to data byte {} in {}",
-                group.tensor,
-                group.data.0,
-                group.shard.display()
-            )
-        })?;
-    file.read_exact(&mut bytes).with_context(|| {
-        format!(
-            "reading `{}` ({len} bytes) from {}",
-            group.tensor,
-            group.shard.display()
-        )
-    })?;
-    stats.read += read_started.elapsed();
-    stats.bytes_read += len as u64;
-
-    let numel: i64 = group.shape.iter().product();
-    let width = dtype_width(&group.dtype)?;
-    let expected_bytes = numel
-        .checked_mul(width as i64)
-        .ok_or_else(|| anyhow::anyhow!("tensor `{}`: numel × width overflows", group.tensor))?;
-    if bytes.len() as i64 != expected_bytes {
-        bail!(
-            "tensor `{}` {}: the shard holds {} bytes, but the shape times {width}-byte \
-             elements is {expected_bytes}",
-            group.tensor,
-            shape_text(&group.shape),
-            bytes.len()
-        );
+    let mut bytes_read = 0u64;
+    for (start, len_elems) in &merged {
+        let offset = base + group.data.0 + *start as u64 * width as u64;
+        let at = (*start - first) as usize * width;
+        let take = *len_elems as usize * width;
+        file.read_exact_at(&mut bytes[at..at + take], offset)
+            .with_context(|| {
+                format!(
+                    "reading `{}` ({take} bytes at element {start}) from {}",
+                    group.tensor,
+                    group.shard.display()
+                )
+            })?;
+        bytes_read += take as u64;
     }
+    stats.read += read_started.elapsed();
+    stats.bytes_read += bytes_read;
+    stats.read_runs += merged.len();
 
-    // ---- every member's slot, read out of the checkpoint bytes in one pass ----
-    // The transform, the `split` segment and this rank's shard slabs are all "swap two axes" or
-    // "keep a sub-range of one axis", so they compose into one map *before* any data moves
-    // (`Cuts`), and each member is then filled directly from the checkpoint bytes. The passes it
-    // replaced — widen a copy, transpose a copy, slice a copy, slice a copy — were 92% of a run's
-    // startup, and the widened intermediate was one more full copy of the tensor in host memory.
-    let strides = strides_of(&group.shape);
-    for member in &group.members {
+    // ---- every member's slot, out of those bytes in one pass ----
+    for (index, cuts) in planned.iter().enumerate() {
         if abort.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
-        let mut cuts = Cuts::identity(&group.shape);
-        let resolved = |index: i64, what: &str| -> Result<usize> {
-            axis(index, group.shape.len()).ok_or_else(|| anyhow::anyhow!("{what}"))
-        };
-        for step in &group.steps {
-            match *step {
-                rustrain_model::Transform::Transpose { i, j } => {
-                    let a = resolved(
-                        i,
-                        &format!(
-                            "transform `transpose({i},{j})`: axis {i} is out of range for {}",
-                            shape_text(&group.shape)
-                        ),
-                    )?;
-                    let b = resolved(
-                        j,
-                        &format!(
-                            "transform `transpose({i},{j})`: axis {j} is out of range for {}",
-                            shape_text(&group.shape)
-                        ),
-                    )?;
-                    cuts.transpose(a, b);
-                }
-                rustrain_model::Transform::Slice { dim, start, len } => {
-                    let d = resolved(
-                        dim,
-                        &format!(
-                            "transform `slice({dim},{start},{len})`: axis {dim} is out of range \
-                             for {}",
-                            shape_text(&group.shape)
-                        ),
-                    )?;
-                    cuts.narrow(
-                        d,
-                        start,
-                        len,
-                        &format!("transform `slice({dim},{start},{len})`"),
-                    )?;
-                }
-            }
-        }
-        if let Some((d, start, len)) = member.segment {
-            cuts.narrow(
-                d,
-                start as i64,
-                len as i64,
-                &format!("slot `{}`: split segment", member.slot_name),
-            )?;
-        }
-
-        // The data walk and the shape math are two implementations of one fact: the transform
-        // + split result they arrive at must agree, or one of them drifted. The shard cuts come
-        // after this check — `expected` describes the split tensor, not this rank's slab.
-        let member_shape = cuts.shape();
-        if member_shape != member.expected {
-            bail!(
-                "slot `{}` <- `{}` (binding `{}`): the data walk produced shape {:?} but the shape \
-                 math says {:?}",
-                member.slot_name,
-                group.tensor,
-                member.source,
-                member_shape,
-                member.expected
-            );
-        }
-
-        for &(d, start, len) in &member.shards {
-            cuts.narrow(
-                d,
-                start as i64,
-                len as i64,
-                &format!("slot `{}`: shard slab on axis {d}", member.slot_name),
-            )?;
-        }
-
-        // ---- the load-time assertion: the produced tensor IS the slot's local shape ----
-        let shape_i64 = cuts.shape();
-        if shape_i64 != member.local_shape {
-            bail!(
-                "slot `{}` <- `{}` (binding `{}`): transform + split + sharding produce {}, but \
-                 the slot's local shape on rank {rank} is {}",
-                member.slot_name,
-                group.tensor,
-                member.source,
-                shape_text(&shape_i64),
-                shape_text(&member.local_shape)
-            );
-        }
-
+        let member = &group.members[index];
         let fill_started = Instant::now();
-        let values = cuts.fill(&bytes, &group.dtype, &strides)?;
+        let values = cuts.fill(&bytes, &group.dtype, &strides, first)?;
         stats.fill += fill_started.elapsed();
         // A closed channel means the writer already failed; it reports its own error, so the
         // workers just stop handing it tensors.
@@ -788,8 +836,104 @@ fn load_group(
             break;
         }
     }
-
     Ok(stats)
+}
+
+/// The composed read map for one member of a group, with both shape facts checked against it.
+///
+/// All of this is index arithmetic — no data is touched — which is why the group can decide its
+/// read window from it before opening the shard, and why a wrong `split` or a wrong slot shape is
+/// reported before the checkpoint is read at all.
+fn member_cuts(group: &Group, member: &Member, rank: usize) -> Result<Cuts> {
+    let mut cuts = Cuts::identity(&group.shape);
+    let resolved = |index: i64, what: &str| -> Result<usize> {
+        axis(index, group.shape.len()).ok_or_else(|| anyhow::anyhow!("{what}"))
+    };
+    for step in &group.steps {
+        match *step {
+            rustrain_model::Transform::Transpose { i, j } => {
+                let a = resolved(
+                    i,
+                    &format!(
+                        "transform `transpose({i},{j})`: axis {i} is out of range for {}",
+                        shape_text(&group.shape)
+                    ),
+                )?;
+                let b = resolved(
+                    j,
+                    &format!(
+                        "transform `transpose({i},{j})`: axis {j} is out of range for {}",
+                        shape_text(&group.shape)
+                    ),
+                )?;
+                cuts.transpose(a, b);
+            }
+            rustrain_model::Transform::Slice { dim, start, len } => {
+                let d = resolved(
+                    dim,
+                    &format!(
+                        "transform `slice({dim},{start},{len})`: axis {dim} is out of range \
+                         for {}",
+                        shape_text(&group.shape)
+                    ),
+                )?;
+                cuts.narrow(
+                    d,
+                    start,
+                    len,
+                    &format!("transform `slice({dim},{start},{len})`"),
+                )?;
+            }
+        }
+    }
+    if let Some((d, start, len)) = member.segment {
+        cuts.narrow(
+            d,
+            start as i64,
+            len as i64,
+            &format!("slot `{}`: split segment", member.slot_name),
+        )?;
+    }
+
+    // The data walk and the shape math are two implementations of one fact: the transform
+    // + split result they arrive at must agree, or one of them drifted. The shard cuts come
+    // after this check — `expected` describes the split tensor, not this rank's slab.
+    let shape = cuts.shape();
+    if shape != member.expected {
+        bail!(
+            "slot `{}` <- `{}` (binding `{}`): the data walk produced shape {:?} but the shape \
+             math says {:?}",
+            member.slot_name,
+            group.tensor,
+            member.source,
+            shape,
+            member.expected
+        );
+    }
+
+    for &(d, start, len) in &member.shards {
+        cuts.narrow(
+            d,
+            start as i64,
+            len as i64,
+            &format!("slot `{}`: shard slab on axis {d}", member.slot_name),
+        )?;
+    }
+
+    // ---- the load-time assertion: the produced tensor IS the slot's local shape ----
+    let shape = cuts.shape();
+    if shape != member.local_shape {
+        bail!(
+            "slot `{}` <- `{}` (binding `{}`): transform + split + sharding produce {}, but \
+             the slot's local shape on rank {rank} is {}",
+            member.slot_name,
+            group.tensor,
+            member.source,
+            shape_text(&shape),
+            shape_text(&member.local_shape)
+        );
+    }
+    Ok(cuts)
 }
 
 /// The pairing errors, with the same wording `check` reports — never weaker ones.
@@ -1063,7 +1207,7 @@ mod tests {
             cuts.shape(),
             shape.iter().map(|d| *d as i64).collect::<Vec<_>>()
         );
-        let composed = cuts.fill(&bytes, "bf16", &strides_of(&source)).unwrap();
+        let composed = cuts.fill(&bytes, "bf16", &strides_of(&source), 0).unwrap();
 
         assert_eq!(composed.len(), explicit.len());
         assert_eq!(composed, explicit, "the composed walk must be exact");
@@ -1077,7 +1221,7 @@ mod tests {
         let bf16: Vec<u8> = bf16_bytes(&values);
         assert_eq!(
             Cuts::identity(&[3])
-                .fill(&bf16, "bf16", &strides_of(&[3]))
+                .fill(&bf16, "bf16", &strides_of(&[3]), 0)
                 .unwrap(),
             values
         );
@@ -1092,7 +1236,7 @@ mod tests {
         }
         assert_eq!(
             Cuts::identity(&[3])
-                .fill(&f16, "f16", &strides_of(&[3]))
+                .fill(&f16, "f16", &strides_of(&[3]), 0)
                 .unwrap(),
             values
         );
@@ -1102,7 +1246,7 @@ mod tests {
         }
         assert_eq!(
             Cuts::identity(&[3])
-                .fill(&f32_bytes, "f32", &strides_of(&[3]))
+                .fill(&f32_bytes, "f32", &strides_of(&[3]), 0)
                 .unwrap(),
             values
         );
@@ -1116,7 +1260,7 @@ mod tests {
         bytes.extend_from_slice(&7.5f32.to_le_bytes());
         let scalar = Cuts::identity(&[]);
         assert_eq!(
-            scalar.fill(&bytes, "f32", &strides_of(&[])).unwrap(),
+            scalar.fill(&bytes, "f32", &strides_of(&[]), 0).unwrap(),
             vec![7.5]
         );
         assert_eq!(scalar.shape(), Vec::<i64>::new());
@@ -1124,7 +1268,7 @@ mod tests {
         let empty = Cuts::identity(&[0, 3]);
         assert!(
             empty
-                .fill(&bytes, "f32", &strides_of(&[0, 3]))
+                .fill(&bytes, "f32", &strides_of(&[0, 3]), 0)
                 .unwrap()
                 .is_empty()
         );
@@ -1153,7 +1297,7 @@ mod tests {
         cuts.transpose(1, 2);
         assert_eq!(cuts.shape(), vec![3, 2, 2]);
         assert_eq!(
-            cuts.fill(&bytes, "bf16", &strides_of(&source)).unwrap(),
+            cuts.fill(&bytes, "bf16", &strides_of(&source), 0).unwrap(),
             explicit
         );
     }
@@ -1171,7 +1315,17 @@ mod tests {
             shard: std::path::PathBuf::from("/nonexistent/rustrain/shard.safetensors"),
             data: (0, 8),
             steps: Vec::new(),
-            members: Vec::new(),
+            // One member that wants the whole tensor: the map is the identity, so nothing but the
+            // read can fail — and with the flag set, the read must not be attempted at all.
+            members: vec![Member {
+                slot: SlotId(0),
+                slot_name: "model.absent.weight".to_string(),
+                source: "model.absent.weight".to_string(),
+                local_shape: vec![2, 2],
+                segment: None,
+                shards: Vec::new(),
+                expected: vec![2, 2],
+            }],
         };
         let (tx, _rx) = std::sync::mpsc::sync_channel(1);
 
@@ -1186,6 +1340,96 @@ mod tests {
         assert!(
             format!("{error:#}").contains("shard"),
             "the error must be the read, not the flag: {error:#}"
+        );
+    }
+
+    /// The span is what narrows the read, so it has to be tight where a cut is contiguous and
+    /// honest where it is not.
+    #[test]
+    fn the_source_span_covers_exactly_what_the_member_reads() {
+        let strides = strides_of(&[4, 8]);
+
+        // A row range — the shape of every `tp` shard of an output axis — is one contiguous slab.
+        let mut rows = Cuts::identity(&[4, 8]);
+        rows.narrow(0, 1, 2, "test").unwrap();
+        assert_eq!(rows.source_span(&strides), (8, 23), "two whole rows");
+        // …and the fill reads nothing outside it.
+        let bytes: Vec<u8> = bf16_bytes(&(0..32).map(|i| i as f32).collect::<Vec<f32>>());
+        let whole = rows.fill(&bytes, "bf16", &strides, 0).unwrap();
+        let narrowed = rows
+            .fill(&bytes[8 * 2..24 * 2], "bf16", &strides, 8)
+            .unwrap();
+        assert_eq!(whole, narrowed);
+        assert_eq!(whole.len(), 16);
+
+        // A column range is not contiguous: the span covers the whole rows it crosses, which is
+        // the honest trade — one contiguous read of 28 elements instead of a gather of 16.
+        let mut cols = Cuts::identity(&[4, 8]);
+        cols.narrow(1, 2, 4, "test").unwrap();
+        assert_eq!(cols.source_span(&strides), (2, 29));
+
+        // A cut on the innermost axis of a 1-D tensor is contiguous again, element for element.
+        let mut flat = Cuts::identity(&[10]);
+        flat.narrow(0, 3, 4, "test").unwrap();
+        assert_eq!(flat.source_span(&strides_of(&[10])), (3, 6));
+    }
+
+    /// The runs are what the narrowed read actually asks the file system for, so they must cover
+    /// the box exactly: no element outside it, and none of its elements missing.
+    #[test]
+    fn the_runs_cover_exactly_the_elements_the_box_reads() {
+        let dims = [3i64, 6, 5];
+        let strides = strides_of(&dims);
+
+        // A partial *middle* axis — the shape of an expert tensor whose `I` axis is this rank's
+        // `tp` slab: three runs, one per expert, each the whole trailing axis.
+        let mut middle = Cuts::identity(&dims);
+        middle.narrow(1, 2, 3, "test").unwrap();
+        let window = middle.source_span(&strides);
+        let runs = middle.runs(&dims, &strides, 1024, window);
+        assert_eq!(runs.len(), 3, "one run per outer index: {runs:?}");
+        assert!(runs.iter().all(|(_, len)| *len == 3 * 5), "{runs:?}");
+
+        // A partial *inner* axis: one run per row, and no row's remainder.
+        let mut inner = Cuts::identity(&dims);
+        inner.narrow(2, 1, 2, "test").unwrap();
+        let window = inner.source_span(&strides);
+        let runs = inner.runs(&dims, &strides, 1024, window);
+        assert_eq!(runs.len(), 3 * 6, "one run per (outer, middle) pair");
+
+        // Both, checked against a naive walk of the box: the runs must be exactly its elements.
+        let mut both = Cuts::identity(&dims);
+        both.narrow(1, 1, 4, "test").unwrap();
+        both.narrow(2, 2, 2, "test").unwrap();
+        let window = both.source_span(&strides);
+        let runs = both.runs(&dims, &strides, 4096, window);
+        let mut from_runs: Vec<i64> = runs
+            .iter()
+            .flat_map(|(start, len)| *start..*start + *len)
+            .collect();
+        from_runs.sort_unstable();
+        let mut naive: Vec<i64> = Vec::new();
+        for a in 0..3 {
+            for b in 1..5 {
+                for c in 2..4 {
+                    naive.push(a * 30 + b * 5 + c);
+                }
+            }
+        }
+        naive.sort_unstable();
+        assert_eq!(from_runs, naive);
+
+        // Past the cap the caller gets the covering window: more bytes, never fewer.
+        let capped = both.runs(&dims, &strides, 2, window);
+        assert_eq!(capped, vec![(window.0, window.1 - window.0 + 1)]);
+
+        // A box that is the whole tensor is one run however the axes are ordered.
+        let mut swapped = Cuts::identity(&dims);
+        swapped.transpose(0, 2);
+        let window = swapped.source_span(&strides);
+        assert_eq!(
+            swapped.runs(&dims, &strides, 8, window),
+            vec![(window.0, window.1 - window.0 + 1)]
         );
     }
 

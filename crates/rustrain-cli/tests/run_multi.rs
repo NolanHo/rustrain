@@ -142,12 +142,7 @@ fn write_tensors(dir: &Path, tensors: &[(&str, Vec<i64>, Vec<f32>)]) {
 
     let weight_map: serde_json::Map<String, serde_json::Value> = tensors
         .iter()
-        .map(|(name, _, _)| {
-            (
-                (*name).to_string(),
-                serde_json::json!("model.safetensors"),
-            )
-        })
+        .map(|(name, _, _)| ((*name).to_string(), serde_json::json!("model.safetensors")))
         .collect();
     let index = serde_json::json!({
         "metadata": {"total_size": payload.len()},
@@ -254,7 +249,12 @@ fn the_sharded_logits_agree_with_the_world1_forward() {
 
     // The world-1 baselines, one per fixture.
     let mut baselines: Vec<(&str, Vec<f32>)> = Vec::new();
-    for fixture_name in ["run-tiny-par", "run-tiny-cp", "run-tiny-dp", "run-tiny-logits"] {
+    for fixture_name in [
+        "run-tiny-par",
+        "run-tiny-cp",
+        "run-tiny-dp",
+        "run-tiny-logits",
+    ] {
         let out = dir.join(format!("base-{fixture_name}.npz"));
         let model_dir = fixture(fixture_name);
         let (ok, _, stderr) = run_cli(&[
@@ -347,6 +347,24 @@ fn the_metrics_report_counts_what_parallel_effects_mean() {
         serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
     assert_eq!(doc["format"], "rustrain.sweep.v1");
     assert_eq!(doc["probe_tokens"], serde_json::json!([0, 1, 2, 3]));
+
+    // The loader reads what the rank needs and nothing else: at world 1 that is every byte of
+    // every tensor, and at tp = 2 the `tp`-sharded tensors are read only in part. Both numbers
+    // come out of the same report as the rest of this test.
+    let whole = &doc["baseline"]["ranks"][0]["checkpoint_load"];
+    assert_eq!(
+        whole["bytes_read"], whole["bytes_distinct"],
+        "a world-1 rank needs the whole checkpoint: {whole}"
+    );
+    let sharded = &doc["configs"][0]["ranks"][0]["checkpoint_load"];
+    assert!(
+        sharded["bytes_read"].as_u64().unwrap() < sharded["bytes_distinct"].as_u64().unwrap(),
+        "a sharded rank must read less than the checkpoint holds: {sharded}"
+    );
+    assert!(
+        sharded["read_runs"].as_u64().unwrap() > 0,
+        "the narrowed read must say how many reads it took: {sharded}"
+    );
 
     let baseline_bytes = doc["baseline"]["ranks"][0]["weight_bytes"]
         .as_u64()
