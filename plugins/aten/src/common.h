@@ -31,12 +31,17 @@
 
 namespace rsaten {
 
-/// The variant every operator in this plugin is published under.
+/// The two variants every operator in this plugin is published under
+/// (plugin.cpp builds the descriptor table once per variant).
 ///
 /// `cuda` is the device namespace a variant name is read for
 /// (`rustrain-ops::capability::declared_device`), `aten` names the
-/// implementation family, `f32` the numerics it accepts today.
-inline constexpr const char* VARIANT = "cuda.aten.f32";
+/// implementation family, and the suffix names the float dtype the variant's
+/// numerics declare. The f32 variant is the conformance gate's workhorse and
+/// `--dtype f32` debugging; the bf16 variant is what a bf16 model plan
+/// resolves to (its numerics accumulate in f32 — ATen's bf16 matmul does).
+inline constexpr const char* VARIANT_F32 = "cuda.aten.f32";
+inline constexpr const char* VARIANT_BF16 = "cuda.aten.bf16";
 
 // ── errors ──────────────────────────────────────────────────────────────────
 
@@ -298,10 +303,10 @@ inline void adopt(rs_tensor* out, const at::Tensor& value) {
     out->amax = nullptr;
 }
 
-/// Fills an output descriptor's shape from `sizes`, leaving the buffer to the
-/// executor (`infer` runs with null data pointers).
-inline void set_shape(rs_tensor* out, at::IntArrayRef sizes) {
-    out->dtype = RS_F32;
+/// Fills an output descriptor's shape and dtype from `sizes` + `dtype`,
+/// leaving the buffer to the executor (`infer` runs with null data pointers).
+inline void set_shape(rs_tensor* out, rs_dtype dtype, at::IntArrayRef sizes) {
+    out->dtype = dtype;
     out->rank = static_cast<uint32_t>(sizes.size());
     for (uint32_t i = 0; i < out->rank && i < RS_MAX_RANK; ++i) {
         out->shape[i] = sizes[static_cast<int64_t>(i)];
@@ -313,14 +318,28 @@ inline void set_shape(rs_tensor* out, at::IntArrayRef sizes) {
     }
 }
 
-/// Every operator here is f32 in and f32 out; a descriptor that is not f32 is a
-/// framework bug (the variant declares its dtype set), so it is refused loudly.
-inline int check_f32(const rs_tensor* t, const char* op, const char* who) {
+/// The variant's float dtype, read from a float operand's descriptor. The
+/// framework sizes slots from the variant's declared numerics, so every float
+/// operand of `cuda.aten.f32` arrives as f32 and every one of
+/// `cuda.aten.bf16` as bf16; `infer` stamps the output descriptors with the
+/// same dtype so the executor allocates the declared width.
+inline rs_dtype float_dtype_of(const rs_tensor* t) { return t->dtype; }
+
+/// The float dtypes this plugin's variants run in: `cuda.aten.f32` declares
+/// f32, `cuda.aten.bf16` declares bf16. Both variants share these bodies and a
+/// body cannot see its own variant (the executor passes no descriptor into
+/// `execute`), so the per-variant contract lives where the variant IS visible —
+/// in `requires.dtype_mask` — and this gate only refuses what NO variant
+/// accepts (f16, fp8, integer dtypes in float slots). A float operand
+/// therefore always arrives in its variant's declared float dtype; the
+/// integer/index operands (embedding's indices, rope's positions, ...) keep
+/// their own gates.
+inline int check_float(const rs_tensor* t, const char* op, const char* who) {
     if (t == nullptr) {
         return fail(std::string(op) + ": " + who + " descriptor is null");
     }
-    if (t->dtype != RS_F32) {
-        return fail(std::string(op) + ": " + who + " is not f32 (this variant is f32 only)");
+    if (t->dtype != RS_F32 && t->dtype != RS_BF16) {
+        return fail(std::string(op) + ": " + who + " is not f32 or bf16 (this plugin's variants are f32 and bf16)");
     }
     return 0;
 }
@@ -343,8 +362,13 @@ inline bool resolve_dim(int64_t dim, uint32_t rank, const char* op, int64_t* out
 // ── the operator table ──────────────────────────────────────────────────────
 
 /// One operator as this plugin publishes it. The ABI descriptor is built from
-/// this at load time; keeping the authoring form separate means the repeating
-/// fields (variant, numerics, memory hook, last_error) are written once.
+/// this at load time, once per published variant; keeping the authoring form
+/// separate means the repeating fields (variant, numerics, memory hook,
+/// last_error) are written once in the build loop instead of per operator.
+///
+/// `dtype_mask` is authored in f32 terms (the gate's working dtype, with the
+/// integer index dtypes of embedding/gather/... beside it); the bf16 variant's
+/// mask is derived by substituting bf16 for f32, integer dtypes untouched.
 ///
 /// The function-pointer types are spelled out rather than typedef'd because
 /// `rustrain_op.h` declares them inline in `rs_op_desc` — the header is the

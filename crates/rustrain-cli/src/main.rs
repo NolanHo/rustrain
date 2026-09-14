@@ -55,10 +55,13 @@ enum Command {
     Check(CheckArgs),
     /// Run one forward pass (spec C4) and write the D5 candidate dump (.npz + .json sidecar).
     ///
-    /// Precision: the checkpoint and HF are bf16 while the reference provider is f32-only, so the
-    /// weights are widened bf16 -> f32 (exact — bf16 is a subset of f32) and the forward executes
-    /// f32; the HF reference is dumped with `--dtype bf16`, and the spec's 1% tolerance on the
-    /// logits and the per-layer summaries absorbs HF's bf16 rounding, not this widening.
+    /// Precision: `--dtype bf16` is the default — the weights stay the checkpoint's own bf16
+    /// (the model's precision; f32 would double the host traffic and the device bytes for
+    /// nothing), and the plan resolves bf16 variants such as `cuda.aten.bf16`. `--dtype f32`
+    /// widens them (exact — bf16 is a subset of f32) for the f32-only reference provider and
+    /// debugging. The dump stays f32 either way; the HF reference is dumped with
+    /// `--dtype bf16`, and the spec's 1% tolerance absorbs HF's bf16 rounding, not the run's
+    /// dtype.
     Run(run::RunArgs),
     /// Run a multi-rank world as one process per GPU (`world = tp × cp × ep × dp × pp`).
     ///

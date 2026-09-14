@@ -1,10 +1,12 @@
-# ATen 插件（`cuda.aten.f32`）
+# ATen 插件（`cuda.aten.f32` / `cuda.aten.bf16`）
 
 框架只负责编排：拿到实现、知道契约、验证算的是同一件事。这个 `.so` 就是"实现体"（T1）——
 它把算子词表映射到 **ATen**（cuBLAS / cuDNN / torch 的 CUDA kernel），不手写任何 kernel。
 
-- **契约**：与内建 reference provider 同名、同操作数顺序、同属性、同数值约定；
-  变体名 `cuda.aten.f32`（`cuda` 前缀是框架识别"这个实现要设备"的约定）。
+- **契约**：与内建 reference provider 同名、同操作数顺序、同属性、同数值约定；每个算子发布
+  两个变体：`cuda.aten.f32` 与 `cuda.aten.bf16`（`cuda` 前缀是框架识别"这个实现要设备"的
+  约定），由 plan 槽位的 dtype 决定解析到哪一个。bf16 变体的 numerics：in/out bf16、
+  accum f32（ATen 的 bf16 matmul 以 fp32 累加），grad bf16。
 - **形态**：`librustrain_aten.so`，导出唯一符号 `rustrain_plugin_v1`，由框架 `dlopen`。
 - **语言**：C++17 + `rustrain_op.h`（ABI v1 是 C 接口，实现语言不属于契约的一部分）。
   选 C++ 而不是 Rust 的唯一理由：所有上游 kernel（ATen 本身、causal-conv1d、FLA）都是
@@ -40,9 +42,10 @@ rustrain run --plugin ... --recipe plugins/aten/aten.toml --device cuda \
 
 | 证据 | 命令 | 结果 |
 |---|---|---|
-| Rust 宿主 `dlopen` C++ 插件 | `rustrain ops list --plugin librustrain_aten.so` | 60 个实现（32 reference + 28 aten） |
-| 逐算子对拍（框架门禁） | `rustrain ops check --plugin … --recipe plugins/aten/aten.toml --device cuda` | **59 case / 0 failing**，exit 0；reference 留在 host、`cuda.*` 变体跑在显存里 |
+| Rust 宿主 `dlopen` C++ 插件 | `rustrain ops list --plugin librustrain_aten.so` | 88 个实现（32 reference + 28×2 aten：f32 与 bf16 各一） |
+| 逐算子对拍（框架门禁） | `rustrain ops check --plugin … --recipe plugins/aten/aten.toml --device cuda` | 30/30 条 `cuda.aten.f32` 行 numeric+determinism 全过；30 条 `cuda.aten.bf16` 行在解析处 FAIL——门禁用 f32 case 喂 bf16-only 变体，按 R-1 拒绝运行（框架侧 gap，非插件缺陷）；reference 留在 host |
 | 插件自检（对照 Rust oracle 源码） | 宿主 `gpu-work/smoke_aten.py` | 31/31 case，26 个算子，两次运行字节一致 |
+| bf16 变体自检（bf16 跑 vs f32 跑后取整到 bf16） | 宿主 `gpu-work/smoke_bf16.py`（2026-09-14） | 61/61 case 通过：全部 28 个算子（含 bf16 的 `gated_delta_rule` fp32 state、`sdpa`、`causal_conv1d`、`moe_layer`），两次运行字节一致；56 个描述符的 per-variant mask / numerics 逐条断言通过 |
 
 开发过程中被门禁抓到的两类真问题（都是"看起来对"的）：
 
@@ -96,7 +99,9 @@ rustrain run --plugin ... --recipe plugins/aten/aten.toml --device cuda \
 
 ## 已知限制
 
-- 只声明 f32。bf16/fp8 变体是后续的 `cuda.aten.bf16`（dtype 会让解析自动选中它）。
+- 发布 f32 与 bf16 两个变体。bf16 变体的 numerics：in/out bf16、accum f32（ATen 的 bf16
+  matmul 以 fp32 累加）；`gated_delta_rule` 的 recurrence state 按契约保持 fp32，输入 cast 到
+  f32、输出写回输入 dtype。fp8 变体是后续工作。
 - `gated_delta_rule` 是逐 token 的 recurrence：数学与 reference 一致，但 S=512 时是 512 次
   迭代 × 每步 ~6 个小 kernel。分块形式（或 FLA）是快速路径。
 - `moe_layer` 每个专家一次 `nonzero`：E=256 时每次调用都有一次 device→host 同步。

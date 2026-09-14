@@ -1,14 +1,16 @@
 # The recipe that runs everything on the ATen (CUDA) plugin.
 #
 # `default = "aten"` means "the implementation published by the plugin named
-# aten decides". Every operator in this plugin is published as exactly one
-# variant, `cuda.aten.f32`, so a forward plan that names an operator this plugin
-# does not implement fails resolution with the candidate table instead of
-# quietly falling back to the CPU reference provider — that quiet fallback is
-# exactly what "no CPU execution except the oracle" forbids.
+# aten decides". Every operator in this plugin is published as two variants,
+# `cuda.aten.f32` and `cuda.aten.bf16`, and the framework resolves one of them
+# from the dtype the plan's slots declare; a forward plan that names an
+# operator this plugin does not implement fails resolution with the candidate
+# table instead of quietly falling back to the CPU reference provider — that
+# quiet fallback is exactly what "no CPU execution except the oracle" forbids.
 #
-# Nothing else is set: the numerics are f32 in / f32 out / f32 accumulate, which
-# is the precision section's default and the only dtype this variant declares.
+# Nothing else is set: the numerics default to f32 in / f32 out / f32
+# accumulate, which resolves to the f32 variant; a plan whose slots declare
+# bf16 resolves to the bf16 variant (bf16 in/out, f32 accumulate).
 [kernel]
 default = "aten"
 strict = true

@@ -29,11 +29,11 @@ int32_t conv_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const* 
         if (n_in != 2 || n_out != 1) {
             return fail("causal_conv1d expects two inputs and one output");
         }
-        int rc = check_f32(in[0], "causal_conv1d", "x");
+        int rc = check_float(in[0], "causal_conv1d", "x");
         if (rc != 0) {
             return rc;
         }
-        rc = check_f32(in[1], "causal_conv1d", "w");
+        rc = check_float(in[1], "causal_conv1d", "w");
         if (rc != 0) {
             return rc;
         }
@@ -58,7 +58,7 @@ int32_t conv_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const* 
         if (!require_kind(attrs, "activation", ACTIVATIONS, 3, "causal_conv1d", &activation)) {
             return 1;
         }
-        set_shape(out[0], dims_of(in[0]));
+        set_shape(out[0], float_dtype_of(in[0]), dims_of(in[0]));
         return 0;
     });
 }
@@ -120,7 +120,7 @@ bool delta_plan(const rs_tensor* const* in, const rs_attrs* attrs, const char* o
     const rs_tensor* g = in[3];
     const rs_tensor* beta = in[4];
     for (int i = 0; i < 5; ++i) {
-        int rc = check_f32(in[i], op, "q/k/v/g/beta");
+        int rc = check_float(in[i], op, "q/k/v/g/beta");
         if (rc != 0) {
             return false;
         }
@@ -192,7 +192,7 @@ int32_t delta_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const*
         }
         std::vector<int64_t> shape = dims_of(in[0]);
         shape[shape.size() - 1] = plan.vh * plan.dv;
-        set_shape(out[0], shape);
+        set_shape(out[0], float_dtype_of(in[0]), shape);
         return 0;
     });
 }
@@ -225,14 +225,21 @@ int32_t delta_execute(rs_ctx*, const rs_tensor* const* in, uint32_t n_in, rs_ten
         const int64_t Dv = plan.dv;
         const double scale = 1.0 / std::sqrt(static_cast<double>(D));
 
-        at::Tensor q = delta_heads(view(in[0]), B, S, plan.kh, D, plan.repeat) * scale;
-        at::Tensor k = delta_heads(view(in[1]), B, S, plan.kh, D, plan.repeat);
-        at::Tensor v = delta_heads(view(in[2]), B, S, H, Dv, 1);
-        at::Tensor g = view(in[3]).reshape({B, S, H});
-        at::Tensor beta = view(in[4]).reshape({B, S, H});
+        // The operator's contract keeps the recurrence state fp32 (the
+        // 'state_dtype' attribute accepts only "f32"): every operand is cast
+        // to f32 for the recurrence and the result is cast back to the
+        // caller's float dtype, so the value matches the documented contract
+        // whether the variant runs f32 or bf16.
+        const at::ScalarType io_dtype = view(in[0]).scalar_type();
+        const at::TensorOptions fopts = view(in[0]).options().dtype(at::kFloat);
+        at::Tensor q = delta_heads(view(in[0]).to(at::kFloat), B, S, plan.kh, D, plan.repeat) * scale;
+        at::Tensor k = delta_heads(view(in[1]).to(at::kFloat), B, S, plan.kh, D, plan.repeat);
+        at::Tensor v = delta_heads(view(in[2]).to(at::kFloat), B, S, H, Dv, 1);
+        at::Tensor g = view(in[3]).to(at::kFloat).reshape({B, S, H});
+        at::Tensor beta = view(in[4]).to(at::kFloat).reshape({B, S, H});
 
-        at::Tensor state = at::zeros({B, H, D, Dv}, q.options());
-        at::Tensor result = at::empty({B, S, H, Dv}, q.options());
+        at::Tensor state = at::zeros({B, H, D, Dv}, fopts);
+        at::Tensor result = at::empty({B, S, H, Dv}, fopts);
 
         // The recurrence is sequential in t by definition; everything else is
         // batched over (batch, head), so the loop runs S times and each step is
@@ -248,7 +255,7 @@ int32_t delta_execute(rs_ctx*, const rs_tensor* const* in, uint32_t n_in, rs_ten
             at::Tensor q_t = q.select(1, t).reshape({B, H, 1, D});
             result.select(1, t).copy_(at::matmul(q_t, state).reshape({B, H, Dv}));
         }
-        return write_out(out[0], result.reshape(dims_of(out[0])), "gated_delta_rule");
+        return write_out(out[0], result.reshape(dims_of(out[0])).to(io_dtype), "gated_delta_rule");
     });
 }
 

@@ -39,11 +39,11 @@ const int N_SCATTER_REDUCE_KINDS = 2;
 
 int32_t matmul_shape(const rs_tensor* a, const rs_tensor* b, const rs_attrs* attrs,
                      std::vector<int64_t>* shape) {
-    int rc = check_f32(a, "matmul", "a");
+    int rc = check_float(a, "matmul", "a");
     if (rc != 0) {
         return rc;
     }
-    rc = check_f32(b, "matmul", "b");
+    rc = check_float(b, "matmul", "b");
     if (rc != 0) {
         return rc;
     }
@@ -76,7 +76,7 @@ int32_t matmul_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const
         if (rc != 0) {
             return rc;
         }
-        set_shape(out[0], shape);
+        set_shape(out[0], float_dtype_of(in[0]), shape);
         return 0;
     });
 }
@@ -103,11 +103,11 @@ int32_t matmul_execute(rs_ctx*, const rs_tensor* const* in, uint32_t n_in, rs_te
 /// `x @ w` — torch's `nn.Linear` stores `[N, K]` and is NOT this contract.
 int32_t linear_shape(const rs_tensor* x, const rs_tensor* w, const rs_tensor* b,
                      std::vector<int64_t>* shape) {
-    int rc = check_f32(x, "linear", "x");
+    int rc = check_float(x, "linear", "x");
     if (rc != 0) {
         return rc;
     }
-    rc = check_f32(w, "linear", "w");
+    rc = check_float(w, "linear", "w");
     if (rc != 0) {
         return rc;
     }
@@ -119,7 +119,7 @@ int32_t linear_shape(const rs_tensor* x, const rs_tensor* w, const rs_tensor* b,
         return fail("linear: inner dim mismatch (w must be [K= " + std::to_string(k) + ", N])");
     }
     if (b != nullptr) {
-        rc = check_f32(b, "linear", "b");
+        rc = check_float(b, "linear", "b");
         if (rc != 0) {
             return rc;
         }
@@ -143,7 +143,7 @@ int32_t linear_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const
         if (rc != 0) {
             return rc;
         }
-        set_shape(out[0], shape);
+        set_shape(out[0], float_dtype_of(in[0]), shape);
         return 0;
     });
 }
@@ -198,11 +198,11 @@ bool broadcast_shapes(const rs_tensor* a, const rs_tensor* b, const char* op,
 /// broadcast.
 bool bmm_shape(const rs_tensor* a, const rs_tensor* b, const rs_attrs* attrs,
                std::vector<int64_t>* out) {
-    int rc = check_f32(a, "bmm", "a");
+    int rc = check_float(a, "bmm", "a");
     if (rc != 0) {
         return false;
     }
-    rc = check_f32(b, "bmm", "b");
+    rc = check_float(b, "bmm", "b");
     if (rc != 0) {
         return false;
     }
@@ -241,7 +241,7 @@ int32_t bmm_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const* o
         if (!bmm_shape(in[0], in[1], attrs, &shape)) {
             return 1;
         }
-        set_shape(out[0], shape);
+        set_shape(out[0], float_dtype_of(in[0]), shape);
         return 0;
     });
 }
@@ -343,7 +343,7 @@ int32_t unary_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const*
         if (n_in != 1 || n_out != 1) {
             return fail("elementwise_unary expects one input and one output");
         }
-        int rc = check_f32(in[0], "elementwise_unary", "x");
+        int rc = check_float(in[0], "elementwise_unary", "x");
         if (rc != 0) {
             return rc;
         }
@@ -351,7 +351,7 @@ int32_t unary_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const*
         if (!require_kind(attrs, "kind", UNARY_KINDS, N_UNARY_KINDS, "elementwise_unary", &kind)) {
             return 1;
         }
-        set_shape(out[0], dims_of(in[0]));
+        set_shape(out[0], float_dtype_of(in[0]), dims_of(in[0]));
         return 0;
     });
 }
@@ -383,7 +383,7 @@ int32_t binary_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const
         if (n_in < 1 || n_in > 2 || n_out != 1) {
             return fail("elementwise_binary expects one or two inputs and one output");
         }
-        int rc = check_f32(in[0], "elementwise_binary", "a");
+        int rc = check_float(in[0], "elementwise_binary", "a");
         if (rc != 0) {
             return rc;
         }
@@ -396,10 +396,10 @@ int32_t binary_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const
             if (!attr_f64(attrs, "rhs", &rhs)) {
                 return fail("elementwise_binary: one input needs the scalar attribute 'rhs'");
             }
-            set_shape(out[0], dims_of(in[0]));
+            set_shape(out[0], float_dtype_of(in[0]), dims_of(in[0]));
             return 0;
         }
-        rc = check_f32(in[1], "elementwise_binary", "b");
+        rc = check_float(in[1], "elementwise_binary", "b");
         if (rc != 0) {
             return rc;
         }
@@ -407,7 +407,7 @@ int32_t binary_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const
         if (!broadcast_shapes(in[0], in[1], "elementwise_binary", &shape)) {
             return 1;
         }
-        set_shape(out[0], shape);
+        set_shape(out[0], float_dtype_of(in[0]), shape);
         return 0;
     });
 }
@@ -462,11 +462,11 @@ int32_t compare_execute(rs_ctx*, const rs_tensor* const* in, uint32_t n_in, rs_t
         if (n_in != 2 || n_out != 1) {
             return fail("compare expects two inputs and one output");
         }
-        int rc = check_f32(in[0], "compare", "a");
+        int rc = check_float(in[0], "compare", "a");
         if (rc != 0) {
             return rc;
         }
-        rc = check_f32(in[1], "compare", "b");
+        rc = check_float(in[1], "compare", "b");
         if (rc != 0) {
             return rc;
         }
@@ -504,7 +504,7 @@ int32_t reduce_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const
         if (n_in != 1 || n_out != 1) {
             return fail("reduce expects one input and one output");
         }
-        int rc = check_f32(in[0], "reduce", "x");
+        int rc = check_float(in[0], "reduce", "x");
         if (rc != 0) {
             return rc;
         }
@@ -523,9 +523,9 @@ int32_t reduce_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const
             // rely on).
             if (keepdim) {
                 std::vector<int64_t> shape(static_cast<size_t>(in[0]->rank), 1);
-                set_shape(out[0], shape);
+                set_shape(out[0], float_dtype_of(in[0]), shape);
             } else {
-                set_shape(out[0], {});
+                set_shape(out[0], float_dtype_of(in[0]), {});
             }
             return 0;
         }
@@ -544,7 +544,7 @@ int32_t reduce_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const
                 shape.push_back(in[0]->shape[d]);
             }
         }
-        set_shape(out[0], shape);
+        set_shape(out[0], float_dtype_of(in[0]), shape);
         return 0;
     });
 }
@@ -605,7 +605,7 @@ int32_t softmax_execute(rs_ctx*, const rs_tensor* const* in, uint32_t n_in, rs_t
         if (n_in != 1 || n_out != 1) {
             return fail("softmax expects one input and one output");
         }
-        int rc = check_f32(in[0], "softmax", "x");
+        int rc = check_float(in[0], "softmax", "x");
         if (rc != 0) {
             return rc;
         }
@@ -638,7 +638,7 @@ int32_t embedding_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* co
         if (n_in != 2 || n_out != 1) {
             return fail("embedding expects two inputs and one output");
         }
-        int rc = check_f32(in[0], "embedding", "w");
+        int rc = check_float(in[0], "embedding", "w");
         if (rc != 0) {
             return rc;
         }
@@ -650,7 +650,7 @@ int32_t embedding_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* co
         }
         std::vector<int64_t> shape = dims_of(in[1]);
         shape.push_back(in[0]->shape[1]);
-        set_shape(out[0], shape);
+        set_shape(out[0], float_dtype_of(in[0]), shape);
         return 0;
     });
 }
@@ -677,14 +677,14 @@ int32_t gather_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const
         if (n_in != 2 || n_out != 1) {
             return fail("gather expects two inputs and one output");
         }
-        int rc = check_f32(in[0], "gather", "x");
+        int rc = check_float(in[0], "gather", "x");
         if (rc != 0) {
             return rc;
         }
         if (!index_dtype_ok(in[1], "gather", "indices")) {
             return 1;
         }
-        set_shape(out[0], dims_of(in[1]));
+        set_shape(out[0], float_dtype_of(in[0]), dims_of(in[1]));
         return 0;
     });
 }
@@ -713,14 +713,14 @@ int32_t scatter_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* cons
         if (n_in != 3 || n_out != 1) {
             return fail("scatter expects three inputs and one output");
         }
-        int rc = check_f32(in[0], "scatter", "x");
+        int rc = check_float(in[0], "scatter", "x");
         if (rc != 0) {
             return rc;
         }
         if (!index_dtype_ok(in[1], "scatter", "indices")) {
             return 1;
         }
-        rc = check_f32(in[2], "scatter", "values");
+        rc = check_float(in[2], "scatter", "values");
         if (rc != 0) {
             return rc;
         }
@@ -729,7 +729,7 @@ int32_t scatter_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* cons
                           "scatter", &reduce)) {
             return 1;
         }
-        set_shape(out[0], dims_of(in[0]));
+        set_shape(out[0], float_dtype_of(in[0]), dims_of(in[0]));
         return 0;
     });
 }
@@ -821,7 +821,7 @@ int32_t sdpa_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const* 
             return fail("sdpa expects three or four inputs and one output");
         }
         for (uint32_t i = 0; i < 3; ++i) {
-            int rc = check_f32(in[i], "sdpa", "q/k/v");
+            int rc = check_float(in[i], "sdpa", "q/k/v");
             if (rc != 0) {
                 return rc;
             }
@@ -837,7 +837,7 @@ int32_t sdpa_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const* 
         } else {
             shape[shape.size() - 1] = plan.value_dim;
         }
-        set_shape(out[0], shape);
+        set_shape(out[0], float_dtype_of(in[0]), shape);
         return 0;
     });
 }
@@ -944,11 +944,11 @@ int32_t rope_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const* 
         if (n_in < 2 || n_in > 3 || n_out != 2) {
             return fail("rope expects two or three inputs and two outputs");
         }
-        int rc = check_f32(in[0], "rope", "x");
+        int rc = check_float(in[0], "rope", "x");
         if (rc != 0) {
             return rc;
         }
-        rc = check_f32(in[1], "rope", "y");
+        rc = check_float(in[1], "rope", "y");
         if (rc != 0) {
             return rc;
         }
@@ -960,8 +960,8 @@ int32_t rope_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const* 
                 return fail("rope expects x and y with identical shape");
             }
         }
-        set_shape(out[0], dims_of(in[0]));
-        set_shape(out[1], dims_of(in[1]));
+        set_shape(out[0], float_dtype_of(in[0]), dims_of(in[0]));
+        set_shape(out[1], float_dtype_of(in[0]), dims_of(in[1]));
         return 0;
     });
 }
@@ -1030,6 +1030,9 @@ int32_t rope_execute(rs_ctx*, const rs_tensor* const* in, uint32_t n_in, rs_tens
                          rotary, x.options(), &cos, &sin, "rope")) {
             return 1;
         }
+        // cos/sin stay f32 (the rotary tables are internal, built in f32 like
+        // the HF source), so the products promote the operands to f32 and
+        // `write_out` rounds the result back to the caller's float dtype.
         int rc = write_out(out[0], rope_apply(x, cos, sin, S, D, rotary), "rope");
         if (rc != 0) {
             return rc;
@@ -1046,7 +1049,7 @@ int32_t topk_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const* 
         if (n_in != 1 || n_out != 2) {
             return fail("topk_router expects one input and two outputs");
         }
-        int rc = check_f32(in[0], "topk_router", "logits");
+        int rc = check_float(in[0], "topk_router", "logits");
         if (rc != 0) {
             return rc;
         }
@@ -1058,8 +1061,8 @@ int32_t topk_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const* 
         if (k < 1 || k > e) {
             return fail("topk_router: 'top_k' must be in [1, E]");
         }
-        set_shape(out[0], {in[0]->shape[0], k});
-        set_shape(out[1], {in[0]->shape[0], k});
+        set_shape(out[0], float_dtype_of(in[0]), {in[0]->shape[0], k});
+        set_shape(out[1], float_dtype_of(in[0]), {in[0]->shape[0], k});
         out[1]->dtype = RS_I32;
         return 0;
     });
@@ -1077,7 +1080,15 @@ int32_t topk_execute(rs_ctx*, const rs_tensor* const* in, uint32_t n_in, rs_tens
         if (k < 1 || k > e) {
             return fail("topk_router: 'top_k' must be in [1, E]");
         }
-        at::Tensor probs = at::softmax(logits, /*dim=*/-1);
+        // The routing decision is **discrete**, so it is computed in f32 whatever the activation
+        // dtype is. A bf16 softmax and sort can order two nearly-equal experts differently, and
+        // the token then takes a different expert: the output changes by O(1), not by a rounding
+        // error, which is what turned the tp-vs-world=1 acceptance into `max|diff| 1.66` and made
+        // every tolerance-based comparison meaningless. Megatron computes router logits in fp32
+        // for the same reason; the selected expert ids then depend on the *values*, not on the
+        // precision they happen to be carried in.
+        at::Tensor scores = logits.to(at::kFloat);
+        at::Tensor probs = at::softmax(scores, /*dim=*/-1);
         // Ties break toward the lower expert index: a stable descending sort
         // keeps the original order among equal probabilities, and ascending
         // selection on top of it is exactly that rule. `at::topk`'s tie
@@ -1118,7 +1129,7 @@ int32_t ce_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const* ou
         if (n_in != 2 || n_out != 1) {
             return fail("cross_entropy expects two inputs and one output");
         }
-        int rc = check_f32(in[0], "cross_entropy", "logits");
+        int rc = check_float(in[0], "cross_entropy", "logits");
         if (rc != 0) {
             return rc;
         }
@@ -1128,7 +1139,7 @@ int32_t ce_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const* ou
         if (in[0]->rank != 2 || in[1]->rank != 1 || in[1]->shape[0] != in[0]->shape[0]) {
             return fail("cross_entropy expects logits [N, C] and targets [N]");
         }
-        set_shape(out[0], {});
+        set_shape(out[0], float_dtype_of(in[0]), {});
         return 0;
     });
 }
@@ -1161,9 +1172,8 @@ void add_compute_ops(std::vector<OpDef>& ops) {
                         "'rhs' attribute is the same operation against a constant.",
                         f32_mask(), RS_AUTODIFF, binary_infer, binary_execute});
     ops.push_back(OpDef{"compare", RS_SHARD_ELEMENTWISE,
-                        "Elementwise comparison to an f32 mask (1.0 where it holds, 0.0 "
-                        "elsewhere). Every comparison involving NaN yields 0.0, 'ne' "
-                        "included.",
+                        "Elementwise comparison to a 1.0/0.0 mask in the input's dtype. "
+                        "Every comparison involving NaN yields 0.0, 'ne' included.",
                         f32_mask(), RS_AUTODIFF, [](const rs_tensor* const* in, uint32_t n_in,
                                                      rs_tensor* const* out, uint32_t n_out,
                                                      const rs_attrs* attrs) {
@@ -1171,11 +1181,11 @@ void add_compute_ops(std::vector<OpDef>& ops) {
                                 if (n_in != 2 || n_out != 1) {
                                     return fail("compare expects two inputs and one output");
                                 }
-                                int rc = check_f32(in[0], "compare", "a");
+                                int rc = check_float(in[0], "compare", "a");
                                 if (rc != 0) {
                                     return rc;
                                 }
-                                rc = check_f32(in[1], "compare", "b");
+                                rc = check_float(in[1], "compare", "b");
                                 if (rc != 0) {
                                     return rc;
                                 }
@@ -1184,7 +1194,7 @@ void add_compute_ops(std::vector<OpDef>& ops) {
                                                   "compare", &kind)) {
                                     return 1;
                                 }
-                                set_shape(out[0], dims_of(in[0]));
+                                set_shape(out[0], float_dtype_of(in[0]), dims_of(in[0]));
                                 return 0;
                             });
                         },
@@ -1204,7 +1214,7 @@ void add_compute_ops(std::vector<OpDef>& ops) {
                                 if (n_in != 1 || n_out != 1) {
                                     return fail("softmax expects one input and one output");
                                 }
-                                int rc = check_f32(in[0], "softmax", "x");
+                                int rc = check_float(in[0], "softmax", "x");
                                 if (rc != 0) {
                                     return rc;
                                 }
@@ -1214,7 +1224,7 @@ void add_compute_ops(std::vector<OpDef>& ops) {
                                     return 1;
                                 }
                                 (void)f64_or(attrs, "scale", 1.0);
-                                set_shape(out[0], dims_of(in[0]));
+                                set_shape(out[0], float_dtype_of(in[0]), dims_of(in[0]));
                                 return 0;
                             });
                         },

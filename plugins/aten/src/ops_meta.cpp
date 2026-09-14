@@ -18,11 +18,11 @@ int32_t view_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const* 
         if (n_in != 1 || n_out != 1) {
             return fail("view expects one input and one output");
         }
-        int rc = check_f32(in[0], "view", "input");
+        int rc = check_float(in[0], "view", "input");
         if (rc != 0) {
             return rc;
         }
-        set_shape(out[0], dims_of(in[0]));
+        set_shape(out[0], float_dtype_of(in[0]), dims_of(in[0]));
         return 0;
     });
 }
@@ -89,7 +89,7 @@ int32_t reshape_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* cons
         if (n_in != 1 || n_out != 1) {
             return fail("reshape expects one input and one output");
         }
-        int rc = check_f32(in[0], "reshape", "input");
+        int rc = check_float(in[0], "reshape", "input");
         if (rc != 0) {
             return rc;
         }
@@ -97,7 +97,7 @@ int32_t reshape_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* cons
         if (!reshape_target(in[0], attrs, &target)) {
             return 1;
         }
-        set_shape(out[0], target);
+        set_shape(out[0], float_dtype_of(in[0]), target);
         return 0;
     });
 }
@@ -136,7 +136,7 @@ int32_t transpose_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* co
         if (n_in != 1 || n_out != 1) {
             return fail("transpose expects one input and one output");
         }
-        int rc = check_f32(in[0], "transpose", "input");
+        int rc = check_float(in[0], "transpose", "input");
         if (rc != 0) {
             return rc;
         }
@@ -147,7 +147,7 @@ int32_t transpose_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* co
         }
         std::vector<int64_t> shape = dims_of(in[0]);
         std::swap(shape[static_cast<size_t>(a)], shape[static_cast<size_t>(b)]);
-        set_shape(out[0], shape);
+        set_shape(out[0], float_dtype_of(in[0]), shape);
         return 0;
     });
 }
@@ -193,7 +193,7 @@ int32_t narrow_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const
         if (n_in != 1 || n_out != 1) {
             return fail("narrow expects one input and one output");
         }
-        int rc = check_f32(in[0], "narrow", "input");
+        int rc = check_float(in[0], "narrow", "input");
         if (rc != 0) {
             return rc;
         }
@@ -203,7 +203,7 @@ int32_t narrow_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const
         }
         std::vector<int64_t> shape = dims_of(in[0]);
         shape[static_cast<size_t>(dim)] = length;
-        set_shape(out[0], shape);
+        set_shape(out[0], float_dtype_of(in[0]), shape);
         return 0;
     });
 }
@@ -238,7 +238,7 @@ int32_t cat_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const* o
         std::vector<int64_t> shape = dims_of(in[0]);
         int64_t total = 0;
         for (uint32_t i = 0; i < n_in; ++i) {
-            int rc = check_f32(in[i], "cat", "input");
+            int rc = check_float(in[i], "cat", "input");
             if (rc != 0) {
                 return rc;
             }
@@ -254,7 +254,7 @@ int32_t cat_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const* o
             total += in[i]->shape[dim];
         }
         shape[static_cast<size_t>(dim)] = total;
-        set_shape(out[0], shape);
+        set_shape(out[0], float_dtype_of(in[0]), shape);
         return 0;
     });
 }
@@ -286,7 +286,7 @@ int32_t broadcast_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* co
         if (n_in != 1 || n_out != 1) {
             return fail("broadcast expects one input and one output");
         }
-        int rc = check_f32(in[0], "broadcast", "input");
+        int rc = check_float(in[0], "broadcast", "input");
         if (rc != 0) {
             return rc;
         }
@@ -294,7 +294,7 @@ int32_t broadcast_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* co
         if (!attr_i64s(attrs, "shape", &shape)) {
             return fail("broadcast: attribute 'shape' is required");
         }
-        set_shape(out[0], shape);
+        set_shape(out[0], float_dtype_of(in[0]), shape);
         return 0;
     });
 }

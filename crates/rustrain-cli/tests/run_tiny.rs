@@ -166,6 +166,11 @@ fn run_executes_the_tiny_forward_and_writes_the_dump_the_script_reads() {
     let status = Command::new(cli_binary())
         .args([
             "run",
+            // The tiny checkpoint is bf16 but the reference provider computes f32: the test
+            // exercises the widened f32 path, which is what `check --dtype f32` and the CPU
+            // conformance oracles use.
+            "--dtype",
+            "f32",
             "--model",
             fixture_model().to_str().unwrap(),
             "--checkpoint",
@@ -273,6 +278,11 @@ fn the_fixed_probe_tokens_land_byte_identical_in_the_dump() {
     let status = Command::new(cli_binary())
         .args([
             "run",
+            // The tiny checkpoint is bf16 but the reference provider computes f32: the test
+            // exercises the widened f32 path, which is what `check --dtype f32` and the CPU
+            // conformance oracles use.
+            "--dtype",
+            "f32",
             "--model",
             fixture_model().to_str().unwrap(),
             "--checkpoint",
@@ -308,6 +318,11 @@ fn a_short_probe_is_padded_and_the_dump_keeps_the_probe_rows() {
     let status = Command::new(cli_binary())
         .args([
             "run",
+            // The tiny checkpoint is bf16 but the reference provider computes f32: the test
+            // exercises the widened f32 path, which is what `check --dtype f32` and the CPU
+            // conformance oracles use.
+            "--dtype",
+            "f32",
             "--model",
             fixture_model().to_str().unwrap(),
             "--checkpoint",
@@ -367,6 +382,11 @@ fn a_metadata_snapshot_is_refused_by_name() {
     let status = Command::new(cli_binary())
         .args([
             "run",
+            // The tiny checkpoint is bf16 but the reference provider computes f32: the test
+            // exercises the widened f32 path, which is what `check --dtype f32` and the CPU
+            // conformance oracles use.
+            "--dtype",
+            "f32",
             "--model",
             fixture_model().to_str().unwrap(),
             "--checkpoint",
@@ -401,6 +421,11 @@ fn length_disagreements_fail_early() {
     let disagree = Command::new(cli_binary())
         .args([
             "run",
+            // The tiny checkpoint is bf16 but the reference provider computes f32: the test
+            // exercises the widened f32 path, which is what `check --dtype f32` and the CPU
+            // conformance oracles use.
+            "--dtype",
+            "f32",
             "--model",
             fixture_model().to_str().unwrap(),
             "--checkpoint",
@@ -426,6 +451,11 @@ fn length_disagreements_fail_early() {
     let too_long = Command::new(cli_binary())
         .args([
             "run",
+            // The tiny checkpoint is bf16 but the reference provider computes f32: the test
+            // exercises the widened f32 path, which is what `check --dtype f32` and the CPU
+            // conformance oracles use.
+            "--dtype",
+            "f32",
             "--model",
             fixture_model().to_str().unwrap(),
             "--checkpoint",

@@ -56,6 +56,11 @@ pub(crate) struct LaunchArgs {
     #[arg(long, value_name = "N")]
     pub seq: Option<usize>,
 
+    /// The dtype the plan's float slots execute in, forwarded to every rank: `bf16` (the default)
+    /// keeps the checkpoint's own weights, `f32` widens them.
+    #[arg(long, value_enum, default_value = "bf16")]
+    pub dtype: run::RunDtype,
+
     /// Where the world's dump lands (a `.npz` plus a `.json` sidecar); in
     /// `--sweep` mode this is the JSON report path instead.
     #[arg(long, value_name = "PATH")]
@@ -207,6 +212,7 @@ impl LaunchArgs {
             checkpoint: self.checkpoint.clone(),
             tokens: self.tokens.clone(),
             seq: self.seq,
+            dtype: self.dtype,
             out: Some(self.out.clone()),
             tp: self.tp,
             cp: self.cp,
@@ -317,6 +323,9 @@ fn run_world(
         if let Some(seq) = args.seq {
             command.arg("--seq").arg(seq.to_string());
         }
+        // The dtype is one fact per world, not per rank: forward it verbatim so a rank child runs
+        // the same plan its launcher reports.
+        command.arg("--dtype").arg(args.dtype.to_string());
         for plugin in &args.plugins {
             command.arg("--plugin").arg(plugin);
         }

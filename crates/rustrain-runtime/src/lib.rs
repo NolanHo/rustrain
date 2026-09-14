@@ -71,6 +71,18 @@ pub enum RuntimeError {
         dtype: String,
     },
 
+    /// A partial raw write addresses elements, so a dtype whose elements are not whole bytes
+    /// (fp4) has no element offset to write at.
+    #[error(
+        "slot {slot:?} ({name}) is {dtype}, whose elements are not whole bytes, so a raw write \
+         at an element offset cannot address them"
+    )]
+    SubByteElements {
+        slot: SlotId,
+        name: String,
+        dtype: String,
+    },
+
     #[error("slot {slot:?} ({name}) holds {expected} bytes but {actual} were supplied")]
     ByteLengthMismatch {
         slot: SlotId,
@@ -612,6 +624,54 @@ impl Executor {
             .map_err(|reason| RuntimeError::Copy {
                 slot: id,
                 bytes,
+                reason,
+            })
+    }
+
+    /// Writes part of a slot in raw bytes: `bytes` land at `element_offset` elements past the
+    /// slot's start, and the rest of the slot is left alone.
+    ///
+    /// The raw twin of [`Self::write_f32_at`]: the streaming loader feeds a bf16 weight slot the
+    /// checkpoint's own little-endian bytes, at the slot's declared element width, where
+    /// `write_f32_at` would demand an f32 slot and quadruple the traffic. The caller is
+    /// responsible for the byte width matching the slot's declared dtype; the range is
+    /// bounds-checked here, so a chunked writer cannot scribble past its slot.
+    pub fn write_raw_at(
+        &mut self,
+        id: SlotId,
+        element_offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), RuntimeError> {
+        let slot = self.plan.plan.slot(id);
+        let width = slot
+            .dtype
+            .byte_width()
+            .ok_or_else(|| RuntimeError::SubByteElements {
+                slot: id,
+                name: slot.name.clone(),
+                dtype: slot.dtype.to_string(),
+            })?;
+        let len = self.slot_len(id);
+        let elements = bytes.len() / width as usize;
+        let end = element_offset.saturating_add(elements);
+        if bytes.len() % width as usize != 0 || end > len {
+            return Err(RuntimeError::LengthMismatch {
+                slot: id,
+                name: slot.name.clone(),
+                expected: len,
+                actual: end,
+            });
+        }
+        let ptr = self.dense_ptr(id)?;
+        // SAFETY: pointer arithmetic on the slot's own allocation: the destination is
+        // `element_offset` elements past its start, and the check above proves the whole range
+        // is inside it.
+        let dst = unsafe { (ptr as *mut u8).add(element_offset * width as usize) };
+        self.allocator
+            .copy_in(dst as *mut c_void, bytes.len() as u64, bytes)
+            .map_err(|reason| RuntimeError::Copy {
+                slot: id,
+                bytes: bytes.len() as u64,
                 reason,
             })
     }
@@ -1336,5 +1396,89 @@ mod tests {
             2,
             "both read paths copy out"
         );
+    }
+
+    /// The raw partial write the streamed bf16 loader needs: bytes land at `element_offset`
+    /// elements past the slot's start, the rest of the slot is untouched, and a range that would
+    /// run past the slot (or a byte count that is not whole elements) is refused.
+    #[test]
+    fn write_raw_at_places_a_chunk_and_refuses_out_of_range() {
+        use rustrain_abi::Plugin;
+        use rustrain_parallel::{Mesh, ParallelConfig};
+        use rustrain_plan::{PlanBuilder, SlotKind};
+
+        let mut registry = rustrain_ops::Registry::new();
+        // SAFETY: the built-in provider descriptor is leaked by the builder and lives for the
+        // process.
+        let reference = unsafe { Plugin::from_static(rustrain_kernels::plugin(), "<built-in>") }
+            .expect("the built-in provider passes ABI validation");
+        registry.add_plugin(reference).expect("registering it");
+        let recipe = rustrain_ops::Recipe::from_toml("[kernel]\ndefault = \"reference\"\n")
+            .expect("recipe parses");
+
+        let mut b = PlanBuilder::new(
+            "raw-partial",
+            rustrain_ops::Phase::Forward,
+            Mesh::from_config(&ParallelConfig::default()).fingerprint(),
+        );
+        // A bf16 weight slot, fed by the loader and by no node — the shape a bf16 weight takes.
+        let w = b.slot("w", RsDtype::BF16, vec![4], SlotKind::Weight);
+        // The plan needs one node to build; it computes nothing the test reads.
+        let x = b.slot("x", RsDtype::F32, vec![4], SlotKind::Input);
+        let y = b.slot("y", RsDtype::F32, vec![4], SlotKind::Output);
+        b.node(
+            rustrain_plan::OpRef::new("elementwise_unary"),
+            vec![x],
+            vec![y],
+            rustrain_plan::Attrs::new().set("kind", "relu"),
+            "relu",
+        );
+        let plan = b.build().unwrap();
+        let compiled =
+            rustrain_plan::Compiler::new(&registry, &recipe, rustrain_ops::TargetEnv::default())
+                .compile(&plan)
+                .unwrap();
+        let mut executor = Executor::new(
+            compiled,
+            Box::new(HostAllocator::new()),
+            Box::new(SingleRank::new(1)),
+        )
+        .unwrap();
+
+        // bf16 as 2 little-endian bytes; the values are small integers, exact in bf16.
+        let bf16 = |values: &[f32]| -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                .collect()
+        };
+        let seed = bf16(&[1.0, 2.0, 3.0, 4.0]);
+        executor.write_raw(w, &seed).unwrap();
+        // A chunk that overwrites the middle two elements, and only them.
+        let chunk = bf16(&[-5.0, -6.0]);
+        executor.write_raw_at(w, 1, &chunk).unwrap();
+        let mut expected = seed.clone();
+        expected[2..6].copy_from_slice(&chunk);
+        assert_eq!(
+            executor.read_raw(w).unwrap(),
+            expected,
+            "the chunk lands at its element offset and the rest of the slot is untouched"
+        );
+
+        // Out of range: two elements at offset 3 exceed the 4-element slot.
+        assert!(matches!(
+            executor.write_raw_at(w, 3, &chunk),
+            Err(RuntimeError::LengthMismatch { .. })
+        ));
+        // A byte count that is not whole elements is refused rather than silently truncated.
+        assert!(matches!(
+            executor.write_raw_at(w, 0, &[0u8; 3]),
+            Err(RuntimeError::LengthMismatch { .. })
+        ));
+        // An offset that cannot even be added to is refused rather than wrapping.
+        assert!(matches!(
+            executor.write_raw_at(w, usize::MAX, &[0u8; 2]),
+            Err(RuntimeError::LengthMismatch { .. })
+        ));
     }
 }

@@ -259,6 +259,9 @@ fn the_sharded_logits_agree_with_the_world1_forward() {
         let model_dir = fixture(fixture_name);
         let (ok, _, stderr) = run_cli(&[
             "run",
+            // bf16 checkpoint, f32 reference provider: the widened f32 path.
+            "--dtype",
+            "f32",
             "--model",
             model_dir.to_str().unwrap(),
             "--checkpoint",
@@ -277,6 +280,9 @@ fn the_sharded_logits_agree_with_the_world1_forward() {
         let model_dir = fixture(fixture_name);
         let mut args = vec![
             "run",
+            // bf16 checkpoint, f32 reference provider: the widened f32 path.
+            "--dtype",
+            "f32",
             "--model",
             model_dir.to_str().unwrap(),
             "--checkpoint",
@@ -330,6 +336,9 @@ fn the_metrics_report_counts_what_parallel_effects_mean() {
     let report = dir.join("sweep.json");
     let (ok, _, stderr) = run_cli(&[
         "run",
+        // bf16 checkpoint, f32 reference provider: the widened f32 path.
+        "--dtype",
+        "f32",
         "--model",
         fixture("run-tiny-par").to_str().unwrap(),
         "--checkpoint",
@@ -447,6 +456,9 @@ fn run_writes_the_standalone_metrics_report() {
     let metrics = dir.join("case.metrics.json");
     let (ok, stdout, stderr) = run_cli(&[
         "run",
+        // bf16 checkpoint, f32 reference provider: the widened f32 path.
+        "--dtype",
+        "f32",
         "--model",
         fixture("run-tiny-par").to_str().unwrap(),
         "--checkpoint",
@@ -484,6 +496,9 @@ fn a_non_dividing_mesh_is_refused_with_the_constraint_named() {
     let out = dir.join("never.npz");
     let (ok, _, stderr) = run_cli(&[
         "run",
+        // bf16 checkpoint, f32 reference provider: the widened f32 path.
+        "--dtype",
+        "f32",
         "--model",
         fixture("run-tiny-par").to_str().unwrap(),
         "--checkpoint",
@@ -515,6 +530,9 @@ fn pipeline_parallelism_is_still_refused() {
     let out = dir.join("never.npz");
     let (ok, _, stderr) = run_cli(&[
         "run",
+        // bf16 checkpoint, f32 reference provider: the widened f32 path.
+        "--dtype",
+        "f32",
         "--model",
         fixture("run-tiny-par").to_str().unwrap(),
         "--checkpoint",
@@ -547,6 +565,9 @@ fn the_world1_logits_match_the_hand_computed_math() {
     let out = dir.join("hand.npz");
     let (ok, _, stderr) = run_cli(&[
         "run",
+        // bf16 checkpoint, f32 reference provider: the widened f32 path.
+        "--dtype",
+        "f32",
         "--model",
         fixture("run-tiny-par").to_str().unwrap(),
         "--checkpoint",

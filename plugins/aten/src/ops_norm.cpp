@@ -18,9 +18,16 @@ namespace {
 /// The rows of `x` treated as [rows, D] with D the last dim; the reduction runs
 /// over D only. Written as `1 / sqrt(mean + eps)` rather than `rsqrt`, so the
 /// arithmetic is the reference's expression and not merely equal to it.
+/// `1 / sqrt(mean(x^2) + eps)`, computed in **f32 whatever the input dtype is**.
+///
+/// A bf16 mean of squares loses most of its mantissa before the reciprocal square root, and the
+/// error is *systematic* per row rather than noisy: it applies to every element of the row, so it
+/// compounds through the 42 layers instead of averaging out. HF's own RMSNorm upcasts for exactly
+/// this reason, and the reference provider is f32 throughout. The result is returned in the input's
+/// dtype by the caller's `copy_`.
 at::Tensor rms_scale(const at::Tensor& x, double eps) {
-    at::Tensor sq = x * x;
-    at::Tensor mean = sq.mean(/*dim=*/-1, /*keepdim=*/true);
+    at::Tensor x32 = x.to(at::kFloat);
+    at::Tensor mean = (x32 * x32).mean(/*dim=*/-1, /*keepdim=*/true);
     return 1.0 / at::sqrt(mean + eps);
 }
 
@@ -30,7 +37,7 @@ int32_t rmsnorm_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* cons
         if (n_in < 1 || n_in > 2 || n_out != 1) {
             return fail("rmsnorm expects one or two inputs and one output");
         }
-        int rc = check_f32(in[0], "rmsnorm", "x");
+        int rc = check_float(in[0], "rmsnorm", "x");
         if (rc != 0) {
             return rc;
         }
@@ -38,7 +45,7 @@ int32_t rmsnorm_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* cons
             return fail("rmsnorm expects rank >= 1");
         }
         if (n_in == 2) {
-            rc = check_f32(in[1], "rmsnorm", "w");
+            rc = check_float(in[1], "rmsnorm", "w");
             if (rc != 0) {
                 return rc;
             }
@@ -46,7 +53,7 @@ int32_t rmsnorm_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* cons
                 return fail("rmsnorm weight must be [D] with D the last dim");
             }
         }
-        set_shape(out[0], dims_of(in[0]));
+        set_shape(out[0], float_dtype_of(in[0]), dims_of(in[0]));
         return 0;
     });
 }
@@ -73,7 +80,7 @@ int32_t layernorm_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* co
         if (n_in < 1 || n_in > 3 || n_out != 1) {
             return fail("layernorm expects one to three inputs and one output");
         }
-        int rc = check_f32(in[0], "layernorm", "x");
+        int rc = check_float(in[0], "layernorm", "x");
         if (rc != 0) {
             return rc;
         }
@@ -82,7 +89,7 @@ int32_t layernorm_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* co
         }
         int64_t d = in[0]->shape[in[0]->rank - 1];
         for (uint32_t i = 1; i < n_in; ++i) {
-            rc = check_f32(in[i], "layernorm", "w/b");
+            rc = check_float(in[i], "layernorm", "w/b");
             if (rc != 0) {
                 return rc;
             }
@@ -90,7 +97,7 @@ int32_t layernorm_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* co
                 return fail("layernorm parameters must be [D] with D the last dim");
             }
         }
-        set_shape(out[0], dims_of(in[0]));
+        set_shape(out[0], float_dtype_of(in[0]), dims_of(in[0]));
         return 0;
     });
 }
@@ -124,7 +131,7 @@ int32_t l2norm_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const
         if (n_in != 1 || n_out != 1) {
             return fail("l2norm expects one input and one output");
         }
-        int rc = check_f32(in[0], "l2norm", "x");
+        int rc = check_float(in[0], "l2norm", "x");
         if (rc != 0) {
             return rc;
         }
@@ -132,7 +139,7 @@ int32_t l2norm_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const
         if (!resolve_dim(i64_or(attrs, "dim", -1), in[0]->rank, "l2norm", &dim)) {
             return 1;
         }
-        set_shape(out[0], dims_of(in[0]));
+        set_shape(out[0], float_dtype_of(in[0]), dims_of(in[0]));
         return 0;
     });
 }
@@ -149,10 +156,12 @@ int32_t l2norm_execute(rs_ctx*, const rs_tensor* const* in, uint32_t n_in, rs_te
         }
         at::Tensor x = view(in[0]);
         // The SUM of squares (not the mean) with eps inside the sqrt — GDN's
-        // convention, aligned with the HF l2norm.
-        at::Tensor sq = x * x;
-        at::Tensor norm = at::sqrt(sq.sum(dim, /*keepdim=*/true) + f64_or(attrs, "eps", 1e-6));
-        return write_out(out[0], x / norm, "l2norm");
+        // convention, aligned with the HF l2norm. Summed in f32 for the same
+        // reason `rms_scale` upcasts: a bf16 sum over the head dim is a
+        // systematic per-row error, not noise.
+        at::Tensor x32 = x.to(at::kFloat);
+        at::Tensor norm = at::sqrt((x32 * x32).sum(dim, /*keepdim=*/true) + f64_or(attrs, "eps", 1e-6));
+        return write_out(out[0], x32 / norm, "l2norm");
     });
 }
 
@@ -162,7 +171,7 @@ int32_t rmsnorm_gated_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor
         if (n_in != 3 || n_out != 1) {
             return fail("rmsnorm_gated expects three inputs and one output");
         }
-        int rc = check_f32(in[0], "rmsnorm_gated", "x");
+        int rc = check_float(in[0], "rmsnorm_gated", "x");
         if (rc != 0) {
             return rc;
         }
@@ -170,14 +179,14 @@ int32_t rmsnorm_gated_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor
             return fail("rmsnorm_gated expects rank >= 1");
         }
         int64_t d = in[0]->shape[in[0]->rank - 1];
-        rc = check_f32(in[1], "rmsnorm_gated", "w");
+        rc = check_float(in[1], "rmsnorm_gated", "w");
         if (rc != 0) {
             return rc;
         }
         if (in[1]->rank != 1 || in[1]->shape[0] != d) {
             return fail("rmsnorm_gated weight must be [D] with D the last dim");
         }
-        rc = check_f32(in[2], "rmsnorm_gated", "gate");
+        rc = check_float(in[2], "rmsnorm_gated", "gate");
         if (rc != 0) {
             return rc;
         }
@@ -189,7 +198,7 @@ int32_t rmsnorm_gated_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor
         if (!require_kind(attrs, "gate_act", GATE_ACTS, 1, "rmsnorm_gated", &act)) {
             return 1;
         }
-        set_shape(out[0], dims_of(in[0]));
+        set_shape(out[0], float_dtype_of(in[0]), dims_of(in[0]));
         return 0;
     });
 }

@@ -4,11 +4,16 @@
 //! rank loads its own weight slices and instantiates its own plan, and the collectives run through
 //! a real backend (N threads, one per rank, shared buffers).
 //!
-//! Precision (the frozen decision, stated here because a runner user has to know it): the
-//! reference provider is f32-only while the checkpoint and HF are bf16, so `run` widens the
-//! bf16 weights to f32 — exact, bf16 ⊂ f32 — and executes f32. The HF reference is dumped with
-//! `--dtype bf16`; the spec's 1% tolerance (`max_abs_diff / max_abs` on the logits and the
-//! per-layer summaries) absorbs HF's own bf16 rounding, not this widening.
+//! Precision (the runner's dtype decision, stated here because a runner user has to know it):
+//! `--dtype bf16` is the default — the checkpoint and HF are bf16, so the weights *stay* bf16:
+//! the loader copies the checkpoint's own bytes through unchanged (2 bytes per element on the
+//! host and the device), and the plan resolves bf16 operator variants such as `cuda.aten.bf16`.
+//! Widening to f32 would double the device bytes and the host traffic without adding any
+//! precision the model has. `--dtype f32` keeps the widened plan for the f32-only reference
+//! provider, `check --dtype f32` and debugging; the widening is exact (bf16 ⊂ f32). The dump
+//! stays f32 either way, so the HF comparison does not change: its reference is dumped with
+//! `--dtype bf16`, and the spec's 1% tolerance (`max_abs_diff / max_abs` on the logits and the
+//! per-layer summaries) absorbs HF's own bf16 rounding, not the run's dtype.
 //!
 //! D6's numeric claim is a different one, against **our own** world-1 run: the collectives
 //! reorder f32 summation (an all-reduce adds partials instead of one sequential accumulation),
@@ -32,7 +37,7 @@ use rustrain_runtime::{
 };
 
 use crate::device::DeviceSpec;
-use crate::load::load_weights;
+use crate::load::{LoadTarget, load_weights};
 use crate::npz::{self, Npy};
 
 /// The completion view's output slot name — where the runner reads the full
@@ -42,6 +47,38 @@ const LOGITS_COMPLETE: &str = "__run__.logits.complete";
 pub(crate) const AGREEMENT_BOUND_RELATIVE: f64 = 1e-5;
 pub(crate) const METRICS_FORMAT: &str = "rustrain.metrics.v1";
 pub(crate) const SWEEP_FORMAT: &str = "rustrain.sweep.v1";
+
+/// The dtype the weights live in for this run, and how the loader hands them over.
+///
+/// `bf16` — the default — is the checkpoint's own precision: its bytes pass through unchanged,
+/// at 2 bytes per element on the host and the device. `f32` widens them (exact, bf16 ⊂ f32) for
+/// the f32-only reference provider, `check --dtype f32` and debugging.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+pub(crate) enum RunDtype {
+    /// The checkpoint's own bf16 bytes pass through unchanged (the default).
+    Bf16,
+    /// Widen bf16/f16/f32 weights to f32.
+    F32,
+}
+
+impl RunDtype {
+    /// The loader's view of the choice: raw bytes, or the widening walk.
+    pub(crate) fn load_target(self) -> LoadTarget {
+        match self {
+            RunDtype::Bf16 => LoadTarget::Raw,
+            RunDtype::F32 => LoadTarget::Widen,
+        }
+    }
+}
+
+impl std::fmt::Display for RunDtype {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RunDtype::Bf16 => "bf16",
+            RunDtype::F32 => "f32",
+        })
+    }
+}
 
 #[derive(Args)]
 pub(crate) struct RunArgs {
@@ -54,6 +91,14 @@ pub(crate) struct RunArgs {
     /// and is refused.
     #[arg(long, value_name = "PATH")]
     pub checkpoint: PathBuf,
+
+    /// The dtype the plan's float slots execute in. `bf16` (the default) keeps the checkpoint's
+    /// own bf16 weights — the model's precision — at 2 bytes per element on the host and the
+    /// device, and resolves bf16 variants such as `cuda.aten.bf16`; widening to f32 would double
+    /// the device bytes and the host traffic for nothing. `f32` widens them (exact, bf16 ⊂ f32)
+    /// for the reference provider and debugging.
+    #[arg(long, value_enum, default_value = "bf16")]
+    pub dtype: RunDtype,
 
     /// The probe tokens, comma-separated non-negative integers — the comparison script's fixed
     /// probe is `9707,11,1879,0,323,358,314,279`.
@@ -146,6 +191,27 @@ fn summarize(values: &[f32]) -> [f32; 3] {
     [mean, var.sqrt(), max]
 }
 
+/// One slot's bytes as host f32, whatever dtype the slot declares.
+///
+/// The dump the HF comparison reads is f32, and bf16 ⊂ f32, so a bf16 run's values widen exactly
+/// here, at dump time — the weights and activations themselves never touched f32. A dtype the
+/// runner cannot reinterpret is refused by name, not guessed.
+fn bytes_as_f32(bytes: &[u8], dtype: RsDtype) -> Result<Vec<f32>> {
+    match dtype {
+        RsDtype::F32 => Ok(bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()),
+        RsDtype::BF16 => Ok(bytes
+            .chunks_exact(2)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+            .collect()),
+        other => bail!(
+            "the dump reads f32 values, and a `{other}` slot is not one the runner can read back"
+        ),
+    }
+}
+
 pub(crate) fn run(args: RunArgs) -> Result<()> {
     let device = DeviceSpec::parse(&args.device)?;
     let degrees = [args.tp, args.cp, args.ep, args.dp, args.pp];
@@ -207,6 +273,7 @@ pub(crate) fn run(args: RunArgs) -> Result<()> {
         &args.plugins,
         args.recipe.as_deref(),
         device,
+        args.dtype,
     )
     .with_context(|| {
         format!(
@@ -293,6 +360,7 @@ fn run_one_rank(
         &args.plugins,
         args.recipe.as_deref(),
         device,
+        args.dtype,
     )
     .with_context(|| format!("rank {rank} of {}", mesh_text(&config)))?;
 
@@ -414,7 +482,7 @@ pub(crate) fn emit_result(
         "hidden_slots": result.hidden_names,
         "weights": result.loaded_count,
         "checkpoint_bytes": result.checkpoint_bytes,
-        // Reading, widening and the transposes are separate costs with separate fixes; the
+        // Reading, converting and the transposes are separate costs with separate fixes; the
         // load is the slowest part of a run, so its breakdown travels with the run report.
         "checkpoint_load": result.checkpoint_load,
         "steps": result.rank0_steps,
@@ -422,7 +490,16 @@ pub(crate) fn emit_result(
         "collectives": result.rank0_collectives,
         "peak_bytes": result.peak_bytes,
         "wall_seconds": result.wall.as_secs_f64(),
-        "precision": "weights widened bf16 -> f32 (exact; bf16 is a subset of f32), forward in f32",
+        "precision": match args.dtype {
+            RunDtype::Bf16 => {
+                "weights bf16 — the checkpoint's own dtype, copied through unchanged (2 bytes \
+                 per element on the host and the device; f32 would double both and add no \
+                 precision the model has)"
+            }
+            RunDtype::F32 => {
+                "weights widened bf16 -> f32 (exact; bf16 is a subset of f32), forward in f32"
+            }
+        },
     });
     if result.world > 1 {
         sidecar["metrics"] = serde_json::json!({
@@ -465,8 +542,12 @@ pub(crate) fn emit_result(
         result.world
     );
     println!("  digest {}", &result.digest[..result.digest.len().min(12)]);
+    let precision = match args.dtype {
+        RunDtype::Bf16 => "bf16, the checkpoint's own bytes — no widening",
+        RunDtype::F32 => "f32 (bf16 ⊂ f32, widening exact)",
+    };
     println!(
-        "  weights {} slot(s)  {:.1} GiB checkpoint bytes -> f32 (bf16 ⊂ f32, widening exact)",
+        "  weights {} slot(s)  {:.1} GiB checkpoint bytes -> {precision}",
         result.loaded_count,
         gib(result.checkpoint_bytes)
     );
@@ -646,6 +727,7 @@ fn run_rank(
     plugins: &[PathBuf],
     recipe_path: Option<&Path>,
     device: DeviceSpec,
+    dtype: RunDtype,
 ) -> Result<serde_json::Value> {
     // ---- description → global plan → this rank's plan --------------------
     let model = rustrain_model::Model::load(model_dir)
@@ -767,8 +849,14 @@ fn run_rank(
         );
     }
 
-    // ---- widen: the frozen precision decision ---------------------------
-    widen_to_f32(&mut plan);
+    // ---- the dtype the weights live in: the runner's decision, applied to the plan ----
+    // `--dtype bf16` (the default) leaves the plan at the description's own dtypes — bf16 weights
+    // resolving to bf16 variants such as `cuda.aten.bf16` — so the checkpoint's bytes are already
+    // the target dtype. `--dtype f32` widens every float slot for the f32-only reference
+    // provider, `check --dtype f32` and debugging.
+    if dtype == RunDtype::F32 {
+        widen_to_f32(&mut plan);
+    }
 
     // The hidden states are intermediate activations whose pool storage the memory planner
     // reuses once their last consumer ran — reading them after the forward would read the
@@ -874,9 +962,10 @@ fn run_rank(
 
     // ---- the weights, through the same pairing `check` verifies ---------
     // The loader writes each slot into the executor as it is prepared, so the host does not hold
-    // a second, f32 copy of every weight and the device copies overlap the reads. The rank-local
-    // metric that must fall as the mesh widens is the widened f32 bytes the rank holds — which is
-    // what `weight_bytes` counts, not the raw read.
+    // a second copy of every weight and the device copies overlap the reads. The rank-local
+    // metric that must fall as the mesh widens is the weight bytes the rank holds — 2 per element
+    // on the bf16 path, 4 on the widened f32 one — which is what `weight_bytes` counts, not the
+    // raw read.
     let load = load_weights(
         &expanded,
         &model.desc,
@@ -885,6 +974,7 @@ fn run_rank(
         rank,
         checkpoint,
         &mut executor,
+        dtype.load_target(),
     )
     .context("loading the checkpoint weights")?;
     let loaded_count = load.slots;
@@ -940,10 +1030,14 @@ fn run_rank(
                 executor.plan().plan.slot(logits_slot).name
             )
         })?;
-        let logits: Vec<f32> = logits_bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let logits: Vec<f32> =
+            bytes_as_f32(&logits_bytes, executor.plan().plan.slot(logits_slot).dtype)
+                .with_context(|| {
+                    format!(
+                        "reading the logits slot `{}`",
+                        executor.plan().plan.slot(logits_slot).name
+                    )
+                })?;
         let logits_shape = executor.plan().plan.slot(logits_slot).shape.clone();
         if logits_shape.len() != 2 || logits_shape[0] != window {
             bail!(
@@ -964,10 +1058,8 @@ fn run_rank(
             let bytes = executor
                 .read_raw(*id)
                 .with_context(|| format!("reading the hidden state slot `{name}`"))?;
-            let values: Vec<f32> = bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
+            let values: Vec<f32> = bytes_as_f32(&bytes, executor.plan().plan.slot(*id).dtype)
+                .with_context(|| format!("reading the hidden state slot `{name}`"))?;
             let shape = executor.plan().plan.slot(*id).shape.clone();
             let per_row: usize = shape[1..]
                 .iter()
@@ -1106,6 +1198,11 @@ fn run_rank(
 
 /// Executes one forward over the mesh `cfg` describes, N threads in this
 /// process, and returns rank 0's view of the run plus every rank's metrics.
+///
+/// Nine arguments for the same reason as `run_rank`: model, checkpoint, probe, mesh, plugins,
+/// recipe, device and dtype are the facts the caller holds, and bundling them into a struct
+/// would exist only to satisfy this lint.
+#[allow(clippy::too_many_arguments)]
 fn execute_mesh(
     model_dir: &Path,
     checkpoint: &Path,
@@ -1114,6 +1211,7 @@ fn execute_mesh(
     plugins: &[PathBuf],
     recipe_path: Option<&Path>,
     device: DeviceSpec,
+    dtype: RunDtype,
 ) -> Result<MeshResult> {
     let mesh = Mesh::from_config(cfg);
     let world = mesh.world_size();
@@ -1135,6 +1233,7 @@ fn execute_mesh(
             plugins,
             recipe_path,
             device,
+            dtype,
         )]
     } else {
         let shared = ThreadShared::new(world);
@@ -1160,6 +1259,7 @@ fn execute_mesh(
                     &plugins,
                     recipe_path.as_deref(),
                     device,
+                    dtype,
                 );
                 // Any failure must wake every rank blocked at a rendezvous —
                 // a silently hung world is worse than a reported one.
@@ -1182,6 +1282,7 @@ fn execute_mesh(
                 plugins,
                 recipe_path,
                 device,
+                dtype,
             );
             if let Err(error) = &result {
                 shared.poison(&format!("rank 0 failed: {error:#}"));
@@ -1451,8 +1552,9 @@ fn parse_tokens(text: &str) -> Result<Vec<i64>> {
         .collect()
 }
 
-/// Every float slot becomes f32 — the frozen precision decision, applied to the plan so the
-/// f32-only reference provider can resolve every node.
+/// Every float slot becomes f32 — the `--dtype f32` path, applied to the plan so the f32-only
+/// reference provider can resolve every node. The default bf16 path does not call it: the
+/// weights stay the checkpoint's own dtype.
 fn widen_to_f32(plan: &mut Plan) {
     for slot in &mut plan.slots {
         if slot.dtype.is_float() {
@@ -1728,6 +1830,7 @@ fn run_sweep(args: &RunArgs, tokens: &[i64], list: &str, device: DeviceSpec) -> 
         &args.plugins,
         args.recipe.as_deref(),
         device,
+        args.dtype,
     )
     .context("running the world-1 baseline")?;
     if baseline.logits.is_empty() {
@@ -1744,6 +1847,7 @@ fn run_sweep(args: &RunArgs, tokens: &[i64], list: &str, device: DeviceSpec) -> 
             &args.plugins,
             args.recipe.as_deref(),
             device,
+            args.dtype,
         )
         .with_context(|| format!("executing the sweep config {}", mesh_text(cfg)))?;
         runs.push((*cfg, result));
@@ -1909,10 +2013,10 @@ mod tests {
     use std::path::Path;
 
     /// The real description goes through the whole runner-side plan surgery and **compiles**
-    /// against the reference provider: expand → instantiate → widen → keep the hidden states →
-    /// compile. The forward itself cannot run on this box (no weights) — that is the GPU run —
-    /// but every step the runner performs on the plan before any weight byte is read is pinned
-    /// here, so nothing between the CLI and the executor is untested.
+    /// against the reference provider: expand → instantiate → widen (`--dtype f32`) → keep the
+    /// hidden states → compile. The forward itself cannot run on this box (no weights) — that is
+    /// the GPU run — but every step the runner performs on the plan before any weight byte is
+    /// read is pinned here, so nothing between the CLI and the executor is untested.
     #[test]
     fn the_real_plan_compiles_after_the_runner_surgery() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2155,6 +2259,62 @@ mod tests {
         assert_eq!(plan.slot(plan.slot_id("x").unwrap()).dtype, RsDtype::I64);
         assert_eq!(plan.slot(plan.slot_id("w").unwrap()).dtype, RsDtype::F32);
         assert_eq!(plan.slot(plan.slot_id("y").unwrap()).dtype, RsDtype::F32);
+    }
+
+    /// The default: `run` without `--dtype f32` leaves the plan at the description's own dtypes,
+    /// so the weight slots stay bf16 — the dtype the loader then copies through raw and the
+    /// recipe's `cuda.aten.bf16` variants resolve.
+    #[test]
+    fn the_default_plan_keeps_bf16_weights() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../rustrain-model/tests/fixtures/qwen36-text");
+        let model = rustrain_model::Model::load(&dir).expect("load");
+        let expanded = model.expand().expect("expand");
+        let mesh = Mesh::from_config(&ParallelConfig::default());
+        let registry = crate::load_registry(&[]).expect("the built-in registry");
+        let plan = rustrain_plan::instantiate(
+            &expanded.plan,
+            &expanded.declarations(),
+            &mesh,
+            0,
+            &registry,
+        )
+        .expect("instantiate rank 0");
+        let weights: Vec<&rustrain_plan::Slot> = plan
+            .slots
+            .iter()
+            .filter(|slot| slot.kind == rustrain_plan::SlotKind::Weight)
+            .collect();
+        assert!(!weights.is_empty(), "the model has weights");
+        for slot in &weights {
+            assert_eq!(
+                slot.dtype,
+                RsDtype::BF16,
+                "weight `{}` stays bf16 without the widening",
+                slot.name
+            );
+        }
+    }
+
+    /// The dump's bf16 -> f32 conversion is exact: bf16 is a subset of f32, so the npz the HF
+    /// comparison reads loses nothing when a bf16 run's logits and hidden states are written.
+    #[test]
+    fn the_dump_widens_bf16_exactly() {
+        let bytes: Vec<u8> = [0x3F80u16, 0xC000, 0x0001]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(
+            bytes_as_f32(&bytes, RsDtype::BF16).unwrap(),
+            vec![1.0, -2.0, f32::from_bits(0x0001 << 16)],
+            "1.0, -2.0 and the smallest bf16 subnormal, widened bit-exactly"
+        );
+        // The f32 path passes its bytes through untouched.
+        let values = [1.5f32, -0.25];
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(bytes_as_f32(&bytes, RsDtype::F32).unwrap(), values);
+        // Anything the runner cannot reinterpret is refused by name.
+        assert!(bytes_as_f32(&[0u8; 8], RsDtype::I64).is_err());
     }
 
     /// The sweep list parser: strict `axis=degree` pairs, unknown axes and

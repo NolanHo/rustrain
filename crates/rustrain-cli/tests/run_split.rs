@@ -302,6 +302,9 @@ fn a_transposed_tensor_splits_into_three_asymmetric_slots() {
     let model_dir = fixture();
     let (ok, stdout, stderr) = run_cli(&[
         "run",
+        // bf16 checkpoint, f32 reference provider: the widened f32 path.
+        "--dtype",
+        "f32",
         "--model",
         model_dir.to_str().unwrap(),
         "--checkpoint",

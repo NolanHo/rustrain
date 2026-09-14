@@ -142,6 +142,9 @@ fn a_rank_child_runs_one_rank_and_reports_metrics_for_the_launcher() {
         fixture_model().display().to_string(),
         s("--checkpoint"),
         dir.display().to_string(),
+        // bf16 checkpoint, f32 reference provider: the widened f32 path.
+        s("--dtype"),
+        s("f32"),
         s("--seq"),
         s(4),
         s("--rank"),

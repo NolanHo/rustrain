@@ -459,13 +459,20 @@ impl<'a> Harness<'a> {
     }
 
     /// Check every variant published for the case's operator.
+    ///
+    /// A variant the case's dtype cannot reach is **not applicable**, not a failure: a plugin that
+    /// publishes the same operator at two precisions (the ATen plugin does — `cuda.aten.f32` and
+    /// `cuda.aten.bf16`) would otherwise report every bf16 variant as failing against the harness's
+    /// f32 cases. The case generator synthesizes one dtype today, so the other
+    /// precision's variant is reported as a skip that names exactly what is missing; the plan
+    /// resolver already asks the same question through
+    /// [`rustrain_ops::capability::reject_reason`], and this reuses it rather than growing a
+    /// second opinion about which dtypes a variant accepts.
     pub fn run(&self, case: &Case) -> Vec<CaseResult> {
-        let mut variants: Vec<String> = self
-            .registry
-            .candidates(&case.op)
-            .into_iter()
-            .map(|c| c.variant().to_string())
-            .collect();
+        let dtypes: Vec<RsDtype> = case.inputs.iter().map(|spec| spec.dtype).collect();
+        let candidates: Vec<&RegisteredOp> = self.registry.candidates(&case.op);
+        let mut variants: Vec<String> =
+            candidates.iter().map(|c| c.variant().to_string()).collect();
         variants.sort();
         variants.dedup();
 
@@ -482,7 +489,28 @@ impl<'a> Harness<'a> {
 
         variants
             .iter()
-            .map(|v| self.check_variant(case, v))
+            .map(|v| {
+                let capability = candidates
+                    .iter()
+                    .find(|candidate| candidate.variant() == v)
+                    .and_then(|candidate| {
+                        rustrain_ops::capability::reject_reason(candidate, &dtypes, &self.env)
+                    });
+                match capability {
+                    Some(reason) => CaseResult {
+                        op: case.op.clone(),
+                        variant: v.clone(),
+                        numeric: Check::skipped(format!(
+                            "not applicable to this case: {reason}; the harness generates one \
+                             dtype per case today, so this variant is neither run nor judged here"
+                        )),
+                        expansion: Check::skipped("not applicable to this case"),
+                        gradient: Check::skipped("not applicable to this case"),
+                        determinism: Check::skipped("not applicable to this case"),
+                    },
+                    None => self.check_variant(case, v),
+                }
+            })
             .collect()
     }
 

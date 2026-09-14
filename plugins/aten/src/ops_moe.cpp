@@ -108,7 +108,7 @@ int32_t moe_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const* o
             if (i == I_ROUTING_INDICES) {
                 continue;  // indices are i32/i64, checked below
             }
-            int rc = check_f32(in[i], "moe_layer", "input");
+            int rc = check_float(in[i], "moe_layer", "input");
             if (rc != 0) {
                 return rc;
             }
@@ -120,7 +120,7 @@ int32_t moe_infer(const rs_tensor* const* in, uint32_t n_in, rs_tensor* const* o
         if (!moe_plan(in, "moe_layer", &plan)) {
             return 1;
         }
-        set_shape(out[0], dims_of(in[I_H]));
+        set_shape(out[0], float_dtype_of(in[0]), dims_of(in[I_H]));
         return 0;
     });
 }

@@ -1,4 +1,5 @@
-//! D5's weight loader: real safetensors bytes → the f32 tensors the widened plan executes.
+//! D5's weight loader: real safetensors bytes → the tensors the plan executes, at the runner's
+//! chosen dtype.
 //!
 //! The mapping is the one fact, one source rule applied to bytes: this module consumes the *same*
 //! checkpoint↔slot pairing `rustrain check` reconciles (`crate::pairing`), applies each binding's
@@ -7,10 +8,14 @@
 //! declared shard, and asserts the produced tensor equals the slot's **local** shape before a
 //! single weight reaches the executor.
 //!
-//! Precision (the frozen decision): the checkpoint and HF are bf16 while the reference provider
-//! is f32-only, so the loader widens bf16/f16/f32 weights to f32 — exact for bf16 and f16
-//! (both are subsets of f32) — and the plan runs f32. HF's reference dump is bf16; the spec's 1%
-//! tolerance absorbs HF's own bf16 rounding.
+//! Precision (the dtype decision, set once per run by the runner): `--dtype bf16` — the default —
+//! means a bf16 weight is *already the target dtype*, so the loader copies the checkpoint's own
+//! little-endian elements through unchanged, at 2 bytes per element on the host and the device;
+//! widening them to f32 would double the host traffic and the device bytes without adding any
+//! precision the model has. `--dtype f32` widens bf16/f16/f32 weights to f32 — exact for bf16 and
+//! f16 (both are subsets of f32) — for the f32-only reference provider and `check --dtype f32`.
+//! The HF reference dump is bf16; the spec's 1% tolerance absorbs HF's own bf16 rounding, not the
+//! run's dtype.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -42,7 +47,8 @@ pub(crate) struct LoadStats {
     pub read_runs: usize,
     pub pairs_total: usize,
     pub read: Duration,
-    /// The composed walk: widening, layout and the rank's slab, done in one pass per member.
+    /// The composed walk: the element copy (raw or widened), layout and the rank's slab, done in
+    /// one pass per member.
     pub fill: Duration,
 }
 
@@ -52,7 +58,8 @@ pub(crate) struct LoadOutcome {
     pub stats: LoadStats,
     /// Weight slots written into the executor.
     pub slots: usize,
-    /// Widened f32 bytes that reached the device — the number that must fall as a mesh widens.
+    /// Weight bytes that reached the device — 2 per element on the bf16 path, 4 on the widened
+    /// f32 one. The number that must fall as a mesh widens.
     pub weight_bytes: u64,
     /// Wall time of the whole load — the index parse, the pairing, the workers and the device
     /// writes.
@@ -64,9 +71,9 @@ pub(crate) struct LoadOutcome {
     /// Time the calling thread spent *waiting* for the pool rather than copying. `write + write_wait`
     /// is the writer's whole span, so the pair says which stage the load is bound by.
     pub write_wait: Duration,
-    /// Device copies the writer issued, and the element count they moved. `bytes/4/chunks` is the
-    /// average piece size — the number that says whether a slow copy is per-call overhead (small
-    /// pieces) or the transport (large ones).
+    /// Device copies the writer issued, and the element count they moved. The average piece size
+    /// (bytes per copy, at the run's element width) is the number that says whether a slow copy is
+    /// per-call overhead (small pieces) or the transport (large ones).
     pub write_chunks: usize,
     /// Per-chunk copy durations as `(bucket upper bound in microseconds, chunks, bytes)`, for the
     /// buckets `<500 us`, `<1 ms`, `<2 ms`, `<5 ms`, and `>=5 ms`. An average hides the shape: 5004
@@ -104,8 +111,89 @@ pub(crate) struct LoadedWeight {
     pub name: String,
     /// Where this chunk starts, in elements of the slot's local shape.
     pub element_offset: usize,
+    /// The chunk's payload: f32 values widened from the checkpoint, or the checkpoint's own
+    /// little-endian bytes at its declared element width.
+    pub data: LoadedBytes,
+}
+
+/// One chunk of a weight, in the form the executor's writer consumes.
+///
+/// Which variant every chunk of a load carries was decided once, by the runner's dtype choice:
+/// the two never mix inside one load, so the writer and the workers match on the variant, not on
+/// a per-chunk flag.
+pub(crate) enum LoadedBytes {
     /// Widened to f32, laid out contiguously in row-major order of the chunk's own shape.
-    pub values: Vec<f32>,
+    Widen(Vec<f32>),
+    /// The checkpoint's raw little-endian elements, `width` bytes each.
+    Raw { bytes: Vec<u8>, width: usize },
+}
+
+impl LoadedBytes {
+    /// An empty warm buffer for the load's target, filled by the walk before it is sent.
+    fn fresh(target: LoadTarget) -> Self {
+        match target {
+            LoadTarget::Widen => LoadedBytes::Widen(Vec::new()),
+            LoadTarget::Raw => LoadedBytes::Raw {
+                bytes: Vec::new(),
+                width: 0,
+            },
+        }
+    }
+
+    /// Fills the chunk from the composed walk — widening, or copying the checkpoint's own bytes.
+    /// The variant was decided once for the whole load, so the mismatched arm is a bug.
+    ///
+    /// Eight arguments for the same reason as `fill_chunk_into`: they are facts the caller
+    /// already holds, and bundling them into a struct would exist only to satisfy this lint.
+    #[allow(clippy::too_many_arguments)]
+    fn fill(
+        &mut self,
+        cuts: &Cuts,
+        bytes: &[u8],
+        dtype: &str,
+        strides: &[i64],
+        window: i64,
+        start: i64,
+        rows: usize,
+    ) -> Result<()> {
+        match self {
+            LoadedBytes::Widen(values) => {
+                cuts.fill_chunk_into(values, bytes, dtype, strides, window, start, rows)
+            }
+            LoadedBytes::Raw { bytes: out, width } => {
+                *width = dtype_width(dtype)?;
+                cuts.copy_chunk_into(out, bytes, *width, strides, window, start, rows);
+                Ok(())
+            }
+        }
+    }
+
+    /// The chunk's byte size — what the per-rank weight metric counts.
+    fn len_bytes(&self) -> usize {
+        match self {
+            LoadedBytes::Widen(values) => values.len() * 4,
+            LoadedBytes::Raw { bytes, .. } => bytes.len(),
+        }
+    }
+
+    /// The chunk's element count — what the coverage walk counts.
+    fn len_elements(&self) -> usize {
+        match self {
+            LoadedBytes::Widen(values) => values.len(),
+            LoadedBytes::Raw { bytes, width } => bytes.len() / width,
+        }
+    }
+}
+
+/// How the loader hands a weight's bytes to the executor, decided once per run by the runner's
+/// dtype choice.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LoadTarget {
+    /// Widen bf16/f16/f32 checkpoint elements to f32 (exact for bf16 and f16).
+    Widen,
+    /// Copy the checkpoint's little-endian elements through unchanged: the plan was not widened,
+    /// so the checkpoint's dtype is already the target dtype.
+    Raw,
 }
 
 /// How many chunk buffers the pool keeps. See the note where it is built: this is a cache-locality
@@ -189,8 +277,9 @@ struct Group {
 /// result against the slot's local shape.
 ///
 /// `expanded` supplies the bindings and the *declared* dtypes; `plan` supplies the local shapes
-/// and layouts (the plan was widened to f32 after `instantiate`, so dtype expectations come from
-/// the expanded plan, not from `plan`).
+/// and layouts (the runner may have widened the plan to f32 after `instantiate`, so dtype
+/// expectations come from the expanded plan, not from `plan`). `target` is the runner's dtype
+/// choice: widen every float weight to f32, or copy the checkpoint's own bytes through unchanged.
 ///
 /// Every failure is the same error `check` reports — missing tensor, extra tensor, unbound slot,
 /// dtype disagreement, shape mismatch — never a weaker one.
@@ -199,6 +288,11 @@ struct Group {
 /// so it is also the place where the order of the two shape facts is fixed: the groups are built
 /// (and every check that needs no bytes is run) before a single byte is read, and each group's
 /// data walk is then asserted against the shape math it was grouped by.
+///
+/// Nine arguments is deliberate: the description, the plan, the mesh fact, the rank, the
+/// checkpoint, the executor and the target dtype are the facts a caller holds, and bundling them
+/// into a struct would exist only to satisfy this lint.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn load_weights(
     expanded: &rustrain_model::Expanded,
     desc: &rustrain_model::ModelDesc,
@@ -207,6 +301,7 @@ pub(crate) fn load_weights(
     rank: usize,
     checkpoint: &Path,
     executor: &mut rustrain_runtime::Executor,
+    target: LoadTarget,
 ) -> Result<LoadOutcome> {
     let load_started = Instant::now();
     let meta = load_checkpoint(checkpoint)?;
@@ -243,7 +338,8 @@ pub(crate) fn load_weights(
             )
         })?;
 
-        // The declared dtype of the slot — from the *global* plan, before the runner widened it.
+        // The declared dtype of the slot — from the *global* plan, before any widening the
+        // runner applies.
         let Some(declared_id) = expanded.plan.slot_id(&pair.slot) else {
             bail!(
                 "slot `{}` is not a slot of the expanded plan (binding `{}`)",
@@ -271,6 +367,22 @@ pub(crate) fn load_weights(
             continue;
         };
         let slot = plan.slot(slot_id);
+        // The raw path copies the checkpoint's bytes at their own width, so the slot they land in
+        // must still be the declared dtype: an element count can match while a byte width
+        // mismatch silently misaligns every element past the first. The widened path is exempt —
+        // the runner has rewritten every float slot to f32 by construction.
+        if target == LoadTarget::Raw && slot.dtype != declared.dtype {
+            bail!(
+                "slot `{}` <- `{}` (binding `{}`): the raw load copies the checkpoint's {} \
+                 elements, but the plan holds the slot as {} — the plan was widened behind the \
+                 loader's back",
+                pair.slot,
+                pair.tensor,
+                binding.source,
+                declared.dtype.name(),
+                slot.dtype
+            );
+        }
 
         // ---- the shape math, evaluated (the same functions `check` uses) ----
         let transformed =
@@ -366,8 +478,8 @@ pub(crate) fn load_weights(
     //
     // The tensors go straight into the executor from a writer thread rather than accumulating in
     // host memory: that hides the host-to-device copies behind the reads (they used to be a
-    // serial 19-23 s after every byte had been read), and the rank stops holding a second, f32
-    // copy of every weight it owns.
+    // serial 19-23 s after every byte had been read), and the rank stops holding a second copy of
+    // every weight it owns.
     let workers = load_workers().min(groups.len()).max(1);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let outcomes: std::sync::Mutex<Vec<GroupOutcome>> =
@@ -386,8 +498,10 @@ pub(crate) fn load_weights(
     // device copy, and the copy reads host memory at the DRAM rate for a cold source (9.8-11.5
     // GB/s measured) but at 15-16 GB/s when the source is still in cache. Sixteen buffers of 8 MiB
     // is 128 MiB of in-flight chunks, which is the point where the two are told apart without
-    // starving the writer (the producer is faster than the copier, so it waits anyway).
-    let pool: std::sync::Arc<std::sync::Mutex<Vec<Vec<f32>>>> =
+    // starving the writer (the producer is faster than the copier, so it waits anyway). The buffer
+    // shape follows the load target — a raw load's chunk is the checkpoint's own width, so its
+    // buffers are half the bytes of a widened one.
+    let pool: std::sync::Arc<std::sync::Mutex<Vec<LoadedBytes>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(POOL_BUFFERS)));
     let mut sink = Sink {
         seen: vec![false; plan.slots.len()],
@@ -430,7 +544,7 @@ pub(crate) fn load_weights(
                     let Some(group) = groups.get(index) else {
                         break;
                     };
-                    let outcome = load_group(group, rank, &pool, &tx, abort);
+                    let outcome = load_group(group, rank, &pool, &tx, abort, target);
                     outcomes
                         .lock()
                         .expect("the loader's result lock")
@@ -459,10 +573,15 @@ pub(crate) fn load_weights(
             write_wait += waited.elapsed();
             write_chunks += 1;
             let started = Instant::now();
-            let chunk_bytes = (weight.values.len() * 4) as u64;
-            let copied = executor
-                .write_f32_at(weight.slot, weight.element_offset, &weight.values)
-                .with_context(|| format!("writing the weight slot `{}`", weight.name));
+            let chunk_bytes = weight.data.len_bytes() as u64;
+            let copied = match &weight.data {
+                LoadedBytes::Widen(values) => executor
+                    .write_f32_at(weight.slot, weight.element_offset, values)
+                    .with_context(|| format!("writing the weight slot `{}`", weight.name)),
+                LoadedBytes::Raw { bytes, .. } => executor
+                    .write_raw_at(weight.slot, weight.element_offset, bytes)
+                    .with_context(|| format!("writing the weight slot `{}`", weight.name)),
+            };
             let taken = started.elapsed();
             write_busy += taken;
             let micros = taken.as_micros() as u64;
@@ -480,9 +599,10 @@ pub(crate) fn load_weights(
                     return Err(error);
                 }
             };
-            sink.bytes += (weight.values.len() * 4) as u64;
-            sink.written[weight.slot.0] += weight.values.len() as u64;
-            sink.ranges[weight.slot.0].push((weight.element_offset, weight.values.len()));
+            sink.bytes += chunk_bytes;
+            let elements = weight.data.len_elements() as u64;
+            sink.written[weight.slot.0] += elements;
+            sink.ranges[weight.slot.0].push((weight.element_offset, elements as usize));
             // A streamed weight arrives as several chunks; the slot is counted once, when its
             // first chunk lands, and `seen` is simply idempotent.
             if !sink.seen[weight.slot.0] {
@@ -492,7 +612,7 @@ pub(crate) fn load_weights(
             // Hand the buffer back for the next chunk: it is warm, which is the whole point.
             let mut pool = pool.lock().expect("the chunk pool");
             if pool.len() < POOL_BUFFERS {
-                pool.push(weight.values);
+                pool.push(weight.data);
             }
         }
 
@@ -798,28 +918,7 @@ impl Cuts {
         start: i64,
         rows: usize,
     ) -> Result<()> {
-        let mut shape: Vec<usize> = self.axes.iter().map(|(_, _, len)| *len as usize).collect();
-        let step: Vec<i64> = self
-            .axes
-            .iter()
-            .map(|(axis, _, _)| strides[*axis])
-            .collect();
-        let base: i64 = self
-            .axes
-            .iter()
-            .map(|(axis, start, _)| start * strides[*axis])
-            .sum::<i64>()
-            - window;
-        // The slice: the outer axis contributes `start` of its own steps, and the walk then covers
-        // `rows` of them instead of the whole axis.
-        let base = if let Some(step) = step.first().copied() {
-            base + start * step
-        } else {
-            base
-        };
-        if let Some(first) = shape.first_mut() {
-            *first = rows;
-        }
+        let (shape, step, base) = self.walk_geometry(strides, window, start, rows);
         match dtype {
             "bf16" => {
                 walk_into(out, &shape, &step, base, |offset| {
@@ -855,6 +954,62 @@ impl Cuts {
             // bytes are read, so an unknown one is a bug here rather than a user error.
             other => unreachable!("dtype_width admitted `{other}` but `fill` cannot read it"),
         }
+    }
+
+    /// [`Cuts::fill_chunk_into`]'s raw twin: the same composed walk, but each output element is
+    /// the checkpoint's own `width` little-endian bytes copied through unchanged instead of a
+    /// value widened to f32.
+    ///
+    /// A bf16 slot's bytes are already the target dtype, so this is the whole job — converting to
+    /// f32 first would double the host traffic and the device bytes for nothing, and the
+    /// checkpoint slice is what lands in the slot, bit for bit.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_chunk_into(
+        &self,
+        out: &mut Vec<u8>,
+        bytes: &[u8],
+        width: usize,
+        strides: &[i64],
+        window: i64,
+        start: i64,
+        rows: usize,
+    ) {
+        let (shape, step, base) = self.walk_geometry(strides, window, start, rows);
+        walk_raw_into(out, bytes, width, &shape, &step, base);
+    }
+
+    /// The composed walk's result shape, per-axis checkpoint stride and base offset — the one
+    /// geometry both the widening fill and the raw copy walk, so the two cannot drift apart.
+    fn walk_geometry(
+        &self,
+        strides: &[i64],
+        window: i64,
+        start: i64,
+        rows: usize,
+    ) -> (Vec<usize>, Vec<i64>, i64) {
+        let mut shape: Vec<usize> = self.axes.iter().map(|(_, _, len)| *len as usize).collect();
+        let step: Vec<i64> = self
+            .axes
+            .iter()
+            .map(|(axis, _, _)| strides[*axis])
+            .collect();
+        let base: i64 = self
+            .axes
+            .iter()
+            .map(|(axis, start, _)| start * strides[*axis])
+            .sum::<i64>()
+            - window;
+        // The slice: the outer axis contributes `start` of its own steps, and the walk then covers
+        // `rows` of them instead of the whole axis.
+        let base = if let Some(step) = step.first().copied() {
+            base + start * step
+        } else {
+            base
+        };
+        if let Some(first) = shape.first_mut() {
+            *first = rows;
+        }
+        (shape, step, base)
     }
 }
 
@@ -906,6 +1061,60 @@ fn walk_into<F: Fn(i64) -> f32>(
     }
 }
 
+/// The same odometer as [`walk_into`], but each element appends its own `width` raw bytes from
+/// `bytes` — the bf16 path moves the checkpoint's little-endian elements through unchanged, so
+/// the output is the checkpoint slice, bit for bit.
+fn walk_raw_into(
+    out: &mut Vec<u8>,
+    bytes: &[u8],
+    width: usize,
+    shape: &[usize],
+    step: &[i64],
+    base: i64,
+) {
+    let total: usize = shape.iter().product();
+    out.clear();
+    out.reserve(total * width);
+    if total == 0 {
+        return;
+    }
+    let mut push = |offset: i64| {
+        let at = offset as usize * width;
+        out.extend_from_slice(&bytes[at..at + width]);
+    };
+    // A scalar tensor has no axes to walk: it is one element, and it is legal in a safetensors
+    // header and in a description.
+    if shape.is_empty() {
+        push(base);
+        return;
+    }
+    if shape.len() == 1 {
+        for i in 0..shape[0] {
+            push(base + i as i64 * step[0]);
+        }
+        return;
+    }
+    let mut index = vec![0usize; shape.len()];
+    let mut offset = base;
+    loop {
+        push(offset);
+        let mut axis = shape.len() - 1;
+        loop {
+            if index[axis] + 1 < shape[axis] {
+                index[axis] += 1;
+                offset += step[axis];
+                break;
+            }
+            index[axis] = 0;
+            offset -= (shape[axis] as i64 - 1) * step[axis];
+            if axis == 0 {
+                return;
+            }
+            axis -= 1;
+        }
+    }
+}
+
 /// Row-major strides of a checkpoint tensor's shape, in elements.
 fn strides_of(shape: &[i64]) -> Vec<i64> {
     let mut strides = vec![1i64; shape.len()];
@@ -939,9 +1148,10 @@ fn chunk_plan(rows: i64, row_elements: usize) -> Vec<(i64, usize)> {
 fn load_group(
     group: &Group,
     rank: usize,
-    pool: &std::sync::Mutex<Vec<Vec<f32>>>,
+    pool: &std::sync::Mutex<Vec<LoadedBytes>>,
     sink: &std::sync::mpsc::SyncSender<LoadedWeight>,
     abort: &std::sync::atomic::AtomicBool,
+    target: LoadTarget,
 ) -> Result<LoadStats> {
     // A failed device copy elsewhere means nothing this group produces can be written; stop
     // before the read, not after it.
@@ -993,17 +1203,25 @@ fn load_group(
         return Ok(stats);
     }
     if empty {
-        // Nothing to read, but every member has to arrive: its values are empty and its slot is
-        // zero-sized, which `Executor::write_f32` accepts and the coverage walk requires.
+        // Nothing to read, but every member has to arrive: its payload is empty and its slot is
+        // zero-sized, which both writers accept and the coverage walk requires.
         for (index, member) in group.members.iter().enumerate() {
             let cuts = &planned[index];
-            let values = cuts.fill(&[], &group.dtype, &strides, 0)?;
+            let data = match target {
+                LoadTarget::Widen => {
+                    LoadedBytes::Widen(cuts.fill(&[], &group.dtype, &strides, 0)?)
+                }
+                LoadTarget::Raw => LoadedBytes::Raw {
+                    bytes: Vec::new(),
+                    width,
+                },
+            };
             if sink
                 .send(LoadedWeight {
                     slot: member.slot,
                     name: member.slot_name.clone(),
                     element_offset: 0,
-                    values,
+                    data,
                 })
                 .is_err()
             {
@@ -1100,20 +1318,12 @@ fn load_group(
                 return Ok(stats);
             }
             let fill_started = Instant::now();
-            let mut values = pool
+            let mut data = pool
                 .lock()
                 .expect("the chunk pool")
                 .pop()
-                .unwrap_or_default();
-            cuts.fill_chunk_into(
-                &mut values,
-                &bytes,
-                &group.dtype,
-                &strides,
-                first,
-                row,
-                take,
-            )?;
+                .unwrap_or_else(|| LoadedBytes::fresh(target));
+            data.fill(cuts, &bytes, &group.dtype, &strides, first, row, take)?;
             stats.fill += fill_started.elapsed();
             // A closed channel means the writer already failed; it reports its own error, so the
             // workers just stop handing it tensors.
@@ -1122,7 +1332,7 @@ fn load_group(
                     slot: member.slot,
                     name: member.slot_name.clone(),
                     element_offset: row as usize * row_elements,
-                    values,
+                    data,
                 })
                 .is_err()
             {
@@ -1341,16 +1551,17 @@ fn reject_broken_pairing(
     Ok(())
 }
 
-/// Element width of a checkpoint dtype the loader can widen; quantized and integer weights are
-/// refused by name — the runner executes f32, and widening those would be guessing.
+/// Element width of a checkpoint dtype the loader can move — widened to f32, or copied raw at
+/// this width. Quantized and integer weights are refused by name: the runner loads only the
+/// three float widths, and loading those would be guessing.
 fn dtype_width(dtype: &str) -> Result<usize> {
     match dtype {
         "f32" => Ok(4),
         "f16" | "bf16" => Ok(2),
         other => bail!(
-            "checkpoint dtype `{other}` is not loadable: the runner widens bf16, f16 and f32 \
-             weights to f32 (the frozen D5 precision decision); a quantized checkpoint needs a \
-             quantized provider first"
+            "checkpoint dtype `{other}` is not loadable: the runner loads bf16, f16 and f32 \
+             weights — bf16 bytes pass through raw (the default), f32 widens; a quantized \
+             checkpoint needs a quantized provider first"
         ),
     }
 }
@@ -1678,16 +1889,16 @@ mod tests {
             }],
         };
         let (tx, _rx) = std::sync::mpsc::sync_channel(1);
-        let pool = std::sync::Mutex::new(Vec::new());
+        let pool: std::sync::Mutex<Vec<LoadedBytes>> = std::sync::Mutex::new(Vec::new());
 
         let aborted = std::sync::atomic::AtomicBool::new(true);
-        let stats =
-            load_group(&group, 0, &pool, &tx, &aborted).expect("an aborted group reads nothing");
+        let stats = load_group(&group, 0, &pool, &tx, &aborted, LoadTarget::Widen)
+            .expect("an aborted group reads nothing");
         assert_eq!(stats.bytes_read, 0);
         assert_eq!(stats.tensors_read, 0);
 
         let running = std::sync::atomic::AtomicBool::new(false);
-        let error = load_group(&group, 0, &pool, &tx, &running)
+        let error = load_group(&group, 0, &pool, &tx, &running, LoadTarget::Widen)
             .expect_err("without the flag the missing shard is a real error");
         assert!(
             format!("{error:#}").contains("shard"),
@@ -1750,14 +1961,17 @@ mod tests {
             }],
         };
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let pool = std::sync::Mutex::new(Vec::new());
+        let pool: std::sync::Mutex<Vec<LoadedBytes>> = std::sync::Mutex::new(Vec::new());
         let running = std::sync::atomic::AtomicBool::new(false);
-        let stats =
-            load_group(&group, 0, &pool, &tx, &running).expect("an empty tensor is not an error");
+        let stats = load_group(&group, 0, &pool, &tx, &running, LoadTarget::Widen)
+            .expect("an empty tensor is not an error");
         assert_eq!(stats.bytes_read, 0, "and it reads nothing");
         let delivered = rx.try_recv().expect("the member still arrives");
         assert_eq!(delivered.slot, SlotId(0));
-        assert!(delivered.values.is_empty());
+        assert!(
+            matches!(&delivered.data, LoadedBytes::Widen(values) if values.is_empty()),
+            "the widened member's payload is empty"
+        );
     }
 
     /// The chunk plan is the whole partition of a member's outer axis: in order, no gap, no
@@ -1825,6 +2039,76 @@ mod tests {
         }
         assert_eq!(whole.len(), streamed.len());
         assert_eq!(streamed, whole, "chunked == whole, element for element");
+    }
+
+    /// The raw copy is the widening walk's input, byte for byte: where `fill` reads a checkpoint
+    /// element and widens it, `copy_chunk_into` emits the same element's own bytes. The two walks
+    /// must therefore agree exactly — `widen` of the raw output is `fill`'s output for the same
+    /// map, on a chain that exercises a transpose, a transform slice and two shard cuts.
+    #[test]
+    fn the_raw_copy_emits_the_exact_bytes_the_widen_walk_reads() {
+        let source = [3i64, 4, 5];
+        let values: Vec<f32> = (0..60).map(|i| i as f32 * 0.5 - 7.0).collect();
+        let bytes = bf16_bytes(&values);
+        let strides = strides_of(&source);
+
+        let mut cuts = Cuts::identity(&source);
+        cuts.transpose(1, 2);
+        cuts.narrow(0, 1, 2, "test").unwrap();
+        cuts.narrow(2, 1, 3, "test").unwrap();
+        cuts.narrow(1, 0, 2, "test").unwrap();
+
+        let widened = cuts.fill(&bytes, "bf16", &strides, 0).unwrap();
+        let rows = cuts.shape()[0];
+        let mut raw = Vec::new();
+        cuts.copy_chunk_into(&mut raw, &bytes, 2, &strides, 0, 0, rows as usize);
+        assert_eq!(
+            widen(&raw, "bf16").unwrap(),
+            widened,
+            "the raw bytes, widened, must equal the widening walk"
+        );
+    }
+
+    /// A narrowed read window, raw: the copy of `[2, 6)` of an 8-element tensor, out of a buffer
+    /// that starts at element 2, is the checkpoint's own byte slice — bit-exact, no rounding —
+    /// and streaming it in chunks concatenates to the same bytes.
+    #[test]
+    fn the_raw_copy_is_byte_identical_to_the_checkpoint_slice() {
+        let values: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let bytes = bf16_bytes(&values);
+        let strides = strides_of(&[8]);
+
+        let mut cuts = Cuts::identity(&[8]);
+        cuts.narrow(0, 2, 4, "test").unwrap();
+        let mut raw = Vec::new();
+        cuts.copy_chunk_into(&mut raw, &bytes[2 * 2..], 2, &strides, 2, 0, 4);
+        assert_eq!(
+            raw,
+            bytes[2 * 2..6 * 2],
+            "the raw copy is the checkpoint slice, bit for bit"
+        );
+
+        // The chunked stream (the `start * step[0]` advance) concatenates to the same bytes.
+        let mut streamed = Vec::new();
+        for (start, take) in chunk_plan(4, 1) {
+            cuts.copy_chunk_into(&mut streamed, &bytes[2 * 2..], 2, &strides, 2, start, take);
+        }
+        assert_eq!(streamed, raw, "chunked raw == whole raw");
+    }
+
+    /// The chunk bookkeeping follows the width: a bf16 chunk counts 2 bytes per element, and the
+    /// coverage walk counts elements, not bytes.
+    #[test]
+    fn raw_chunks_count_bytes_and_elements_by_width() {
+        let chunk = LoadedBytes::Raw {
+            bytes: vec![0u8; 6],
+            width: 2,
+        };
+        assert_eq!(chunk.len_bytes(), 6);
+        assert_eq!(chunk.len_elements(), 3);
+        let widened = LoadedBytes::Widen(vec![0.0f32; 3]);
+        assert_eq!(widened.len_bytes(), 12);
+        assert_eq!(widened.len_elements(), 3);
     }
 
     /// A zero-length cut has no source span (`start + len - 1`) and its runs would address an empty
@@ -2075,9 +2359,9 @@ mod tests {
         assert!(widen(&[0u8], "i64").is_err());
     }
 
-    /// The loader's dtype gate: only the three float widths it can widen.
+    /// The loader's dtype gate: only the three float widths it can move (raw or widened).
     #[test]
-    fn loadable_dtypes_are_the_three_widenable_widths() {
+    fn loadable_dtypes_are_the_three_movable_widths() {
         assert_eq!(dtype_width("f32").unwrap(), 4);
         assert_eq!(dtype_width("bf16").unwrap(), 2);
         assert_eq!(dtype_width("f16").unwrap(), 2);
