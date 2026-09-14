@@ -11,8 +11,9 @@ use rustrain_ops::{Phase, Recipe, Registry, TargetEnv};
 use rustrain_parallel::{GroupMask, Mesh, ParallelConfig, ParallelLayout, ReduceOp, ShardSpec};
 use rustrain_plan::ir::intrinsic;
 use rustrain_plan::{
-    Attrs, DeclaredAxes, InstanceStage, OpRef, Plan, PlanBuilder, PlanError, SlotKind, instantiate,
-    instantiate_stages, DeclaredAxis};
+    Attrs, DeclaredAxes, DeclaredAxis, InstanceStage, OpRef, Plan, PlanBuilder, PlanError,
+    SlotKind, instantiate, instantiate_stages,
+};
 
 /// The canonical five-axis mesh with `tp = 2`; `tp` is the first axis, so its mask is bit 0.
 fn tp_mesh() -> Mesh {
@@ -326,10 +327,7 @@ fn a_matmul_keeps_the_batch_shard_and_the_output_shard_in_the_local_shape() {
     assert_eq!(
         instantiated.slot(y).layout,
         ParallelLayout {
-            dims: vec![
-                ShardSpec::shard(0, tp),
-                ShardSpec::shard(2, ep),
-            ],
+            dims: vec![ShardSpec::shard(0, tp), ShardSpec::shard(2, ep),],
             partial: None,
         },
         "both surviving shards ride the output"
@@ -595,4 +593,63 @@ fn the_real_qwen36_reshape_chain_instantiates_with_heads_split() {
         vec![512, 2048],
         "the local flat extent is 4096 / tp"
     );
+}
+
+/// A declared axis that replicates with a unit, on the plan side: `instantiate` translates the
+/// declaration into the spec, and the local shape is one whole unit per rank rather than a quarter
+/// of the axis (`docs/design/qwen36-text/spec.md` §D6.6). The model crate's own test goes through
+/// the description; this one pins the translation itself.
+#[test]
+fn a_declared_replicating_axis_keeps_whole_units_in_the_local_shape() {
+    let mesh = Mesh::new(vec![("tp".to_string(), 4)]).unwrap();
+    let mut b = PlanBuilder::new("kv", Phase::Forward, mesh.fingerprint());
+    let x = b.slot("x", RsDtype::F32, vec![2, 8], SlotKind::Activation);
+    let k = b.slot("k", RsDtype::F32, vec![8, 512], SlotKind::Weight);
+    let y = b.slot("y", RsDtype::F32, vec![2, 512], SlotKind::Activation);
+    b.node(
+        OpRef::new("linear"),
+        vec![x, k],
+        vec![y],
+        Attrs::new(),
+        "k_proj",
+    );
+    let global = b.build().unwrap();
+
+    let declared = DeclaredAxes {
+        slots: BTreeMap::from([(
+            "k".to_string(),
+            BTreeMap::from([("1".to_string(), vec![DeclaredAxis::replicate("tp", 256)])]),
+        )]),
+        instances: Vec::new(),
+    };
+    let instantiated =
+        instantiate(&global, &declared, &mesh, 0, &reference_registry()).expect("instantiate");
+
+    let k = instantiated.slot_id("k").expect("k survives");
+    assert_eq!(
+        instantiated.slot(k).shape,
+        vec![8, 256],
+        "two heads over four ranks: one whole head per rank, not 128 features"
+    );
+    let tp = GroupMask::single(mesh.index_of("tp").unwrap()).unwrap();
+    assert_eq!(
+        instantiated.slot(k).layout.dims,
+        vec![ShardSpec::replicating(1, tp, 256)]
+    );
+
+    // The same axis declared strictly has no local shape at all: 512 does not divide by 4 into
+    // 256-element units, and it must not be quietly cut into 128-element halves of a head.
+    let strict = DeclaredAxes {
+        slots: BTreeMap::from([(
+            "k".to_string(),
+            BTreeMap::from([("1".to_string(), vec![DeclaredAxis::divide("tp")])]),
+        )]),
+        instances: Vec::new(),
+    };
+    // Division itself succeeds (512 / 4 = 128); it is the *description* that is wrong there, which
+    // is why the declared unit is checked where it is written, not here.
+    let instantiated = instantiate(&global, &strict, &mesh, 0, &reference_registry())
+        .expect("a strict four-way shard is arithmetically fine");
+    let k = instantiated.slot_id("k").expect("k survives");
+    assert_eq!(instantiated.slot(k).shape, vec![8, 128]);
 }
