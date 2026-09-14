@@ -386,8 +386,19 @@ node NodeId(36) (causal_conv1d@reference.f32) inferred output 0 shape [512, 1024
 **证据**：新增回归 `run::tests::the_real_plan_compiles_after_the_runner_surgery_at_tp_two`
 （真实描述 × tp=2 → 实例化 + runner surgery + 编译通过；断言 layer 0 的 q 本地形状 `[512,1024]` 且插入了
 all_reduce）。工作区测试全绿、clippy 0 warning、`ops check` exit 0。
-**未做（诚实记录）**：`check` 的三项 skip 仍然存在 —— 补它是 D6.1 之前的下一个改动；tp≥4 仍卡在
-KV 头整除（需 KV 复制 + head 偏移位置常量）；EP 仍卡在声明式集合通信未接线。
+**D6.0b — 门禁补洞（同一轮，提交 `ba2afb3`）**：`l1.compile` / `l1.operator_shapes` /
+`l1.slot_allocation` 从 `skip` 变成**真检查** —— stage-0 的实例化 plan 真的过 `Plan::compile`，
+三项分别报"编译通过（步数/插入的集合通信/digest）"、"每个节点的 `infer` 与声明形状一致"、
+"每个 slot 都被放置且没有运行时执行不了的 policy"。`--dtype` 在编译前应用到 plan 上（否则
+`--dtype f32` 会去编译 bf16 的 plan，被 f32-only 的 reference 拒绝，把宿主的限制报成 plan 的缺陷）。
+报告契约的绊线按设计变红并更新：`--dtype f32` 的 skip 集合**从 3 项变成空**，bf16 / 被拒绝的 dtype
+仍是 4 项。实测：`check --dtype f32` 在真实 checkpoint 元数据上 exit 0、15/15 全绿
+（1327 步、42 次插入的集合通信、峰值 143.3 GB）；`check --tp 2` 现在能看到 tp=2 的 plan 编译通过；
+`check --tp 4` 仍 fail 并点名 `layers.3.kh`。
+
+**仍未做（诚实记录）**：tp≥4 卡在 KV 头整除（需 KV 复制 + head 偏移位置常量）；EP 卡在声明式集合通信
+未接线（`moe_layer` 声明的两个 `all_to_all` 仍然没有消费者 —— 门禁也看不见它，因为没有检查项断言
+"声明的集合通信都被接进 plan 了"）；`cp>1` 仍是空转（没有槽声明 `cp` 轴）。
 
 ### D5 — 前向数值对齐 HuggingFace
 
